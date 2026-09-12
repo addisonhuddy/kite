@@ -1,0 +1,171 @@
+//! Framed request/response transport over TCP, optionally wrapped in TLS
+//! via std.crypto.tls.
+
+const std = @import("std");
+const protocol = @import("protocol.zig");
+
+pub const TransportError = error{
+    ConnectFailed,
+    TlsFailed,
+    TlsHandshakeAuthFailed,
+    IoFailed,
+    ResponseTooLarge,
+    CorrelationMismatch,
+    MalformedResponse,
+    OutOfMemory,
+};
+
+const rbuf_len = std.crypto.tls.Client.min_buffer_len + 4096;
+const wbuf_len = 64 * 1024;
+const tls_plain_len = 32 * 1024;
+/// Kafka brokers never need a response larger than this for the requests we
+/// send (metadata for one topic, produce acks).
+const max_response_len = 16 << 20;
+
+pub const Conn = struct {
+    stream: std.net.Stream,
+    rbuf: [rbuf_len]u8,
+    wbuf: [wbuf_len]u8,
+    tls_rbuf: [tls_plain_len]u8,
+    tls_wbuf: [tls_plain_len]u8,
+    net_reader: std.net.Stream.Reader,
+    net_writer: std.net.Stream.Writer,
+    tls_client: ?std.crypto.tls.Client,
+    input: *std.Io.Reader,
+    output: *std.Io.Writer,
+    host: []const u8,
+    port: u16,
+
+    pub fn close(c: *Conn) void {
+        c.stream.close();
+    }
+};
+
+/// Connect TCP to host:port. host may be DNS or IP literal.
+fn tcpConnect(alloc: std.mem.Allocator, host: []const u8, port: u16) !std.net.Stream {
+    const list = std.net.getAddressList(alloc, host, port) catch return error.ConnectFailed;
+    defer list.deinit();
+    var last_err: anyerror = error.ConnectFailed;
+    for (list.addrs) |addr| {
+        const s = std.net.tcpConnectToAddress(addr) catch |err| {
+            last_err = err;
+            continue;
+        };
+        // 15s timeouts keep a hung broker from stalling the CLI forever.
+        const tv = std.posix.timeval{ .sec = 15, .usec = 0 };
+        std.posix.setsockopt(s.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+        std.posix.setsockopt(s.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+        const one: c_int = 1;
+        std.posix.setsockopt(s.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
+        return s;
+    }
+    return last_err;
+}
+
+/// Establish a connection: TCP, then TLS if `ca` is set (SNI + verification on).
+pub fn connect(
+    alloc: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    ca: ?std.crypto.Certificate.Bundle,
+) TransportError!*Conn {
+    const stream = tcpConnect(alloc, host, port) catch return error.ConnectFailed;
+    errdefer stream.close();
+
+    const c = try alloc.create(Conn);
+    errdefer alloc.destroy(c);
+    c.* = .{
+        .stream = stream,
+        .rbuf = undefined,
+        .wbuf = undefined,
+        .tls_rbuf = undefined,
+        .tls_wbuf = undefined,
+        .net_reader = undefined,
+        .net_writer = undefined,
+        .tls_client = null,
+        .input = undefined,
+        .output = undefined,
+        .host = host,
+        .port = port,
+    };
+    c.net_reader = stream.reader(&c.rbuf);
+    c.net_writer = stream.writer(&c.wbuf);
+    c.input = c.net_reader.interface();
+    c.output = &c.net_writer.interface;
+
+    if (ca) |bundle| {
+        const client = std.crypto.tls.Client.init(c.input, c.output, .{
+            .host = .{ .explicit = host },
+            .ca = .{ .bundle = bundle },
+            .read_buffer = &c.tls_rbuf,
+            .write_buffer = &c.tls_wbuf,
+        }) catch |err| {
+            // errdefers above close the stream and free `c`.
+            if (std.posix.getenv("KANNON_DEBUG") != null)
+                std.debug.print("tls init: {s}\n", .{@errorName(err)});
+            const failed: TransportError = switch (err) {
+                error.TlsCertificateNotVerified, error.CertificateHostMismatch, error.CertificateIssuerMismatch, error.CertificateExpired, error.CertificateNotYetValid, error.CertificatePublicKeyInvalid, error.CertificateSignatureInvalid, error.UnsupportedCertificateVersion => error.TlsHandshakeAuthFailed,
+                else => error.TlsFailed,
+            };
+            return failed;
+        };
+        c.tls_client = client;
+        c.input = &c.tls_client.?.reader;
+        c.output = &c.tls_client.?.writer;
+    }
+    return c;
+}
+
+/// Send a framed request (4-byte big-endian length + payload).
+pub fn send(c: *Conn, payload: []const u8) TransportError!void {
+    if (std.posix.getenv("KANNON_DEBUG") != null)
+        std.debug.print("send {d}B: {x}\n", .{ payload.len, payload[0..@min(payload.len, 200)] });
+    var hdr: [4]u8 = undefined;
+    std.mem.writeInt(u32, &hdr, @intCast(payload.len), .big);
+    c.output.writeAll(&hdr) catch return error.IoFailed;
+    c.output.writeAll(payload) catch return error.IoFailed;
+    c.output.flush() catch |err| {
+        if (std.posix.getenv("KANNON_DEBUG") != null)
+            std.debug.print("send flush: {s}\n", .{@errorName(err)});
+        return error.IoFailed;
+    };
+    // The TLS writer's flush encrypts into the net writer's buffer without
+    // pushing it out; the underlying flush puts ciphertext on the wire.
+    if (c.tls_client != null) c.net_writer.interface.flush() catch return error.IoFailed;
+}
+
+pub const Response = struct {
+    /// Full allocation backing the frame; free this, not `body`.
+    frame: []u8,
+    /// Response body after the v1 header (correlation id + tag buffer).
+    body: []u8,
+};
+
+/// Receive one framed response and validate its correlation id.
+/// `header_tags`: response header v1 carries a tag buffer — every flexible
+/// response except ApiVersions, which is always header v0.
+pub fn recv(c: *Conn, alloc: std.mem.Allocator, expect_corr: i32, header_tags: bool) TransportError!Response {
+    const hdr = c.input.takeArray(4) catch |err| {
+        if (std.posix.getenv("KANNON_DEBUG") != null) {
+            std.debug.print("recv hdr: {s}", .{@errorName(err)});
+            if (c.tls_client) |*t| std.debug.print(" read_err={s}", .{@errorName(t.read_err orelse error{NoErr}.NoErr)});
+            std.debug.print("\n", .{});
+        }
+        return error.IoFailed;
+    };
+    const len = std.mem.readInt(u32, hdr, .big);
+    if (len > max_response_len) return error.ResponseTooLarge;
+    const frame = alloc.alloc(u8, len) catch return error.OutOfMemory;
+    errdefer alloc.free(frame);
+    c.input.readSliceAll(frame) catch return error.IoFailed;
+
+    if (std.posix.getenv("KANNON_DEBUG") != null) {
+        const n = @min(frame.len, 512);
+        std.debug.print("recv {d}B: {x}\n", .{ frame.len, frame[0..n] });
+    }
+    var d = protocol.Decoder.init(frame);
+    const corr = d.i32v() catch return error.MalformedResponse;
+    if (corr != expect_corr) return error.CorrelationMismatch;
+    if (header_tags) d.tagBuffer() catch return error.MalformedResponse;
+    return .{ .frame = frame, .body = frame[d.pos..] };
+}
