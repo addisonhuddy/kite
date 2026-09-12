@@ -40,13 +40,64 @@ fn fatalErr(c: *const client.Client, comptime fmt: []const u8) noreturn {
         fatal(fmt, .{});
 }
 
+fn usageExit(code: u8) noreturn {
+    out("usage: kannon [-H 'name: value']... <topic>\n" ++
+        "  reads records from stdin, one per line:\n" ++
+        "    value                            value only\n" ++
+        "    key<TAB>value                    record key + value\n" ++
+        "    key<TAB>h1: v1<TAB>...<TAB>value key + headers + value\n" ++
+        "  -H 'name: value' adds the header to every record (repeatable)\n", .{});
+    std.process.exit(code);
+}
+
 fn usage() noreturn {
-    fatal("usage: kannon <topic>   (reads records, one per line, from stdin)", .{});
+    usageExit(1);
+}
+
+/// Parse a 'name: value' header (curl -H style). Name/value are trimmed.
+fn parseHeaderArg(s: []const u8) protocol.Header {
+    const colon = std.mem.indexOfScalar(u8, s, ':') orelse
+        fatal("malformed header '{s}' (want 'name: value')", .{s});
+    const name = std.mem.trim(u8, s[0..colon], " \t");
+    if (name.len == 0) fatal("malformed header '{s}' (want 'name: value')", .{s});
+    return .{ .key = name, .value = std.mem.trim(u8, s[colon + 1 ..], " \t") };
+}
+
+/// Parse one stdin line into a record. First TAB-field = key (empty = null),
+/// last = value, any middle fields = 'name: value' headers.
+fn parseLine(
+    alloc: std.mem.Allocator,
+    line: []const u8,
+    static_headers: []const protocol.Header,
+    lineno: u64,
+) protocol.Record {
+    if (std.mem.indexOfScalar(u8, line, '\t') == null)
+        return .{ .value = line, .headers = static_headers };
+
+    var it = std.mem.splitScalar(u8, line, '\t');
+    const keyf = it.next().?;
+    var headers: std.ArrayListUnmanaged(protocol.Header) = .empty;
+    headers.appendSlice(alloc, static_headers) catch fatal("out of memory", .{});
+    var value: []const u8 = "";
+    while (it.next()) |f| {
+        if (it.peek() == null) {
+            value = f;
+        } else {
+            if (std.mem.indexOfScalar(u8, f, ':') == null)
+                fatal("line {d}: malformed header '{s}' (want 'name: value')", .{ lineno, f });
+            headers.append(alloc, parseHeaderArg(f)) catch fatal("out of memory", .{});
+        }
+    }
+    return .{
+        .key = if (keyf.len == 0) null else keyf,
+        .value = value,
+        .headers = headers.items,
+    };
 }
 
 /// Per-partition pending record buffer.
 const Pending = struct {
-    lines: std.ArrayListUnmanaged([]const u8) = .empty,
+    records: std.ArrayListUnmanaged(protocol.Record) = .empty,
     bytes: usize = 0,
 };
 
@@ -55,8 +106,26 @@ pub fn main() !void {
     const alloc = arena.allocator();
 
     const args = std.process.argsAlloc(alloc) catch fatal("out of memory", .{});
-    if (args.len != 2) usage();
-    const topic = args[1];
+    var static_headers: std.ArrayListUnmanaged(protocol.Header) = .empty;
+    var topic_arg: ?[]const u8 = null;
+    var ai: usize = 1;
+    while (ai < args.len) : (ai += 1) {
+        const a = args[ai];
+        if (std.mem.eql(u8, a, "-H")) {
+            ai += 1;
+            if (ai >= args.len) usage();
+            static_headers.append(alloc, parseHeaderArg(args[ai])) catch fatal("out of memory", .{});
+        } else if (std.mem.startsWith(u8, a, "-H") and a.len > 2) {
+            static_headers.append(alloc, parseHeaderArg(a[2..])) catch fatal("out of memory", .{});
+        } else if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
+            usageExit(0);
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            usage();
+        } else if (topic_arg == null) {
+            topic_arg = a;
+        } else usage();
+    }
+    const topic = topic_arg orelse usage();
     if (topic.len == 0) usage();
 
     var cfg = config.load(alloc) catch |err| switch (err) {
@@ -105,10 +174,11 @@ pub fn main() !void {
         }
 
         const owned = nextLine(r, alloc) catch fatal("failed reading stdin", .{}) orelse break :read_loop;
-        const p = &pend[sticky];
-        p.lines.append(alloc, owned) catch fatal("out of memory", .{});
-        p.bytes += owned.len;
         total += 1;
+        const rec = parseLine(alloc, owned, static_headers.items, total);
+        const p = &pend[sticky];
+        p.records.append(alloc, rec) catch fatal("out of memory", .{});
+        p.bytes += owned.len;
         if (p.bytes >= batch_bytes_cap) {
             flushPartition(&cli, topic, pend, sticky) catch |err| produceFatal(&cli, err);
             sticky = (sticky + 1) % nparts;
@@ -163,9 +233,9 @@ fn flushAll(c: *client.Client, topic: []const u8, pend: []Pending) !void {
 
 fn flushPartition(c: *client.Client, topic: []const u8, pend: []Pending, i: usize) !void {
     const p = &pend[i];
-    if (p.lines.items.len == 0) return;
-    try c.produceToPartition(topic, i, p.lines.items);
-    p.lines.clearRetainingCapacity();
+    if (p.records.items.len == 0) return;
+    try c.produceToPartition(topic, i, p.records.items);
+    p.records.clearRetainingCapacity();
     p.bytes = 0;
 }
 

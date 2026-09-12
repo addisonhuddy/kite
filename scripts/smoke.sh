@@ -96,4 +96,15 @@ echo "== 10. SCRAM-SHA-512 =="
 (cd "$TMP" && printf "$M-r512\n" | "$K" t-scram)
 echo ok
 
+echo "== 11. keys + headers (-H flag and inline <TAB> fields) =="
+(cd "$TMP" && write_props bootstrap.servers=localhost:9092)
+(cd "$TMP" && printf "$M-k\th1: v1\t$M-v1\n$M-pure\n" | "$K" -H "static-h: $M-sv" t1)
+consume t1 --property print.key=true --property print.headers=true \
+    --property key.separator='|' --property headers.delimiter=';' \
+    | grep "$M" | grep -qF "static-h:$M-sv,h1:v1|$M-k|$M-v1" || { echo "FAIL"; exit 1; }
+consume t1 --property print.key=true --property print.headers=true \
+    --property key.separator='|' --property headers.delimiter=';' \
+    | grep -qF "static-h:$M-sv|null|$M-pure" || { echo "FAIL"; exit 1; }
+echo ok
+
 echo "ALL SMOKE TESTS PASSED"

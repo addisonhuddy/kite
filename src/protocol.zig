@@ -381,10 +381,22 @@ pub fn lastCorrelationId() i32 {
 // Record batch v2 (magic 2)
 // ---------------------------------------------------------------------------
 
-/// One value-only record: null key, no headers, timestamp = batch base.
+pub const Header = struct {
+    key: []const u8,
+    value: ?[]const u8,
+};
+
+/// One record in a batch. `key` null = unkeyed; `headers` may be empty.
+pub const Record = struct {
+    key: ?[]const u8 = null,
+    value: []const u8,
+    headers: []const Header = &.{},
+};
+
+/// Records share the batch base timestamp (delta 0 each).
 pub fn encodeRecordBatch(
     e: *Encoder,
-    records: []const []const u8,
+    records: []const Record,
     base_timestamp_ms: i64,
 ) ProtoError!void {
     var body = Encoder.init(e.aw.allocator);
@@ -404,10 +416,25 @@ pub fn encodeRecordBatch(
         try r.u8v(0); // record attributes
         try r.varlong(0); // timestamp delta
         try r.varint(@intCast(idx)); // offset delta
-        try r.varint(-1); // key: null
-        try r.varint(@intCast(rec.len)); // value length
-        try r.raw(rec);
-        try r.varint(0); // header count
+        if (rec.key) |k| {
+            try r.varint(@intCast(k.len));
+            try r.raw(k);
+        } else {
+            try r.varint(-1); // key: null
+        }
+        try r.varint(@intCast(rec.value.len));
+        try r.raw(rec.value);
+        try r.varint(@intCast(rec.headers.len));
+        for (rec.headers) |h| {
+            try r.varint(@intCast(h.key.len));
+            try r.raw(h.key);
+            if (h.value) |v| {
+                try r.varint(@intCast(v.len));
+                try r.raw(v);
+            } else {
+                try r.varint(-1);
+            }
+        }
         try body.varint(@intCast(r.written().len));
         try body.raw(r.written());
     }
@@ -495,7 +522,7 @@ test "tagBuffer skip" {
 test "record batch smoke" {
     var e = Encoder.init(std.testing.allocator);
     defer e.deinit();
-    const recs = [_][]const u8{ "a", "b", "c" };
+    const recs = [_]Record{ .{ .value = "a" }, .{ .value = "b" }, .{ .value = "c" } };
     try encodeRecordBatch(&e, &recs, 1700000000000);
     const batch = e.written();
     var d = Decoder.init(batch);

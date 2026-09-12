@@ -416,7 +416,7 @@ pub const Client = struct {
         c: *Client,
         topic: []const u8,
         partition: usize,
-        records: []const []const u8,
+        records: []const protocol.Record,
     ) !void {
         var be = Encoder.init(c.alloc);
         defer be.deinit();

@@ -1,7 +1,7 @@
 # kannon
 
 An ultra-lightweight Kafka producer CLI written in Zig. `kannon` reads lines
-from stdin and produces each line as a record (value only, null key) to a topic:
+from stdin and produces each line as a record to a topic:
 
 ```console
 $ kannon my-topic < file.txt
@@ -31,8 +31,25 @@ $ zig build -Dtarget=x86_64-macos      # Intel Mac
 ## Usage
 
 ```console
-$ kannon <topic>        # one record per stdin line
+$ kannon [-H 'name: value']... <topic>   # one record per stdin line
 $ echo hello | kannon my-topic
+```
+
+Each stdin line is one record. A plain line is value-only; a TAB separates
+the line into fields: first field = record key, last = value, any middle
+fields are per-record `name: value` headers.
+
+```console
+$ printf 'value only\n' | kannon t1
+$ printf 'key\tvalue\n' | kannon t1                    # key + value
+$ printf 'key\ttrace-id: 42\tsrc: cli\tvalue\n' | kannon t1   # key + headers + value
+```
+
+`-H 'name: value'` (repeatable, curl-style) attaches a header to every
+record:
+
+```console
+$ kannon -H 'source: import-job' -H 'env: prod' my-topic < file.txt
 ```
 
 - The final line is produced even without a trailing newline.

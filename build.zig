@@ -18,6 +18,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = strip,
         .single_threaded = true,
+        // Errors are one-line messages; no stack traces → drop the machinery.
+        .unwind_tables = .none,
+        .omit_frame_pointer = true,
+        .stack_protector = false,
+        .error_tracing = false,
     });
 
     const exe = b.addExecutable(.{ .name = "kannon", .root_module = mod });
