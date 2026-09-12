@@ -9,6 +9,7 @@ pub const api_key = struct {
     pub const metadata: i16 = 3;
     pub const api_versions: i16 = 18;
     pub const sasl_handshake: i16 = 17;
+    pub const init_producer_id: i16 = 22;
     pub const sasl_authenticate: i16 = 36;
 };
 
@@ -19,6 +20,7 @@ pub const version = struct {
     pub const produce: i16 = 11;
     pub const sasl_handshake: i16 = 1;
     pub const sasl_authenticate: i16 = 2;
+    pub const init_producer_id: i16 = 4;
 };
 
 pub const ErrorCode = enum(i16) {
@@ -37,6 +39,10 @@ pub const ErrorCode = enum(i16) {
     not_coordinator = 16,
     not_enough_replicas = 19,
     not_enough_replicas_after_append = 20,
+    out_of_order_sequence_number = 45,
+    duplicate_sequence_number = 46,
+    invalid_producer_epoch = 47,
+    invalid_producer_id_mapping = 49,
     unknown_producer_id = 59,
     invalid_required_ack = 21,
     topic_authorization_failed = 29,
@@ -64,6 +70,10 @@ pub const ErrorCode = enum(i16) {
             .not_coordinator => "NOT_COORDINATOR",
             .not_enough_replicas => "NOT_ENOUGH_REPLICAS",
             .not_enough_replicas_after_append => "NOT_ENOUGH_REPLICAS_AFTER_APPEND",
+            .out_of_order_sequence_number => "OUT_OF_ORDER_SEQUENCE_NUMBER",
+            .duplicate_sequence_number => "DUPLICATE_SEQUENCE_NUMBER",
+            .invalid_producer_epoch => "INVALID_PRODUCER_EPOCH",
+            .invalid_producer_id_mapping => "INVALID_PRODUCER_ID_MAPPING",
             .unknown_producer_id => "UNKNOWN_PRODUCER_ID",
             .invalid_required_ack => "INVALID_REQUIRED_ACK",
             .topic_authorization_failed => "TOPIC_AUTHORIZATION_FAILED",
@@ -88,6 +98,8 @@ pub const ErrorCode = enum(i16) {
             .not_enough_replicas_after_append,
             .unknown_topic_or_partition,
             .stale_metadata,
+            .group_load_in_progress,
+            .not_coordinator,
             => true,
             else => false,
         };
@@ -492,11 +504,17 @@ pub const Record = struct {
     headers: []const Header = &.{},
 };
 
-/// Records share the batch base timestamp (delta 0 each).
+/// Records share the batch base timestamp (delta 0 each). For idempotent
+/// produce pass the InitProducerId-issued `producer_id`/`producer_epoch` and
+/// the partition's next `base_sequence`; all -1 for a plain (non-idempotent)
+/// batch.
 pub fn encodeRecordBatch(
     e: *Encoder,
     records: []const Record,
     base_timestamp_ms: i64,
+    producer_id: i64,
+    producer_epoch: i16,
+    base_sequence: i32,
 ) ProtoError!void {
     var body = Encoder.init(e.aw.allocator);
     defer body.deinit();
@@ -505,9 +523,9 @@ pub fn encodeRecordBatch(
     try body.i32v(@intCast(records.len - 1)); // last offset delta
     try body.i64v(base_timestamp_ms);
     try body.i64v(base_timestamp_ms); // max timestamp
-    try body.i64v(-1); // producer id (non-idempotent)
-    try body.i16v(-1); // producer epoch
-    try body.i32v(-1); // base sequence
+    try body.i64v(producer_id);
+    try body.i16v(producer_epoch);
+    try body.i32v(base_sequence);
     try body.i32v(@intCast(records.len)); // record count
     for (records, 0..) |rec, idx| {
         var r = Encoder.init(e.aw.allocator);
@@ -622,7 +640,7 @@ test "record batch smoke" {
     var e = Encoder.init(std.testing.allocator);
     defer e.deinit();
     const recs = [_]Record{ .{ .value = "a" }, .{ .value = "b" }, .{ .value = "c" } };
-    try encodeRecordBatch(&e, &recs, 1700000000000);
+    try encodeRecordBatch(&e, &recs, 1700000000000, -1, -1, -1);
     const batch = e.written();
     var d = Decoder.init(batch);
     try std.testing.expectEqual(@as(i64, 0), try d.i64v());

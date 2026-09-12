@@ -61,6 +61,11 @@ $ kannon -H 'source: import-job' -H 'env: prod' my-topic < file.txt
   in flight before acks are awaited.
 - `acks=-1`; retriable errors are retried with exponential backoff and a
   metadata refresh. Retried records may reorder within their partition.
+- Idempotent produce is on by default (`enable.idempotence`): the producer
+  gets a producer id/epoch via InitProducerId, each batch carries a
+  per-partition sequence number, and at most 5 requests stay un-acked per
+  partition — broker dedup makes retries exactly-once. Set
+  `enable.idempotence=false` to disable.
 
 ## Configuration
 
@@ -81,6 +86,7 @@ kannon reads `kannon.properties` (Java properties format, `key=value` lines,
 | `ssl.truststore.location` | optional for `SSL`/`SASL_SSL` | Path to a PEM CA bundle. Falls back to the system trust store when unset. |
 | `batch.size` | no (default `1048576`) | Per-partition record buffer cap in bytes — flush when exceeded. |
 | `linger.ms` | no (default `50`) | Flush pending records after this delay when stdin stalls. |
+| `enable.idempotence` | no (default `true`) | Idempotent producer: producer id + per-partition sequences, exactly-once on retry. |
 
 Unknown keys are ignored with a warning, so a shared `server.properties`-style
 file works.

@@ -107,4 +107,23 @@ consume t1 --property print.key=true --property print.headers=true \
     | grep -qF "static-h:$M-sv|null|$M-pure" || { echo "FAIL"; exit 1; }
 echo ok
 
+echo "== 12. idempotent produce: producerId + sequences in segment =="
+# Unique topic per run so the segment dump only contains this run's batches.
+docker exec "$C" $B/kafka-topics.sh --bootstrap-server localhost:9092 \
+    --create --topic "idem-$M" --partitions 1 >/dev/null 2>&1 || true
+(cd "$TMP" && printf "$M-i1\n$M-i2\n" | "$K" "idem-$M")
+found=""
+for _ in 1 2 3 4 5; do
+    sleep 1 # let the broker flush the segment before dumping
+    seg=$(docker exec "$C" bash -c "ls /tmp/kafka-logs/idem-$M-0/*.log 2>/dev/null | head -1" || true)
+    # NB: grep -q under pipefail would SIGPIPE the dump tool — write first.
+    if [ -n "$seg" ] && docker exec "$C" $B/kafka-dump-log.sh --files "$seg" \
+        --print-data-log >"$TMP/dump.txt" 2>/dev/null \
+        && grep -qE 'baseSequence: 0 lastSequence: 1 producerId: [0-9]+' "$TMP/dump.txt"; then
+        found=1; break
+    fi
+done
+[ -n "$found" ] || { echo "FAIL: no producerId/sequence in segment"; exit 1; }
+echo ok
+
 echo "ALL SMOKE TESTS PASSED"

@@ -47,6 +47,12 @@ pub const Client = struct {
     /// produceDrain(). Lets callers keep filling batches while responses fly.
     outstanding: std.ArrayListUnmanaged(Outstanding),
     outstanding_bytes: usize,
+    /// Idempotent produce state: issued by InitProducerId (-1 = none/off).
+    producer_id: i64 = -1,
+    producer_epoch: i16 = -1,
+    producer_inited: bool = false,
+    /// pidx -> next base sequence number (idempotent produce only).
+    seqs: std.AutoHashMapUnmanaged(i32, i32),
 
     pub fn init(alloc: std.mem.Allocator, cfg: *const config.Config) Client {
         return .{
@@ -63,6 +69,7 @@ pub const Client = struct {
             .err_ctx = std.mem.zeroes([512]u8),
             .outstanding = .empty,
             .outstanding_bytes = 0,
+            .seqs = .empty,
         };
     }
 
@@ -85,6 +92,7 @@ pub const Client = struct {
             c.alloc.free(o.batches);
         }
         c.outstanding.deinit(c.alloc);
+        c.seqs.deinit(c.alloc);
         if (c.ca) |*b| b.deinit(c.alloc);
     }
 
@@ -433,6 +441,64 @@ pub const Client = struct {
         return c.partitions.items.len;
     }
 
+    // -- Idempotent produce: InitProducerId ----------------------------------
+
+    /// Ask the broker for a producer id + epoch (idempotent produce). Sends
+    /// InitProducerId v4 on the control connection; retries transient errors.
+    fn initProducerId(c: *Client) !void {
+        const conn = c.control orelse return error.MetadataFailed;
+        if (!c.checkVersion(protocol.api_key.init_producer_id, protocol.version.init_producer_id)) {
+            const r = c.api_ranges.get(protocol.api_key.init_producer_id);
+            c.setErr(
+                "broker lacks InitProducerId v{d} (range {d}..{d}); set enable.idempotence=false",
+                .{ protocol.version.init_producer_id, if (r) |x| x.min else -1, if (r) |x| x.max else -1 },
+            );
+            return error.MalformedResponse;
+        }
+        const Ctx = struct {};
+        const body = struct {
+            fn f(e: *Encoder, _: Ctx) protocol.ProtoError!void {
+                try e.compactString(null); // transactional_id: null = idempotent-only
+                try e.i32v(60000); // transaction_timeout_ms (unused without txn id)
+                try e.i64v(-1); // producer_id: -1 = broker assigns
+                try e.i16v(-1); // producer_epoch
+                try e.tagBuffer();
+            }
+        }.f;
+        var attempt: usize = 0;
+        var backoff_ms: u64 = 100;
+        while (attempt < 3) : (attempt += 1) {
+            const resp = c.sendRequest(conn, protocol.api_key.init_producer_id, protocol.version.init_producer_id, Ctx{}, body) catch {
+                c.setErr("InitProducerId request failed", .{});
+                return error.ProduceFailed;
+            };
+            defer c.alloc.free(resp.frame);
+            var d = Decoder.init(resp.body);
+            _ = try d.i32v(); // throttle
+            const code: protocol.ErrorCode = @enumFromInt(try d.i16v());
+            const pid = try d.i64v();
+            const epoch = try d.i16v();
+            if (code == .none) {
+                c.producer_id = pid;
+                c.producer_epoch = epoch;
+                c.producer_inited = true;
+                return;
+            }
+            if (!code.retriable() or attempt == 2) {
+                c.setErr("InitProducerId: {s}", .{code.name()});
+                return error.ProduceFailed;
+            }
+            c.sleep(backoff_ms);
+            backoff_ms = @min(backoff_ms * 2, 2000);
+        }
+    }
+
+    /// Ensure a producer id exists when idempotence is enabled.
+    fn ensureProducerId(c: *Client) !void {
+        if (c.cfg.enable_idempotence and !c.producer_inited)
+            try c.initProducerId();
+    }
+
     // -- Produce -------------------------------------------------------------
 
     /// A sent ProduceRequest awaiting its response. Batches stay alive in the
@@ -494,6 +560,7 @@ pub const Client = struct {
         parts: []const usize,
         sets: []const []const protocol.Record,
     ) !void {
+        try c.ensureProducerId();
         for (parts, 0..) |pi, i| {
             const pidx: i32 = @intCast(pi);
             var o: Outstanding = .{
@@ -505,11 +572,26 @@ pub const Client = struct {
                 .batches = try c.alloc.alloc([]const u8, 1),
                 .bytes = 0,
             };
+            // Assign the batch's base sequence up front; the counter advances
+            // at encode time so a retried batch keeps its original sequence.
+            const base_seq: i32 = if (c.producer_inited)
+                c.seqs.get(pidx) orelse 0
+            else
+                -1;
             var be = Encoder.init(c.alloc);
-            protocol.encodeRecordBatch(&be, sets[i], std.time.milliTimestamp()) catch {
+            protocol.encodeRecordBatch(
+                &be,
+                sets[i],
+                std.time.milliTimestamp(),
+                c.producer_id,
+                c.producer_epoch,
+                base_seq,
+            ) catch {
                 be.deinit();
                 return error.OutOfMemory;
             };
+            if (base_seq >= 0)
+                try c.seqs.put(c.alloc, pidx, base_seq + @as(i32, @intCast(sets[i].len)));
             try o.encoders.append(c.alloc, be);
             o.pidx[0] = pidx;
             o.batches[0] = be.written();
@@ -530,6 +612,11 @@ pub const Client = struct {
                 };
             } else |_| {}
             try c.outstanding.append(c.alloc, o);
+            // Idempotent produce allows at most 5 un-acked requests per
+            // partition (broker dedup window); wait for a slot before the
+            // next send on this partition.
+            if (c.producer_inited)
+                try c.produceDrainStop(topic, .{ .partition_inflight = .{ .pidx = pidx, .max = max_inflight } });
         }
     }
 
@@ -544,6 +631,28 @@ pub const Client = struct {
     /// retriable partitions. Requests left outstanding stay in flight so the
     /// caller can keep a steady window of bytes on the wire.
     pub fn produceDrainUntil(c: *Client, topic: []const u8, floor: usize) !void {
+        return c.produceDrainStop(topic, .{ .bytes_floor = floor });
+    }
+
+    /// Broker requires ≤5 in-flight produce requests per partition for
+    /// sequence dedup to hold.
+    const max_inflight = 5;
+
+    const DrainStop = union(enum) {
+        /// Drain while outstanding_bytes exceeds the floor.
+        bytes_floor: usize,
+        /// Drain while partition pidx has more than `max` un-acked requests.
+        partition_inflight: struct { pidx: i32, max: usize },
+    };
+
+    fn drainStopActive(c: *Client, stop: DrainStop) bool {
+        return switch (stop) {
+            .bytes_floor => |f| c.outstanding_bytes > f,
+            .partition_inflight => |s| if (c.inflight.get(s.pidx)) |inf| inf.n > s.max else false,
+        };
+    }
+
+    fn produceDrainStop(c: *Client, topic: []const u8, stop: DrainStop) !void {
         const PendingPart = struct { pidx: i32, batch: []const u8 };
         var retry: std.ArrayListUnmanaged(PendingPart) = .empty;
         defer retry.deinit(c.alloc);
@@ -561,7 +670,7 @@ pub const Client = struct {
             c.outstanding.items.len = rest;
         }
 
-        while (done < c.outstanding.items.len and c.outstanding_bytes > floor) {
+        while (done < c.outstanding.items.len and c.drainStopActive(stop)) {
             const o = &c.outstanding.items[done];
             done += 1;
             c.outstanding_bytes -= o.bytes;
@@ -573,7 +682,9 @@ pub const Client = struct {
                     for (o.pidx, o.batches) |pi, b| {
                         const code = codes.get(pi) orelse .none;
                         switch (code) {
-                            .none => {},
+                            // duplicate_sequence_number: broker already
+                            // appended this batch — dedup success.
+                            .none, .duplicate_sequence_number => {},
                             else => if (code.retriable()) {
                                 try retry.append(c.alloc, .{ .pidx = pi, .batch = b });
                             } else {
@@ -628,7 +739,7 @@ pub const Client = struct {
                 };
                 const code = codes.get(pp.pidx) orelse .none;
                 switch (code) {
-                    .none => c.releaseConn(pp.pidx),
+                    .none, .duplicate_sequence_number => c.releaseConn(pp.pidx),
                     else => if (code.retriable()) {
                         // Keep the claim: the retry stays bound to this conn.
                         try retry.append(c.alloc, pp);

@@ -12,6 +12,9 @@ pub const Config = struct {
     ssl_truststore_location: ?[]const u8 = null,
     linger_ms: u64 = 50,
     batch_size: usize = 1 << 20,
+    /// Idempotent produce: InitProducerId handshake + per-partition sequence
+    /// numbers so broker-side retries/dedup can never duplicate records.
+    enable_idempotence: bool = true,
 
     pub fn needsSasl(self: *const Config) bool {
         return self.security_protocol == .sasl_ssl or self.security_protocol == .sasl_plaintext;
@@ -139,6 +142,14 @@ pub fn load(alloc: std.mem.Allocator) LoadError!Config {
                 warn("invalid batch.size '{s}' ignored", .{val});
                 continue;
             };
+        } else if (std.mem.eql(u8, key, "enable.idempotence")) {
+            if (std.ascii.eqlIgnoreCase(val, "true")) {
+                cfg.enable_idempotence = true;
+            } else if (std.ascii.eqlIgnoreCase(val, "false")) {
+                cfg.enable_idempotence = false;
+            } else {
+                warn("invalid enable.idempotence '{s}' ignored", .{val});
+            }
         } else {
             warn("unknown config key '{s}' ignored", .{key});
         }
