@@ -392,10 +392,14 @@ pub fn lastCorrelationId() i32 {
 /// CRC-32C (Castagnoli) over `data`: hardware instructions when the target
 /// CPU has them (x86 SSE4.2 crc32, Armv8 crc32c*), else the std table impl.
 pub fn crc32c(data: []const u8) u32 {
-    if (comptime std.Target.x86.featureSetHas(builtin.cpu.features, .sse4_2)) {
+    if (comptime builtin.cpu.arch == .x86_64 and
+        std.Target.x86.featureSetHas(builtin.cpu.features, .sse4_2))
+    {
         return crc32cX86(data);
     }
-    if (comptime std.Target.aarch64.featureSetHas(builtin.cpu.features, .crc)) {
+    if (comptime builtin.cpu.arch == .aarch64 and
+        std.Target.aarch64.featureSetHas(builtin.cpu.features, .crc))
+    {
         return crc32cArm(data);
     }
     return std.hash.crc.Crc32Iscsi.hash(data);
@@ -442,14 +446,14 @@ fn crc32cArm(data: []const u8) u32 {
     var i: usize = 0;
     while (i + 8 <= data.len) : (i += 8) {
         const v = std.mem.readInt(u64, data[i..][0..8], .little);
-        asm ("crc32cx %[c], %[c], %[v]"
+        asm ("crc32cx %[c:w], %[c:w], %[v:x]"
             : [c] "+r" (crc),
             : [v] "r" (v),
         );
     }
     if (i + 4 <= data.len) {
         const v = std.mem.readInt(u32, data[i..][0..4], .little);
-        asm ("crc32cw %[c], %[c], %[v]"
+        asm ("crc32cw %[c:w], %[c:w], %[v:w]"
             : [c] "+r" (crc),
             : [v] "r" (v),
         );
@@ -457,14 +461,14 @@ fn crc32cArm(data: []const u8) u32 {
     }
     if (i + 2 <= data.len) {
         const v = std.mem.readInt(u16, data[i..][0..2], .little);
-        asm ("crc32ch %[c], %[c], %[v]"
+        asm ("crc32ch %[c:w], %[c:w], %[v:w]"
             : [c] "+r" (crc),
             : [v] "r" (v),
         );
         i += 2;
     }
     while (i < data.len) : (i += 1) {
-        asm ("crc32cb %[c], %[c], %[v]"
+        asm ("crc32cb %[c:w], %[c:w], %[v:w]"
             : [c] "+r" (crc),
             : [v] "r" (data[i]),
         );
