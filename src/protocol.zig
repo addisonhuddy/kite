@@ -2,6 +2,7 @@
 //! request/response framing, and record batch v2 (magic 2) encoding.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const api_key = struct {
     pub const produce: i16 = 0;
@@ -353,8 +354,24 @@ pub const Decoder = struct {
 
 var correlation_id: i32 = 0;
 
-/// Writes the request header + body into `e` via `body_fn`. Header v2 and a
-/// trailing tag buffer only when the request version is flexible.
+/// Request header v2: api key/version, correlation id, client id, tags.
+/// The tag buffer is written only when the request version is flexible.
+pub fn encodeRequestHeader(
+    e: *Encoder,
+    key: i16,
+    ver: i16,
+    flexible: bool,
+    client_id: ?[]const u8,
+) ProtoError!void {
+    correlation_id +%= 1;
+    try e.i16v(key);
+    try e.i16v(ver);
+    try e.i32v(correlation_id);
+    try e.nullableString(client_id);
+    if (flexible) try e.tagBuffer();
+}
+
+/// Writes the request header + body into `e` via `body_fn`.
 pub fn encodeRequest(
     e: *Encoder,
     key: i16,
@@ -364,17 +381,95 @@ pub fn encodeRequest(
     ctx: anytype,
     comptime body_fn: fn (*Encoder, @TypeOf(ctx)) ProtoError!void,
 ) ProtoError!void {
-    correlation_id +%= 1;
-    try e.i16v(key);
-    try e.i16v(ver);
-    try e.i32v(correlation_id);
-    try e.nullableString(client_id);
-    if (flexible) try e.tagBuffer();
+    try encodeRequestHeader(e, key, ver, flexible, client_id);
     try body_fn(e, ctx);
 }
 
 pub fn lastCorrelationId() i32 {
     return correlation_id;
+}
+
+/// CRC-32C (Castagnoli) over `data`: hardware instructions when the target
+/// CPU has them (x86 SSE4.2 crc32, Armv8 crc32c*), else the std table impl.
+pub fn crc32c(data: []const u8) u32 {
+    if (comptime std.Target.x86.featureSetHas(builtin.cpu.features, .sse4_2)) {
+        return crc32cX86(data);
+    }
+    if (comptime std.Target.aarch64.featureSetHas(builtin.cpu.features, .crc)) {
+        return crc32cArm(data);
+    }
+    return std.hash.crc.Crc32Iscsi.hash(data);
+}
+
+fn crc32cX86(data: []const u8) u32 {
+    var crc: u64 = 0xffffffff;
+    var i: usize = 0;
+    while (i + 8 <= data.len) : (i += 8) {
+        const v = std.mem.readInt(u64, data[i..][0..8], .little);
+        asm ("crc32q %[v], %[c]"
+            : [c] "+r" (crc),
+            : [v] "r" (v),
+        );
+    }
+    var crc32: u32 = @truncate(crc);
+    if (i + 4 <= data.len) {
+        const v = std.mem.readInt(u32, data[i..][0..4], .little);
+        asm ("crc32l %[v], %[c]"
+            : [c] "+r" (crc32),
+            : [v] "r" (v),
+        );
+        i += 4;
+    }
+    if (i + 2 <= data.len) {
+        const v = std.mem.readInt(u16, data[i..][0..2], .little);
+        asm ("crc32w %[v], %[c]"
+            : [c] "+r" (crc32),
+            : [v] "r" (v),
+        );
+        i += 2;
+    }
+    while (i < data.len) : (i += 1) {
+        asm ("crc32b %[v], %[c]"
+            : [c] "+r" (crc32),
+            : [v] "r" (data[i]),
+        );
+    }
+    return ~crc32;
+}
+
+fn crc32cArm(data: []const u8) u32 {
+    var crc: u32 = 0xffffffff;
+    var i: usize = 0;
+    while (i + 8 <= data.len) : (i += 8) {
+        const v = std.mem.readInt(u64, data[i..][0..8], .little);
+        asm ("crc32cx %[c], %[c], %[v]"
+            : [c] "+r" (crc),
+            : [v] "r" (v),
+        );
+    }
+    if (i + 4 <= data.len) {
+        const v = std.mem.readInt(u32, data[i..][0..4], .little);
+        asm ("crc32cw %[c], %[c], %[v]"
+            : [c] "+r" (crc),
+            : [v] "r" (v),
+        );
+        i += 4;
+    }
+    if (i + 2 <= data.len) {
+        const v = std.mem.readInt(u16, data[i..][0..2], .little);
+        asm ("crc32ch %[c], %[c], %[v]"
+            : [c] "+r" (crc),
+            : [v] "r" (v),
+        );
+        i += 2;
+    }
+    while (i < data.len) : (i += 1) {
+        asm ("crc32cb %[c], %[c], %[v]"
+            : [c] "+r" (crc),
+            : [v] "r" (data[i]),
+        );
+    }
+    return ~crc;
 }
 
 // ---------------------------------------------------------------------------
@@ -440,7 +535,7 @@ pub fn encodeRecordBatch(
     }
 
     const body_bytes = body.written();
-    const crc = std.hash.crc.Crc32Iscsi.hash(body_bytes);
+    const crc = crc32c(body_bytes);
 
     try e.i64v(0); // base offset (broker assigns)
     try e.i32v(@intCast(4 + 1 + 4 + body_bytes.len)); // batchLength

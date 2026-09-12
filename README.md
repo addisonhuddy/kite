@@ -53,12 +53,14 @@ $ kannon -H 'source: import-job' -H 'env: prod' my-topic < file.txt
 ```
 
 - The final line is produced even without a trailing newline.
-- Records are buffered per partition and flushed when a ~1 MiB batch cap is
-  hit, after a ~50 ms linger, or at EOF.
-- Partitioning is sticky: each flush goes to one partition, round-robining
-  between flushes.
+- Records are buffered per partition and flushed when a `batch.size` cap is
+  hit, after a `linger.ms` linger, or at EOF.
+- Keyed records partition by murmur2 (like Kafka's default partitioner);
+  unkeyed records round-robin so all partitions fill together.
+- Produces are pipelined: one connection per partition with up to ~96 MiB
+  in flight before acks are awaited.
 - `acks=-1`; retriable errors are retried with exponential backoff and a
-  metadata refresh.
+  metadata refresh. Retried records may reorder within their partition.
 
 ## Configuration
 
@@ -77,6 +79,8 @@ kannon reads `kannon.properties` (Java properties format, `key=value` lines,
 | `sasl.username` | required for `SASL_*` | |
 | `sasl.password` | required for `SASL_*` | |
 | `ssl.truststore.location` | optional for `SSL`/`SASL_SSL` | Path to a PEM CA bundle. Falls back to the system trust store when unset. |
+| `batch.size` | no (default `1048576`) | Per-partition record buffer cap in bytes — flush when exceeded. |
+| `linger.ms` | no (default `50`) | Flush pending records after this delay when stdin stalls. |
 
 Unknown keys are ignored with a warning, so a shared `server.properties`-style
 file works.

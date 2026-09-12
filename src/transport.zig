@@ -16,7 +16,9 @@ pub const TransportError = error{
 };
 
 const rbuf_len = std.crypto.tls.Client.min_buffer_len + 4096;
-const wbuf_len = 64 * 1024;
+// Net send buffer: large enough to hold many TLS records so socket writes
+// are amortized — ciphertext only reaches the wire on explicit flush.
+const wbuf_len = 512 * 1024;
 const tls_plain_len = 32 * 1024;
 /// Kafka brokers never need a response larger than this for the requests we
 /// send (metadata for one topic, produce acks).
@@ -57,6 +59,8 @@ fn tcpConnect(alloc: std.mem.Allocator, host: []const u8, port: u16) !std.net.St
         std.posix.setsockopt(s.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
         const one: c_int = 1;
         std.posix.setsockopt(s.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
+        // NB: no SO_SNDBUF — explicit values clamp to wmem_max (~208KB here),
+        // smaller than tcp autotuning's ceiling.
         return s;
     }
     return last_err;
@@ -118,12 +122,23 @@ pub fn connect(
 
 /// Send a framed request (4-byte big-endian length + payload).
 pub fn send(c: *Conn, payload: []const u8) TransportError!void {
-    if (std.posix.getenv("KANNON_DEBUG") != null)
-        std.debug.print("send {d}B: {x}\n", .{ payload.len, payload[0..@min(payload.len, 200)] });
+    return sendv(c, &.{payload});
+}
+
+/// Send a framed request assembled from parts — the frame length is the sum
+/// of part lengths; parts are written back-to-back without copying into a
+/// contiguous buffer (avoids duplicating multi-MB record batches).
+pub fn sendv(c: *Conn, parts: []const []const u8) TransportError!void {
+    var total: usize = 0;
+    for (parts) |p| total += p.len;
+    if (std.posix.getenv("KANNON_DEBUG") != null) {
+        const first = parts[0];
+        std.debug.print("send {d}B: {x}\n", .{ total, first[0..@min(first.len, 200)] });
+    }
     var hdr: [4]u8 = undefined;
-    std.mem.writeInt(u32, &hdr, @intCast(payload.len), .big);
+    std.mem.writeInt(u32, &hdr, @intCast(total), .big);
     c.output.writeAll(&hdr) catch return error.IoFailed;
-    c.output.writeAll(payload) catch return error.IoFailed;
+    for (parts) |p| c.output.writeAll(p) catch return error.IoFailed;
     c.output.flush() catch |err| {
         if (std.posix.getenv("KANNON_DEBUG") != null)
             std.debug.print("send flush: {s}\n", .{@errorName(err)});

@@ -17,9 +17,6 @@ comptime {
     _ = scram;
 }
 
-const batch_bytes_cap = 1 << 20; // ~1MB per partition before flush
-const linger_ms: i32 = 50;
-
 fn out(comptime fmt: []const u8, args: anytype) void {
     var buf: [1024]u8 = undefined;
     var w = std.fs.File.stderr().writer(&buf);
@@ -159,14 +156,20 @@ pub fn main() !void {
     const r = &stdin_reader.interface;
     const stdin_fd = std.fs.File.stdin().handle;
 
-    var sticky: usize = 0;
+    var rr: usize = 0; // round-robin cursor for unkeyed records
     var total: u64 = 0;
+    const timing = std.posix.getenv("KANNON_TIME") != null;
+    var t_read: u64 = 0;
+    var t_flush: u64 = 0;
+    var t_drain: u64 = 0;
+    var timer = std.time.Timer.start() catch unreachable;
     read_loop: while (true) {
         // Linger: with pending records and no stdin data within linger_ms,
-        // flush rather than block indefinitely on a slow producer.
-        if (pendingBytes(pend) > 0) {
+        // flush rather than block indefinitely on a slow producer. Skip the
+        // poll when a full line is already buffered — no read() can block.
+        if (pendingBytes(pend) > 0 and std.mem.indexOfScalar(u8, r.buffered(), '\n') == null) {
             var fds = [_]std.posix.pollfd{.{ .fd = stdin_fd, .events = std.posix.POLL.IN, .revents = 0 }};
-            const nready = std.posix.poll(&fds, linger_ms) catch 1;
+            const nready = std.posix.poll(&fds, @intCast(@min(cfg.linger_ms, std.math.maxInt(i32)))) catch 1;
             if (nready == 0) {
                 flushAll(&cli, topic, pend) catch |err| produceFatal(&cli, err);
                 continue;
@@ -174,18 +177,37 @@ pub fn main() !void {
         }
 
         const owned = nextLine(r, alloc) catch fatal("failed reading stdin", .{}) orelse break :read_loop;
+        t_read += timer.lap();
         total += 1;
         const rec = parseLine(alloc, owned, static_headers.items, total);
-        const p = &pend[sticky];
+        // Keyed records partition by murmur2 like Kafka's default partitioner;
+        // unkeyed records round-robin so every partition fills together.
+        const target: usize = if (rec.key) |k| blk: {
+            const h = std.hash.murmur.Murmur2_32.hashWithSeed(k, 0x9747b28c);
+            break :blk (h & 0x7fffffff) % nparts;
+        } else blk: {
+            const t = rr;
+            rr = (rr + 1) % nparts;
+            break :blk t;
+        };
+        const p = &pend[target];
         p.records.append(alloc, rec) catch fatal("out of memory", .{});
         p.bytes += owned.len;
-        if (p.bytes >= batch_bytes_cap) {
-            flushPartition(&cli, topic, pend, sticky) catch |err| produceFatal(&cli, err);
-            sticky = (sticky + 1) % nparts;
+        if (p.bytes >= cfg.batch_size) {
+            // Cap hit: flush every partition's pending buffer in one pipelined
+            // round so all leader conns go in flight together.
+            flushAll(&cli, topic, pend) catch |err| produceFatal(&cli, err);
+            t_flush += timer.lap();
+            if (cli.outstanding_bytes >= 96 << 20) {
+                cli.produceDrainUntil(topic, 96 << 20) catch |err| produceFatal(&cli, err);
+                t_drain += timer.lap();
+            }
         }
     }
 
     flushAll(&cli, topic, pend) catch |err| produceFatal(&cli, err);
+    cli.produceDrain(topic) catch |err| produceFatal(&cli, err);
+    if (timing) std.debug.print("read {d}ms send {d}ms drain {d}ms conns {d}\n", .{ t_read / 1_000_000, t_flush / 1_000_000, (t_drain + timer.lap()) / 1_000_000, cli.conns.count() });
 
     var buf: [256]u8 = undefined;
     var w = std.fs.File.stdout().writer(&buf);
@@ -228,15 +250,21 @@ fn nextLine(r: *std.Io.Reader, alloc: std.mem.Allocator) !?[]const u8 {
 }
 
 fn flushAll(c: *client.Client, topic: []const u8, pend: []Pending) !void {
-    for (0..pend.len) |i| try flushPartition(c, topic, pend, i);
-}
-
-fn flushPartition(c: *client.Client, topic: []const u8, pend: []Pending, i: usize) !void {
-    const p = &pend[i];
-    if (p.records.items.len == 0) return;
-    try c.produceToPartition(topic, i, p.records.items);
-    p.records.clearRetainingCapacity();
-    p.bytes = 0;
+    var parts: std.ArrayListUnmanaged(usize) = .empty;
+    var sets: std.ArrayListUnmanaged([]const protocol.Record) = .empty;
+    defer parts.deinit(c.alloc);
+    defer sets.deinit(c.alloc);
+    for (pend, 0..) |*p, i| {
+        if (p.records.items.len == 0) continue;
+        try parts.append(c.alloc, i);
+        try sets.append(c.alloc, p.records.items);
+    }
+    if (parts.items.len == 0) return;
+    try c.produceEnqueue(topic, parts.items, sets.items);
+    for (parts.items) |i| {
+        pend[i].records.clearRetainingCapacity();
+        pend[i].bytes = 0;
+    }
 }
 
 fn produceFatal(c: *client.Client, err: anyerror) noreturn {

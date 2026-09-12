@@ -22,8 +22,16 @@ const max_attempts = 6;
 pub const Client = struct {
     alloc: std.mem.Allocator,
     cfg: *const config.Config,
-    /// node_id -> connection (broker connections opened lazily)
-    conns: std.AutoHashMapUnmanaged(i32, *Conn),
+    /// conn_key (node<<32 | slot) -> connection. Produce uses a small pool of
+    /// connections per partition: while a partition has un-acked batches in
+    /// flight they all ride the same socket (order preserved); once drained it
+    /// migrates to the next slot, so throughput scales with connection count
+    /// on ingest-capped services without ever racing a partition's records.
+    conns: std.AutoHashMapUnmanaged(u64, *Conn),
+    /// pidx -> the conn key it is currently bound to + outstanding count.
+    inflight: std.AutoHashMapUnmanaged(i32, Inflight),
+    /// pidx -> alternation counter for picking the partition's next conn slot.
+    alt: std.AutoHashMapUnmanaged(i32, u32),
     /// conn used for metadata; also the bootstrap connection
     control: ?*Conn,
     /// node_id -> advertised broker address from metadata
@@ -35,18 +43,26 @@ pub const Client = struct {
     ca: ?std.crypto.Certificate.Bundle,
     /// diagnostic detail for error messages
     err_ctx: [512]u8,
+    /// Queue of sent-but-unacknowledged ProduceRequests; drained by
+    /// produceDrain(). Lets callers keep filling batches while responses fly.
+    outstanding: std.ArrayListUnmanaged(Outstanding),
+    outstanding_bytes: usize,
 
     pub fn init(alloc: std.mem.Allocator, cfg: *const config.Config) Client {
         return .{
             .alloc = alloc,
             .cfg = cfg,
             .conns = .empty,
+            .inflight = .empty,
+            .alt = .empty,
             .control = null,
             .brokers = .empty,
             .partitions = .empty,
             .api_ranges = .empty,
             .ca = null,
             .err_ctx = std.mem.zeroes([512]u8),
+            .outstanding = .empty,
+            .outstanding_bytes = 0,
         };
     }
 
@@ -57,9 +73,18 @@ pub const Client = struct {
             c.alloc.destroy(conn.*);
         }
         c.conns.deinit(c.alloc);
+        c.inflight.deinit(c.alloc);
+        c.alt.deinit(c.alloc);
         c.brokers.deinit(c.alloc);
         c.partitions.deinit(c.alloc);
         c.api_ranges.deinit(c.alloc);
+        for (c.outstanding.items) |*o| {
+            for (o.encoders.items) |*e| e.deinit();
+            o.encoders.deinit(c.alloc);
+            c.alloc.free(o.pidx);
+            c.alloc.free(o.batches);
+        }
+        c.outstanding.deinit(c.alloc);
         if (c.ca) |*b| b.deinit(c.alloc);
     }
 
@@ -410,108 +435,316 @@ pub const Client = struct {
 
     // -- Produce -------------------------------------------------------------
 
-    /// Encode `records` into one record batch and produce it to `partition`
-    /// of `topic`, retrying retriable errors with backoff + metadata refresh.
-    pub fn produceToPartition(
+    /// A sent ProduceRequest awaiting its response. Batches stay alive in the
+    /// encoders so retriable partitions can be resent verbatim.
+    const Outstanding = struct {
+        node: i32,
+        ckey: u64,
+        conn: *Conn,
+        corr: i32, // <0 = the send never completed; all parts retriable
+        pidx: []i32,
+        batches: [][]const u8,
+        bytes: usize,
+        encoders: std.ArrayListUnmanaged(Encoder) = .empty,
+    };
+
+    const Inflight = struct { node: i32, key: u64, n: usize };
+    const conns_per_partition = 2;
+
+    fn connKey(node: i32, slot: u32) u64 {
+        return (@as(u64, @intCast(node)) << 32) | slot;
+    }
+
+    /// Pick (and pin) the connection for partition `pidx`: if the partition
+    /// still has un-acked requests, reuse that conn; otherwise migrate it to
+    /// the next of its conns_per_partition slots.
+    fn claimConn(c: *Client, pidx: i32) !struct { node: i32, key: u64 } {
+        if (c.inflight.getPtr(pidx)) |inf| {
+            inf.n += 1;
+            return .{ .node = inf.node, .key = inf.key };
+        }
+        const node = c.partitionLeader(pidx) orelse {
+            c.setErr("no leader for partition {d}", .{pidx});
+            return error.MetadataFailed;
+        };
+        const a = c.alt.get(pidx) orelse 0;
+        try c.alt.put(c.alloc, pidx, a + 1);
+        const slot = @as(u32, @intCast(pidx)) * conns_per_partition + a % conns_per_partition;
+        const key = connKey(node, slot);
+        try c.inflight.put(c.alloc, pidx, .{ .node = node, .key = key, .n = 1 });
+        return .{ .node = node, .key = key };
+    }
+
+    /// One of the partition's outstanding requests resolved; when the count
+    /// hits zero the binding is released and the next batch may migrate conns.
+    fn releaseConn(c: *Client, pidx: i32) void {
+        if (c.inflight.getPtr(pidx)) |inf| {
+            inf.n -= 1;
+            if (inf.n == 0) _ = c.inflight.remove(pidx);
+        }
+    }
+
+    /// Encode `sets` into record batches and send one ProduceRequest per
+    /// partition on that partition's own connection — all in flight at once.
+    /// Returns after the sends complete; call produceDrain() to collect
+    /// responses (mandatory before exit, and whenever outstanding_bytes grows).
+    pub fn produceEnqueue(
         c: *Client,
         topic: []const u8,
-        partition: usize,
-        records: []const protocol.Record,
+        parts: []const usize,
+        sets: []const []const protocol.Record,
     ) !void {
-        var be = Encoder.init(c.alloc);
-        defer be.deinit();
-        protocol.encodeRecordBatch(&be, records, std.time.milliTimestamp()) catch
-            return error.OutOfMemory;
-        const batch = be.written();
+        for (parts, 0..) |pi, i| {
+            const pidx: i32 = @intCast(pi);
+            var o: Outstanding = .{
+                .node = -1,
+                .ckey = 0,
+                .conn = undefined,
+                .corr = -1,
+                .pidx = try c.alloc.alloc(i32, 1),
+                .batches = try c.alloc.alloc([]const u8, 1),
+                .bytes = 0,
+            };
+            var be = Encoder.init(c.alloc);
+            protocol.encodeRecordBatch(&be, sets[i], std.time.milliTimestamp()) catch {
+                be.deinit();
+                return error.OutOfMemory;
+            };
+            try o.encoders.append(c.alloc, be);
+            o.pidx[0] = pidx;
+            o.batches[0] = be.written();
+            o.bytes = be.written().len;
+            c.outstanding_bytes += o.bytes;
+            const claim = c.claimConn(pidx) catch {
+                try c.outstanding.append(c.alloc, o);
+                continue;
+            };
+            o.node = claim.node;
+            o.ckey = claim.key;
+            if (c.connFor(claim.node, claim.key)) |conn| {
+                o.conn = conn;
+                o.corr = c.produceSend(conn, topic, o.pidx, o.batches) catch {
+                    c.dropConn(claim.key);
+                    try c.outstanding.append(c.alloc, o);
+                    continue;
+                };
+            } else |_| {}
+            try c.outstanding.append(c.alloc, o);
+        }
+    }
+
+    /// Drain every outstanding ProduceResponse in send order, then retry
+    /// retriable partitions (backoff + metadata refresh) up to max_attempts.
+    pub fn produceDrain(c: *Client, topic: []const u8) !void {
+        return c.produceDrainUntil(topic, 0);
+    }
+
+    /// Receive responses for the oldest outstanding requests while
+    /// outstanding_bytes exceeds `floor` (floor 0 drains all), then retry
+    /// retriable partitions. Requests left outstanding stay in flight so the
+    /// caller can keep a steady window of bytes on the wire.
+    pub fn produceDrainUntil(c: *Client, topic: []const u8, floor: usize) !void {
+        const PendingPart = struct { pidx: i32, batch: []const u8 };
+        var retry: std.ArrayListUnmanaged(PendingPart) = .empty;
+        defer retry.deinit(c.alloc);
+
+        var done: usize = 0;
+        defer {
+            for (c.outstanding.items[0..done]) |*o| {
+                for (o.encoders.items) |*e| e.deinit();
+                o.encoders.deinit(c.alloc);
+                c.alloc.free(o.pidx);
+                c.alloc.free(o.batches);
+            }
+            const rest = c.outstanding.items.len - done;
+            std.mem.copyForwards(Outstanding, c.outstanding.items[0..rest], c.outstanding.items[done..]);
+            c.outstanding.items.len = rest;
+        }
+
+        while (done < c.outstanding.items.len and c.outstanding_bytes > floor) {
+            const o = &c.outstanding.items[done];
+            done += 1;
+            c.outstanding_bytes -= o.bytes;
+            c.releaseConn(o.pidx[0]);
+            if (o.corr >= 0) {
+                var codes = std.AutoHashMapUnmanaged(i32, protocol.ErrorCode).empty;
+                defer codes.deinit(c.alloc);
+                if (c.produceRecv(o.conn, o.corr, &codes)) |_| {
+                    for (o.pidx, o.batches) |pi, b| {
+                        const code = codes.get(pi) orelse .none;
+                        switch (code) {
+                            .none => {},
+                            else => if (code.retriable()) {
+                                try retry.append(c.alloc, .{ .pidx = pi, .batch = b });
+                            } else {
+                                c.setErr("produce to {s}[{d}]: {s}", .{ topic, pi, code.name() });
+                                return error.ProduceFailed;
+                            },
+                        }
+                    }
+                } else |_| {
+                    c.dropConn(o.ckey);
+                    for (o.pidx, o.batches) |pi, b|
+                        try retry.append(c.alloc, .{ .pidx = pi, .batch = b });
+                }
+            } else {
+                for (o.pidx, o.batches) |pi, b|
+                    try retry.append(c.alloc, .{ .pidx = pi, .batch = b });
+            }
+        }
 
         var attempt: usize = 0;
         var backoff_ms: u64 = 100;
-        while (attempt < max_attempts) : (attempt += 1) {
-            const leader = c.partitions.items[partition].leader;
-            const conn = c.connForBroker(leader) catch {
-                c.sleep(backoff_ms);
-                backoff_ms = @min(backoff_ms * 2, 3000);
-                _ = c.refreshMetadata(topic) catch {};
-                continue;
-            };
-            const code = c.produceOnce(conn, topic, @intCast(partition), batch) catch {
-                c.dropConn(leader);
-                c.sleep(backoff_ms);
-                backoff_ms = @min(backoff_ms * 2, 3000);
-                continue;
-            };
-            switch (code) {
-                .none => return,
-                else => {
-                    if (code.retriable()) {
-                        c.sleep(backoff_ms);
-                        backoff_ms = @min(backoff_ms * 2, 3000);
-                        _ = c.refreshMetadata(topic) catch {};
-                        continue;
-                    }
-                    c.setErr("produce to {s}[{d}]: {s}", .{ topic, partition, code.name() });
-                    return error.ProduceFailed;
-                },
+        while (retry.items.len > 0 and attempt < max_attempts) : (attempt += 1) {
+            c.sleep(backoff_ms);
+            backoff_ms = @min(backoff_ms * 2, 3000);
+            _ = c.refreshMetadata(topic) catch {};
+
+            const items = try retry.toOwnedSlice(c.alloc);
+            defer c.alloc.free(items);
+            for (items) |pp| {
+                const claim = c.claimConn(pp.pidx) catch {
+                    try retry.append(c.alloc, pp);
+                    continue;
+                };
+                const conn = c.connFor(claim.node, claim.key) catch {
+                    c.releaseConn(pp.pidx);
+                    try retry.append(c.alloc, pp);
+                    continue;
+                };
+                const corr = c.produceSend(conn, topic, &.{pp.pidx}, &.{pp.batch}) catch {
+                    c.dropConn(claim.key);
+                    c.releaseConn(pp.pidx);
+                    try retry.append(c.alloc, pp);
+                    continue;
+                };
+                var codes = std.AutoHashMapUnmanaged(i32, protocol.ErrorCode).empty;
+                defer codes.deinit(c.alloc);
+                c.produceRecv(conn, corr, &codes) catch {
+                    c.dropConn(claim.key);
+                    c.releaseConn(pp.pidx);
+                    try retry.append(c.alloc, pp);
+                    continue;
+                };
+                const code = codes.get(pp.pidx) orelse .none;
+                switch (code) {
+                    .none => c.releaseConn(pp.pidx),
+                    else => if (code.retriable()) {
+                        // Keep the claim: the retry stays bound to this conn.
+                        try retry.append(c.alloc, pp);
+                    } else {
+                        c.setErr("produce to {s}[{d}]: {s}", .{ topic, pp.pidx, code.name() });
+                        return error.ProduceFailed;
+                    },
+                }
             }
         }
-        c.setErr("produce to {s}[{d}]: giving up after {d} attempts", .{ topic, partition, max_attempts });
-        return error.ProduceFailed;
+        if (retry.items.len > 0) {
+            c.setErr("produce to {s}: giving up after {d} attempts", .{ topic, max_attempts });
+            return error.ProduceFailed;
+        }
+    }
+
+    fn partitionLeader(c: *Client, pidx: i32) ?i32 {
+        for (c.partitions.items) |p|
+            if (p.index == pidx) return p.leader;
+        return null;
     }
 
     fn sleep(_: *Client, ms: u64) void {
         std.Thread.sleep(ms * std.time.ns_per_ms);
     }
 
-    fn connForBroker(c: *Client, node: i32) !*Conn {
-        if (c.conns.get(node)) |conn| return conn;
+    fn connFor(c: *Client, node: i32, key: u64) !*Conn {
+        if (c.conns.get(key)) |conn| return conn;
         const addr = c.brokers.get(node) orelse {
             c.setErr("no address for broker node {d}", .{node});
             return error.MetadataFailed;
         };
         const conn = try c.connectOne(addr.host, addr.port);
-        try c.conns.put(c.alloc, node, conn);
+        try c.conns.put(c.alloc, key, conn);
         return conn;
     }
 
-    fn dropConn(c: *Client, node: i32) void {
-        if (c.conns.fetchRemove(node)) |kv| {
+    fn dropConn(c: *Client, key: u64) void {
+        if (c.conns.fetchRemove(key)) |kv| {
             kv.value.close();
             c.alloc.destroy(kv.value);
         }
     }
 
-    /// One ProduceRequest holding a single topic/partition; returns the
-    /// partition-level error code.
-    fn produceOnce(c: *Client, conn: *Conn, topic: []const u8, pidx: i32, batch: []const u8) !protocol.ErrorCode {
-        const Ctx = struct { topic: []const u8, pidx: i32, batch: []const u8 };
-        const body = struct {
-            fn f(e: *Encoder, x: Ctx) protocol.ProtoError!void {
-                try e.compactString(null); // transactional_id
-                try e.i16v(-1); // acks=all
-                try e.i32v(15000); // timeout_ms
-                try e.compactArrayLen(1); // one topic
-                try e.compactString(x.topic);
-                try e.compactArrayLen(1); // one partition
-                try e.i32v(x.pidx);
-                try e.compactBytes(x.batch);
-                try e.tagBuffer();
-                try e.tagBuffer();
-                try e.tagBuffer();
-            }
-        }.f;
-        const resp = try c.sendRequest(conn, protocol.api_key.produce, protocol.version.produce, Ctx{ .topic = topic, .pidx = pidx, .batch = batch }, body);
+    /// Send a ProduceRequest covering `pidx`/`batches` (one batch per
+    /// partition) on `conn` without waiting for the response; returns the
+    /// correlation id. Batch bytes are spliced into the frame verbatim —
+    /// never copied into a contiguous request buffer.
+    fn produceSend(
+        c: *Client,
+        conn: *Conn,
+        topic: []const u8,
+        pidx: []const i32,
+        batches: []const []const u8,
+    ) !i32 {
+        var parts: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer parts.deinit(c.alloc);
+        // Small per-partition prefix/tail encoders kept alive until the send
+        // completes; their written() slices are the parts.
+        var keep: std.ArrayListUnmanaged(Encoder) = .empty;
+        defer {
+            for (keep.items) |*k| k.deinit();
+            keep.deinit(c.alloc);
+        }
+
+        var head = Encoder.init(c.alloc);
+        try protocol.encodeRequestHeader(&head, protocol.api_key.produce, protocol.version.produce, true, "kannon");
+        try head.compactString(null); // transactional_id
+        try head.i16v(-1); // acks=all
+        try head.i32v(15000); // timeout_ms
+        try head.compactArrayLen(1); // one topic
+        try head.compactString(topic);
+        try head.compactArrayLen(pidx.len);
+        try keep.append(c.alloc, head);
+        try parts.append(c.alloc, keep.items[keep.items.len - 1].written());
+
+        for (pidx, batches) |p, b| {
+            var ph = Encoder.init(c.alloc);
+            try ph.i32v(p);
+            try ph.uvarint(b.len + 1); // compact records length
+            try keep.append(c.alloc, ph);
+            try parts.append(c.alloc, keep.items[keep.items.len - 1].written());
+            try parts.append(c.alloc, b);
+        }
+
+        var tail = Encoder.init(c.alloc);
+        try tail.tagBuffer(); // partition tags
+        try tail.tagBuffer(); // topic tags
+        try tail.tagBuffer(); // request tags
+        try keep.append(c.alloc, tail);
+        try parts.append(c.alloc, keep.items[keep.items.len - 1].written());
+
+        try transport.sendv(conn, parts.items);
+        return protocol.lastCorrelationId();
+    }
+
+    /// Read the ProduceResponse for correlation id `corr`; fills `codes`
+    /// with partition_index -> error code.
+    fn produceRecv(
+        c: *Client,
+        conn: *Conn,
+        corr: i32,
+        codes: *std.AutoHashMapUnmanaged(i32, protocol.ErrorCode),
+    ) !void {
+        const resp = try transport.recv(conn, c.alloc, corr, true);
         defer c.alloc.free(resp.frame);
 
         var d = Decoder.init(resp.body);
         const ntopics = try d.compactArrayLen();
         var t: i64 = 0;
-        var result: protocol.ErrorCode = .none;
         while (t < ntopics) : (t += 1) {
             _ = try d.compactString(); // name
             const nparts = try d.compactArrayLen();
             var p: i64 = 0;
             while (p < nparts) : (p += 1) {
-                _ = try d.i32v(); // partition index
+                const pidx = try d.i32v();
                 const code: protocol.ErrorCode = @enumFromInt(try d.i16v());
                 _ = try d.i64v(); // base_offset
                 _ = try d.i64v(); // log_append_time_ms
@@ -525,10 +758,12 @@ pub const Client = struct {
                 }
                 _ = try d.compactString(); // error_message
                 try d.tagBuffer(); // partition tags
-                result = code;
+                try codes.put(c.alloc, pidx, code);
             }
             try d.tagBuffer(); // topic tags
         }
-        return result;
+        const throttle = try d.i32v();
+        if (throttle > 0) std.debug.print("kannon: broker throttled produce {d}ms\n", .{throttle});
+        try d.tagBuffer();
     }
 };

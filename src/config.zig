@@ -10,6 +10,8 @@ pub const Config = struct {
     sasl_username: ?[]const u8 = null,
     sasl_password: ?[]const u8 = null,
     ssl_truststore_location: ?[]const u8 = null,
+    linger_ms: u64 = 50,
+    batch_size: usize = 1 << 20,
 
     pub fn needsSasl(self: *const Config) bool {
         return self.security_protocol == .sasl_ssl or self.security_protocol == .sasl_plaintext;
@@ -127,6 +129,16 @@ pub fn load(alloc: std.mem.Allocator) LoadError!Config {
             cfg.sasl_password = val;
         } else if (std.mem.eql(u8, key, "ssl.truststore.location")) {
             cfg.ssl_truststore_location = val;
+        } else if (std.mem.eql(u8, key, "linger.ms")) {
+            cfg.linger_ms = std.fmt.parseInt(u64, val, 10) catch {
+                warn("invalid linger.ms '{s}' ignored", .{val});
+                continue;
+            };
+        } else if (std.mem.eql(u8, key, "batch.size")) {
+            cfg.batch_size = std.fmt.parseInt(usize, val, 10) catch {
+                warn("invalid batch.size '{s}' ignored", .{val});
+                continue;
+            };
         } else {
             warn("unknown config key '{s}' ignored", .{key});
         }
