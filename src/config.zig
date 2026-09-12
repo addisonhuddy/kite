@@ -15,6 +15,8 @@ pub const Config = struct {
     /// Idempotent produce: InitProducerId handshake + per-partition sequence
     /// numbers so broker-side retries/dedup can never duplicate records.
     enable_idempotence: bool = true,
+    /// Verbose diagnostics on stderr (-v / --verbose flag).
+    verbose: bool = false,
 
     pub fn needsSasl(self: *const Config) bool {
         return self.security_protocol == .sasl_ssl or self.security_protocol == .sasl_plaintext;

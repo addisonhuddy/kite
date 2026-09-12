@@ -38,12 +38,13 @@ fn fatalErr(c: *const client.Client, comptime fmt: []const u8) noreturn {
 }
 
 fn usageExit(code: u8) noreturn {
-    out("usage: kannon [-H 'name: value']... <topic>\n" ++
+    out("usage: kannon [-v] [-H 'name: value']... <topic>\n" ++
         "  reads records from stdin, one per line:\n" ++
         "    value                            value only\n" ++
         "    key<TAB>value                    record key + value\n" ++
         "    key<TAB>h1: v1<TAB>...<TAB>value key + headers + value\n" ++
-        "  -H 'name: value' adds the header to every record (repeatable)\n", .{});
+        "  -H 'name: value' adds the header to every record (repeatable)\n" ++
+        "  -v, --verbose   connection/retry diagnostics on stderr\n", .{});
     std.process.exit(code);
 }
 
@@ -105,6 +106,7 @@ pub fn main() !void {
     const args = std.process.argsAlloc(alloc) catch fatal("out of memory", .{});
     var static_headers: std.ArrayListUnmanaged(protocol.Header) = .empty;
     var topic_arg: ?[]const u8 = null;
+    var verbose = false;
     var ai: usize = 1;
     while (ai < args.len) : (ai += 1) {
         const a = args[ai];
@@ -114,6 +116,8 @@ pub fn main() !void {
             static_headers.append(alloc, parseHeaderArg(args[ai])) catch fatal("out of memory", .{});
         } else if (std.mem.startsWith(u8, a, "-H") and a.len > 2) {
             static_headers.append(alloc, parseHeaderArg(a[2..])) catch fatal("out of memory", .{});
+        } else if (std.mem.eql(u8, a, "-v") or std.mem.eql(u8, a, "--verbose")) {
+            verbose = true;
         } else if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
             usageExit(0);
         } else if (std.mem.startsWith(u8, a, "-")) {
@@ -137,6 +141,7 @@ pub fn main() !void {
         error.MissingSaslCredentials => fatal("sasl.mechanism set but sasl.username/sasl.password missing", .{}),
         else => fatal("failed to load kannon.properties: {s}", .{@errorName(err)}),
     };
+    cfg.verbose = verbose;
 
     var cli = client.Client.init(alloc, &cfg);
     cli.bootstrap() catch fatalErr(&cli, "could not reach any bootstrap server");

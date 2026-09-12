@@ -91,6 +91,19 @@ kannon reads `kannon.properties` (Java properties format, `key=value` lines,
 Unknown keys are ignored with a warning, so a shared `server.properties`-style
 file works.
 
+## Diagnostics
+
+All diagnostics go to stderr; stdout carries only the final
+`N record(s) produced to '<topic>'` line.
+
+- `-v` / `--verbose` — connection lifecycle (bootstrap, per-broker connects,
+  drops), partition counts, the assigned producer id, and every retry attempt
+  with its backoff.
+- `KANNON_DEBUG=1` — hex-dumps outbound request frames and logs TLS
+  handshake errors.
+- `KANNON_TIME=1` — prints `read/send/drain` millisecond totals and the
+  connection count on exit (perf tuning).
+
 ## Examples
 
 PLAINTEXT:

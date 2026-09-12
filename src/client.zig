@@ -103,6 +103,14 @@ pub const Client = struct {
         return std.mem.sliceTo(&c.err_ctx, 0);
     }
 
+    /// Verbose diagnostic to stderr, gated on `cfg.verbose` (-v).
+    fn vlog(c: *Client, comptime fmt: []const u8, args: anytype) void {
+        if (!c.cfg.verbose) return;
+        var buf: [512]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "kannon: " ++ fmt ++ "\n", args) catch return;
+        _ = std.posix.write(std.posix.STDERR_FILENO, s) catch {};
+    }
+
     fn loadCa(c: *Client) !*const std.crypto.Certificate.Bundle {
         if (c.ca) |*b| return b;
         var bundle: std.crypto.Certificate.Bundle = .{};
@@ -178,6 +186,7 @@ pub const Client = struct {
                 continue;
             };
             c.control = conn;
+            c.vlog("bootstrap connected {s}:{d}", .{ host, port });
             return;
         }
         if (have_err) @memcpy(&c.err_ctx, &first_err_ctx);
@@ -435,6 +444,7 @@ pub const Client = struct {
             c.setErr("topic '{s}' has no partitions", .{topic});
             return error.MetadataFailed;
         }
+        c.vlog("metadata: topic '{s}' has {d} partition(s)", .{ topic, c.partitions.items.len });
     }
 
     pub fn partitionCount(c: *const Client) usize {
@@ -482,6 +492,7 @@ pub const Client = struct {
                 c.producer_id = pid;
                 c.producer_epoch = epoch;
                 c.producer_inited = true;
+                c.vlog("idempotent producer: id={d} epoch={d}", .{ pid, epoch });
                 return;
             }
             if (!code.retriable() or attempt == 2) {
@@ -615,8 +626,13 @@ pub const Client = struct {
             // Idempotent produce allows at most 5 un-acked requests per
             // partition (broker dedup window); wait for a slot before the
             // next send on this partition.
-            if (c.producer_inited)
+            if (c.producer_inited) {
+                if (c.inflight.get(pidx)) |inf| {
+                    if (inf.n > max_inflight)
+                        c.vlog("partition {d}: {d} in flight — draining for a slot", .{ pidx, inf.n });
+                }
                 try c.produceDrainStop(topic, .{ .partition_inflight = .{ .pidx = pidx, .max = max_inflight } });
+            }
         }
     }
 
@@ -707,6 +723,7 @@ pub const Client = struct {
         var attempt: usize = 0;
         var backoff_ms: u64 = 100;
         while (retry.items.len > 0 and attempt < max_attempts) : (attempt += 1) {
+            c.vlog("retrying {d} partition(s) — attempt {d}/{d}, backoff {d}ms", .{ retry.items.len, attempt + 1, max_attempts, backoff_ms });
             c.sleep(backoff_ms);
             backoff_ms = @min(backoff_ms * 2, 3000);
             _ = c.refreshMetadata(topic) catch {};
@@ -773,12 +790,14 @@ pub const Client = struct {
             return error.MetadataFailed;
         };
         const conn = try c.connectOne(addr.host, addr.port);
+        c.vlog("connected broker {d} at {s}:{d}", .{ node, addr.host, addr.port });
         try c.conns.put(c.alloc, key, conn);
         return conn;
     }
 
     fn dropConn(c: *Client, key: u64) void {
         if (c.conns.fetchRemove(key)) |kv| {
+            c.vlog("dropping connection to broker {d}", .{key >> 32});
             kv.value.close();
             c.alloc.destroy(kv.value);
         }
