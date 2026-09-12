@@ -75,14 +75,16 @@ pub fn parse(alloc: std.mem.Allocator, text: []const u8) !Props {
 fn configPaths(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged([]const u8)) !void {
     try list.append(alloc, "./kannon.properties");
     if (std.posix.getenv("XDG_CONFIG_HOME")) |xdg| {
-        if (xdg.len > 0) {
+        if (xdg.len > 0)
             try list.append(alloc, try std.fmt.allocPrint(alloc, "{s}/kannon/kannon.properties", .{xdg}));
-            return;
-        }
     }
     if (std.posix.getenv("HOME")) |home| {
-        if (home.len > 0)
-            try list.append(alloc, try std.fmt.allocPrint(alloc, "{s}/.config/kannon/kannon.properties", .{home}));
+        if (home.len > 0) {
+            const p = try std.fmt.allocPrint(alloc, "{s}/.config/kannon/kannon.properties", .{home});
+            for (list.items) |q|
+                if (std.mem.eql(u8, q, p)) return;
+            try list.append(alloc, p);
+        }
     }
 }
 

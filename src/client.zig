@@ -371,8 +371,6 @@ pub const Client = struct {
     /// Fetch metadata for `topic` over the control connection; refreshes the
     /// broker map and the topic's partition->leader table.
     pub fn refreshMetadata(c: *Client, topic: []const u8) !void {
-        const conn = c.control orelse return error.MetadataFailed;
-
         const body = struct {
             fn f(e: *Encoder, t: []const u8) protocol.ProtoError!void {
                 try e.compactArrayLen(1);
@@ -385,10 +383,28 @@ pub const Client = struct {
                 try e.tagBuffer();
             }
         }.f;
-        const resp = c.sendRequest(conn, protocol.api_key.metadata, protocol.version.metadata, topic, body) catch {
-            c.setErr("metadata request failed", .{});
-            return error.MetadataFailed;
-        };
+        var resp: Resp = undefined;
+        var reconnected = false;
+        while (true) {
+            const conn = c.control orelse return error.MetadataFailed;
+            resp = c.sendRequest(conn, protocol.api_key.metadata, protocol.version.metadata, topic, body) catch {
+                // A dead control socket (broker restart/failover) would leave
+                // partition->leader stale, steering every produce retry at a
+                // dead broker — rebuild it via bootstrap, then retry once.
+                if (reconnected) {
+                    c.setErr("metadata request failed", .{});
+                    return error.MetadataFailed;
+                }
+                reconnected = true;
+                c.vlog("metadata request failed — reconnecting control connection", .{});
+                c.reconnectControl() catch {
+                    c.setErr("metadata request failed", .{});
+                    return error.MetadataFailed;
+                };
+                continue;
+            };
+            break;
+        }
         defer c.alloc.free(resp.frame);
 
         var d = Decoder.init(resp.body);
@@ -608,6 +624,16 @@ pub const Client = struct {
             o.batches[0] = be.written();
             o.bytes = be.written().len;
             c.outstanding_bytes += o.bytes;
+            // Idempotent produce allows at most 5 un-acked requests per
+            // partition (broker dedup window); drain for a free slot BEFORE
+            // this send so the partition never reaches 6 in flight.
+            if (c.producer_inited) {
+                if (c.inflight.get(pidx)) |inf| {
+                    if (inf.n >= max_inflight)
+                        c.vlog("partition {d}: {d} in flight — draining for a slot", .{ pidx, inf.n });
+                }
+                try c.produceDrainStop(topic, .{ .partition_inflight = .{ .pidx = pidx, .max = max_inflight - 1 } });
+            }
             const claim = c.claimConn(pidx) catch {
                 try c.outstanding.append(c.alloc, o);
                 continue;
@@ -623,16 +649,6 @@ pub const Client = struct {
                 };
             } else |_| {}
             try c.outstanding.append(c.alloc, o);
-            // Idempotent produce allows at most 5 un-acked requests per
-            // partition (broker dedup window); wait for a slot before the
-            // next send on this partition.
-            if (c.producer_inited) {
-                if (c.inflight.get(pidx)) |inf| {
-                    if (inf.n > max_inflight)
-                        c.vlog("partition {d}: {d} in flight — draining for a slot", .{ pidx, inf.n });
-                }
-                try c.produceDrainStop(topic, .{ .partition_inflight = .{ .pidx = pidx, .max = max_inflight } });
-            }
         }
     }
 
@@ -758,7 +774,7 @@ pub const Client = struct {
                 switch (code) {
                     .none, .duplicate_sequence_number => c.releaseConn(pp.pidx),
                     else => if (code.retriable()) {
-                        // Keep the claim: the retry stays bound to this conn.
+                        c.releaseConn(pp.pidx);
                         try retry.append(c.alloc, pp);
                     } else {
                         c.setErr("produce to {s}[{d}]: {s}", .{ topic, pp.pidx, code.name() });
@@ -777,6 +793,17 @@ pub const Client = struct {
         for (c.partitions.items) |p|
             if (p.index == pidx) return p.leader;
         return null;
+    }
+
+    /// Drop the control connection (dead or unreachable socket) and rebuild
+    /// it through the configured bootstrap servers with the full handshake.
+    fn reconnectControl(c: *Client) !void {
+        if (c.control) |old| {
+            old.close();
+            c.alloc.destroy(old);
+            c.control = null;
+        }
+        try c.bootstrap();
     }
 
     fn sleep(_: *Client, ms: u64) void {

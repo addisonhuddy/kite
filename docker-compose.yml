@@ -3,10 +3,10 @@ services:
     image: apache/kafka:4.0.0
     container_name: kannon-kafka
     ports:
-      - "9092:9092" # PLAINTEXT
-      - "9093:9093" # SSL
-      - "9094:9094" # SASL_SSL
-      - "9095:9095" # SASL_PLAINTEXT
+      - "127.0.0.1:9092:9092" # PLAINTEXT
+      - "127.0.0.1:9093:9093" # SSL
+      - "127.0.0.1:9094:9094" # SASL_SSL
+      - "127.0.0.1:9095:9095" # SASL_PLAINTEXT
     environment:
       KAFKA_NODE_ID: "1"
       KAFKA_PROCESS_ROLES: broker,controller
