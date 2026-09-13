@@ -38,9 +38,9 @@ pub fn Scram(comptime s: Sha) type {
         server_signature: [mac_len]u8,
 
         /// `n,,n=<user>,r=<nonce>`; stores the bare part for the auth message.
-        pub fn clientFirst(alloc: std.mem.Allocator, username: []const u8) ScramError!struct { msg: []u8, state: Self } {
+        pub fn clientFirst(io: std.Io, alloc: std.mem.Allocator, username: []const u8) ScramError!struct { msg: []u8, state: Self } {
             var nonce_raw: [18]u8 = undefined;
-            std.crypto.random.bytes(&nonce_raw);
+            io.randomSecure(&nonce_raw) catch io.random(&nonce_raw);
             const enc = b64.Encoder;
             var nonce_buf: [enc.calcSize(18)]u8 = undefined;
             const nonce = enc.encode(&nonce_buf, &nonce_raw);

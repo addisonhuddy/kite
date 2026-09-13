@@ -18,10 +18,7 @@ comptime {
 }
 
 fn out(comptime fmt: []const u8, args: anytype) void {
-    var buf: [1024]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
-    w.interface.print(fmt, args) catch {};
-    w.interface.flush() catch {};
+    std.debug.print(fmt, args);
 }
 
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
@@ -99,11 +96,11 @@ const Pending = struct {
     bytes: usize = 0,
 };
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    const alloc = arena.allocator();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const alloc = init.arena.allocator();
 
-    const args = std.process.argsAlloc(alloc) catch fatal("out of memory", .{});
+    const args = init.minimal.args.toSlice(alloc) catch fatal("out of memory", .{});
     var static_headers: std.ArrayListUnmanaged(protocol.Header) = .empty;
     var topic_arg: ?[]const u8 = null;
     var verbose = false;
@@ -129,7 +126,7 @@ pub fn main() !void {
     const topic = topic_arg orelse usage();
     if (topic.len == 0) usage();
 
-    var cfg = config.load(alloc) catch |err| switch (err) {
+    var cfg = config.load(io, alloc, init.environ_map) catch |err| switch (err) {
         error.ConfigNotFound => fatal(
             "no kannon.properties found (searched ./kannon.properties, $XDG_CONFIG_HOME/kannon/kannon.properties, ~/.config/kannon/kannon.properties)",
             .{},
@@ -143,7 +140,7 @@ pub fn main() !void {
     };
     cfg.verbose = verbose;
 
-    var cli = client.Client.init(alloc, &cfg);
+    var cli = client.Client.init(alloc, io, init.environ_map, &cfg);
     cli.bootstrap() catch fatalErr(&cli, "could not reach any bootstrap server");
 
     cli.refreshMetadata(topic) catch |err| switch (err) {
@@ -157,17 +154,17 @@ pub fn main() !void {
     for (pend) |*p| p.* = .{};
 
     var stdin_buf: [64 * 1024]u8 = undefined;
-    var stdin_reader = std.fs.File.stdin().reader(&stdin_buf);
+    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
     const r = &stdin_reader.interface;
-    const stdin_fd = std.fs.File.stdin().handle;
+    const stdin_fd = std.Io.File.stdin().handle;
 
     var rr: usize = 0; // round-robin cursor for unkeyed records
     var total: u64 = 0;
-    const timing = std.posix.getenv("KANNON_TIME") != null;
+    const timing = init.environ_map.get("KANNON_TIME") != null;
     var t_read: u64 = 0;
     var t_flush: u64 = 0;
     var t_drain: u64 = 0;
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = Lap.init(io);
     read_loop: while (true) {
         // Linger: with pending records and no stdin data within linger_ms,
         // flush rather than block indefinitely on a slow producer. Skip the
@@ -215,11 +212,26 @@ pub fn main() !void {
     if (timing) std.debug.print("read {d}ms send {d}ms drain {d}ms conns {d}\n", .{ t_read / 1_000_000, t_flush / 1_000_000, (t_drain + timer.lap()) / 1_000_000, cli.conns.count() });
 
     var buf: [256]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+    var w = std.Io.File.stdout().writer(io, &buf);
     w.interface.print("{d} record(s) produced to '{s}'\n", .{ total, topic }) catch {};
     w.interface.flush() catch {};
     cli.deinit();
 }
+
+/// Lap timer over the monotonic `Io` clock (replaces std.time.Timer).
+const Lap = struct {
+    io: std.Io,
+    last: std.Io.Timestamp,
+    fn init(io: std.Io) Lap {
+        return .{ .io = io, .last = .now(io, .awake) };
+    }
+    fn lap(l: *Lap) u64 {
+        const n = std.Io.Timestamp.now(l.io, .awake);
+        const d = l.last.durationTo(n);
+        l.last = n;
+        return @intCast(@max(0, d.toNanoseconds()));
+    }
+};
 
 fn pendingBytes(pend: []Pending) usize {
     var n: usize = 0;
