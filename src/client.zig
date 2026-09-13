@@ -21,6 +21,8 @@ const max_attempts = 6;
 
 pub const Client = struct {
     alloc: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
     cfg: *const config.Config,
     /// conn_key (node<<32 | slot) -> connection. Produce uses a small pool of
     /// connections per partition: while a partition has un-acked batches in
@@ -54,9 +56,11 @@ pub const Client = struct {
     /// pidx -> next base sequence number (idempotent produce only).
     seqs: std.AutoHashMapUnmanaged(i32, i32),
 
-    pub fn init(alloc: std.mem.Allocator, cfg: *const config.Config) Client {
+    pub fn init(alloc: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, cfg: *const config.Config) Client {
         return .{
             .alloc = alloc,
+            .io = io,
+            .env = env,
             .cfg = cfg,
             .conns = .empty,
             .inflight = .empty,
@@ -106,26 +110,27 @@ pub const Client = struct {
     /// Verbose diagnostic to stderr, gated on `cfg.verbose` (-v).
     fn vlog(c: *Client, comptime fmt: []const u8, args: anytype) void {
         if (!c.cfg.verbose) return;
-        var buf: [512]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "kannon: " ++ fmt ++ "\n", args) catch return;
-        _ = std.posix.write(std.posix.STDERR_FILENO, s) catch {};
+        std.debug.print("kannon: " ++ fmt ++ "\n", args);
     }
 
-    fn loadCa(c: *Client) !*const std.crypto.Certificate.Bundle {
+    fn loadCa(c: *Client) !*std.crypto.Certificate.Bundle {
         if (c.ca) |*b| return b;
-        var bundle: std.crypto.Certificate.Bundle = .{};
+        var bundle: std.crypto.Certificate.Bundle = .empty;
         if (c.cfg.ssl_truststore_location) |path| {
-            const f = std.fs.cwd().openFile(path, .{}) catch {
+            const f = std.Io.Dir.cwd().openFile(c.io, path, .{}) catch {
                 c.setErr("cannot open ssl.truststore.location '{s}'", .{path});
                 return error.TlsCaLoadFailed;
             };
-            defer f.close();
-            bundle.addCertsFromFile(c.alloc, f) catch {
+            defer f.close(c.io);
+            var fbuf: [4096]u8 = undefined;
+            var fr = f.reader(c.io, &fbuf);
+            const now_sec = std.Io.Timestamp.now(c.io, .real).toSeconds();
+            bundle.addCertsFromFile(c.alloc, &fr, now_sec) catch {
                 c.setErr("failed parsing CA bundle '{s}'", .{path});
                 return error.TlsCaLoadFailed;
             };
         } else {
-            bundle.rescan(c.alloc) catch {
+            bundle.rescan(c.alloc, c.io, .now(c.io, .real)) catch {
                 c.setErr("failed loading system CA bundle", .{});
                 return error.TlsCaLoadFailed;
             };
@@ -135,11 +140,11 @@ pub const Client = struct {
     }
 
     fn connectOne(c: *Client, host: []const u8, port: u16) !*Conn {
-        const ca: ?std.crypto.Certificate.Bundle = if (c.cfg.needsTls())
-            (try c.loadCa()).*
+        const ca: ?*std.crypto.Certificate.Bundle = if (c.cfg.needsTls())
+            try c.loadCa()
         else
             null;
-        const conn = transport.connect(c.alloc, host, port, ca) catch |err| {
+        const conn = transport.connect(c.io, c.alloc, c.env, host, port, ca) catch |err| {
             switch (err) {
                 error.TlsHandshakeAuthFailed => c.setErr(
                     "TLS certificate verification failed for {s}:{d} (check ssl.truststore.location)",
@@ -336,7 +341,7 @@ pub const Client = struct {
 
     fn saslScram(c: *Client, conn: *Conn, comptime sha: scram.Sha) !void {
         const S = scram.Scram(sha);
-        const first = try S.clientFirst(c.alloc, c.cfg.sasl_username.?);
+        const first = try S.clientFirst(c.io, c.alloc, c.cfg.sasl_username.?);
         defer c.alloc.free(first.msg);
         defer c.alloc.free(first.state.client_first_bare);
         var st = first.state;
@@ -609,7 +614,7 @@ pub const Client = struct {
             protocol.encodeRecordBatch(
                 &be,
                 sets[i],
-                std.time.milliTimestamp(),
+                std.Io.Timestamp.now(c.io, .real).toMilliseconds(),
                 c.producer_id,
                 c.producer_epoch,
                 base_seq,
@@ -806,8 +811,8 @@ pub const Client = struct {
         try c.bootstrap();
     }
 
-    fn sleep(_: *Client, ms: u64) void {
-        std.Thread.sleep(ms * std.time.ns_per_ms);
+    fn sleep(c: *Client, ms: u64) void {
+        std.Io.sleep(c.io, .fromMilliseconds(@intCast(ms)), .awake) catch {};
     }
 
     fn connFor(c: *Client, node: i32, key: u64) !*Conn {
