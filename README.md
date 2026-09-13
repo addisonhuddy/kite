@@ -32,6 +32,7 @@ $ zig build -Dtarget=x86_64-macos      # Intel Mac
 
 ```console
 $ kannon [-H 'name: value']... <topic>   # one record per stdin line
+$ kannon --csv [--key col] <topic>       # CSV rows → JSON records
 $ echo hello | kannon my-topic
 ```
 
@@ -66,6 +67,30 @@ $ kannon -H 'source: import-job' -H 'env: prod' my-topic < file.txt
   per-partition sequence number, and at most 5 requests stay un-acked per
   partition — broker dedup makes retries exactly-once. Set
   `enable.idempotence=false` to disable.
+
+## CSV input
+
+`--csv` parses stdin as RFC 4180 CSV: the first row supplies column names
+and every following row becomes one record whose value is a JSON object:
+
+```console
+$ kannon --csv my-topic < data.csv
+```
+
+```text
+id,name,note              →  {"id":"1","name":"alice","note":"hi"}
+1,alice,hi
+```
+
+- Quoted fields may contain commas, `""` escapes, and embedded newlines —
+  a quoted newline does not split the record.
+- `--key <col>` uses a column as the record key (it stays in the JSON
+  value), so keyed rows get murmur2 partitioning:
+  `kannon --csv --key id my-topic < data.csv`
+- All fields are emitted as JSON strings — no type guessing, so IDs like
+  `007` survive intact.
+- CRLF endings and a UTF-8 BOM are handled; a row with the wrong number
+  of fields aborts with `csv row N: expected M field(s), got K`.
 
 ## Configuration
 
@@ -155,3 +180,4 @@ all four listeners (PLAINTEXT / SSL / SASL_SSL / SASL_PLAINTEXT) and
 - `src/client.zig` — bootstrap, ApiVersions negotiation, SASL, metadata, produce+retry
 - `src/scram.zig` — RFC 5802 SCRAM-SHA-256/512 client with server-signature verification
 - `src/config.zig` — `kannon.properties` loader
+- `src/csv.zig` — quote-aware row reader, field unescaping, row→JSON

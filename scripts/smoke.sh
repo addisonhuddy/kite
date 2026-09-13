@@ -126,4 +126,14 @@ done
 [ -n "$found" ] || { echo "FAIL: no producerId/sequence in segment"; exit 1; }
 echo ok
 
+echo "== 13. csv: rows -> JSON values, --key drives the record key =="
+(cd "$TMP" && write_props bootstrap.servers=localhost:9092 security.protocol=PLAINTEXT)
+printf 'id,name,note\n%s-1,alice,"has, comma"\n%s-2,bob,"two\nlines"\n' "$M" "$M" > "$TMP/in.csv"
+(cd "$TMP" && "$K" --csv --key id t1 < "$TMP/in.csv")
+consume t1 --property print.key=true --property key.separator='|' \
+    | grep -qF "$M-1|{\"id\":\"$M-1\",\"name\":\"alice\",\"note\":\"has, comma\"}" || { echo "FAIL"; exit 1; }
+consume t1 --property print.key=true --property key.separator='|' \
+    | grep -qF "$M-2|{\"id\":\"$M-2\",\"name\":\"bob\",\"note\":\"two\nlines\"}" || { echo "FAIL"; exit 1; }
+echo ok
+
 echo "ALL SMOKE TESTS PASSED"
