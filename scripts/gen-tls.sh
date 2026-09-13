@@ -8,7 +8,7 @@ mkdir -p docker/tls docker/secrets
 cd docker/tls
 
 openssl req -x509 -newkey rsa:2048 -keyout ca.key -out ca.crt \
-    -days 3650 -nodes -subj "/CN=kannon-test-ca"
+    -days 3650 -nodes -subj "/CN=kite-test-ca"
 openssl req -newkey rsa:2048 -keyout broker.key -out broker.csr \
     -nodes -subj "/CN=localhost"
 openssl x509 -req -in broker.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
@@ -21,7 +21,7 @@ rm -f broker.csr ca.srl
 cd ../secrets
 openssl pkcs12 -export -in ../tls/broker.crt -inkey ../tls/broker.key \
     -certfile ../tls/ca.crt -name broker -out broker.p12 \
-    -password pass:kannon-tls
-printf 'kannon-tls' > key_creds
-printf 'kannon-tls' > keystore_creds
+    -password pass:kite-tls
+printf 'kite-tls' > key_creds
+printf 'kite-tls' > keystore_creds
 echo "wrote docker/tls/{ca.crt,ca.key,broker.key,broker.crt}, docker/secrets/{broker.p12,key_creds,keystore_creds}"
