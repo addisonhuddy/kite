@@ -537,8 +537,9 @@ pub fn decodeBatches(
     records: []const u8,
     ctx: anytype,
     comptime on_record: fn (@TypeOf(ctx), offset: i64, timestamp_ms: i64, rec: Record) anyerror!void,
-) !void {
+) !?i64 {
     var pos: usize = 0;
+    var next_offset: ?i64 = null;
     while (records.len -| pos >= 12) {
         const base_offset = std.mem.readInt(i64, records[pos..][0..8], .big);
         const batch_length = std.mem.readInt(i32, records[pos + 8 ..][0..4], .big);
@@ -606,6 +607,7 @@ pub fn decodeBatches(
                 const header_count = try b.varint();
                 if (header_count < 0) return error.Truncated;
                 var headers: std.ArrayListUnmanaged(Header) = .empty;
+                defer headers.deinit(alloc);
                 for (0..@as(usize, @intCast(header_count))) |_| {
                     const hk_len = try b.varint();
                     if (hk_len < 0) return error.Truncated;
@@ -628,13 +630,14 @@ pub fn decodeBatches(
                     .value = value,
                     .headers = headers.items,
                 });
-                headers.deinit(alloc);
                 rpos = record_end;
             }
         }
-        _ = last_offset_delta;
+        const batch_next = base_offset + @as(i64, last_offset_delta) + 1;
+        if (next_offset == null or batch_next > next_offset.?) next_offset = batch_next;
         pos = batch_end;
     }
+    return next_offset;
 }
 
 /// Records share the batch base timestamp (delta 0 each). For idempotent
@@ -761,10 +764,42 @@ test "decodes record batch v2" {
     try encodeRecordBatch(&e, &input, 1000, -1, -1, -1);
 
     var sink = DecodeTestSink{};
-    try decodeBatches(std.testing.allocator, e.written(), &sink, decodeTestRecord);
+    try std.testing.expectEqual(@as(?i64, 2), try decodeBatches(std.testing.allocator, e.written(), &sink, decodeTestRecord));
     try std.testing.expectEqual(@as(usize, 2), sink.count);
     try std.testing.expectEqual(@as(i64, 1), sink.offset);
     try std.testing.expectEqual(@as(i64, 1000), sink.timestamp);
+}
+
+test "skips control batches and returns next complete offset" {
+    var control_encoder = Encoder.init(std.testing.allocator);
+    defer control_encoder.deinit();
+    const control_input = [_]Record{.{ .value = "control" }};
+    try encodeRecordBatch(&control_encoder, &control_input, 1000, -1, -1, -1);
+    const control = try std.testing.allocator.dupe(u8, control_encoder.written());
+    defer std.testing.allocator.free(control);
+    std.mem.writeInt(i16, control[21..23], 1 << 5, .big);
+    std.mem.writeInt(u32, control[17..21], crc32c(control[21..]), .big);
+
+    var normal_encoder = Encoder.init(std.testing.allocator);
+    defer normal_encoder.deinit();
+    const normal_input = [_]Record{.{ .value = "normal" }};
+    try encodeRecordBatch(&normal_encoder, &normal_input, 2000, -1, -1, -1);
+    const normal = try std.testing.allocator.dupe(u8, normal_encoder.written());
+    defer std.testing.allocator.free(normal);
+    std.mem.writeInt(i64, normal[0..8], 1, .big);
+
+    var records: std.ArrayListUnmanaged(u8) = .empty;
+    defer records.deinit(std.testing.allocator);
+    try records.appendSlice(std.testing.allocator, control);
+    try records.appendSlice(std.testing.allocator, normal);
+
+    var sink = DecodeTestSink{};
+    try std.testing.expectEqual(
+        @as(?i64, 2),
+        try decodeBatches(std.testing.allocator, records.items, &sink, decodeTestRecord),
+    );
+    try std.testing.expectEqual(@as(usize, 1), sink.count);
+    try std.testing.expectEqual(@as(i64, 1), sink.offset);
 }
 
 test "varint byte-exact fixtures" {
