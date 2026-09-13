@@ -1,0 +1,9 @@
+event_id,user_id,type,ts
+e-1,u-1,page_view,2024-06-01T10:00:00Z
+e-2,u-1,click,2024-06-01T10:00:05Z
+e-3,u-2,page_view,2024-06-01T10:00:07Z
+e-4,u-3,signup,2024-06-01T10:00:12Z
+e-5,u-2,click,2024-06-01T10:00:20Z
+e-6,u-1,logout,2024-06-01T10:00:31Z
+e-7,u-4,page_view,2024-06-01T10:00:44Z
+e-8,u-3,purchase,2024-06-01T10:01:02Z

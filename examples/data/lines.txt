@@ -1,0 +1,5 @@
+{"event":"page_view","page":"/home","user_id":101}
+{"event":"click","target":"signup","user_id":101}
+{"event":"page_view","page":"/pricing","user_id":102}
+{"event":"signup","plan":"pro","user_id":103}
+{"event":"logout","user_id":101}
