@@ -1,0 +1,8 @@
+id,name,email,note
+007,james,james@example.com,"licensed, to produce"
+1,alice,alice@example.com,plain note
+2,bob,bob@example.com,"says ""hi"" often"
+3,carol,carol@example.com,"first line
+second line"
+4,dave,dave@example.com,
+5,erin,erin@example.com,trailing space
