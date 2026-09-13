@@ -7,6 +7,7 @@ const client = @import("client.zig");
 const protocol = @import("protocol.zig");
 const transport = @import("transport.zig");
 const scram = @import("scram.zig");
+const csv = @import("csv.zig");
 
 // unused-import anchors so `zig build test` covers every module
 comptime {
@@ -15,6 +16,7 @@ comptime {
     _ = protocol;
     _ = transport;
     _ = scram;
+    _ = csv;
 }
 
 fn out(comptime fmt: []const u8, args: anytype) void {
@@ -35,12 +37,15 @@ fn fatalErr(c: *const client.Client, comptime fmt: []const u8) noreturn {
 }
 
 fn usageExit(code: u8) noreturn {
-    out("usage: kannon [-v] [-H 'name: value']... <topic>\n" ++
+    out("usage: kannon [-v] [-H 'name: value']... [--csv [--key col]] <topic>\n" ++
         "  reads records from stdin, one per line:\n" ++
         "    value                            value only\n" ++
         "    key<TAB>value                    record key + value\n" ++
         "    key<TAB>h1: v1<TAB>...<TAB>value key + headers + value\n" ++
         "  -H 'name: value' adds the header to every record (repeatable)\n" ++
+        "  --csv           parse stdin as RFC 4180 CSV; first row is the header,\n" ++
+        "                  each row becomes a JSON object value\n" ++
+        "  --key <col>     CSV column to use as the record key\n" ++
         "  -v, --verbose   connection/retry diagnostics on stderr\n", .{});
     std.process.exit(code);
 }
@@ -104,6 +109,8 @@ pub fn main(init: std.process.Init) !void {
     var static_headers: std.ArrayListUnmanaged(protocol.Header) = .empty;
     var topic_arg: ?[]const u8 = null;
     var verbose = false;
+    var csv_mode = false;
+    var csv_key_col: ?[]const u8 = null;
     var ai: usize = 1;
     while (ai < args.len) : (ai += 1) {
         const a = args[ai];
@@ -113,6 +120,14 @@ pub fn main(init: std.process.Init) !void {
             static_headers.append(alloc, parseHeaderArg(args[ai])) catch fatal("out of memory", .{});
         } else if (std.mem.startsWith(u8, a, "-H") and a.len > 2) {
             static_headers.append(alloc, parseHeaderArg(a[2..])) catch fatal("out of memory", .{});
+        } else if (std.mem.eql(u8, a, "--csv")) {
+            csv_mode = true;
+        } else if (std.mem.eql(u8, a, "--key")) {
+            ai += 1;
+            if (ai >= args.len) usage();
+            csv_key_col = args[ai];
+        } else if (std.mem.startsWith(u8, a, "--key=")) {
+            csv_key_col = a["--key=".len..];
         } else if (std.mem.eql(u8, a, "-v") or std.mem.eql(u8, a, "--verbose")) {
             verbose = true;
         } else if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
@@ -125,6 +140,7 @@ pub fn main(init: std.process.Init) !void {
     }
     const topic = topic_arg orelse usage();
     if (topic.len == 0) usage();
+    if (csv_key_col != null and !csv_mode) usage();
 
     var cfg = config.load(io, alloc, init.environ_map) catch |err| switch (err) {
         error.ConfigNotFound => fatal(
@@ -158,6 +174,21 @@ pub fn main(init: std.process.Init) !void {
     const r = &stdin_reader.interface;
     const stdin_fd = std.Io.File.stdin().handle;
 
+    var cols: [][]const u8 = &.{};
+    var key_idx: ?usize = null;
+    if (csv_mode) {
+        const hdr = csv.nextRow(r, alloc) catch fatal("failed reading stdin", .{}) orelse
+            fatal("empty csv input (no header row)", .{});
+        cols = csv.splitFields(alloc, hdr) catch fatal("malformed csv header row", .{});
+        if (cols.len > 0) cols[0] = csv.stripBom(cols[0]);
+        if (csv_key_col) |kc| {
+            for (cols, 0..) |c, i| {
+                if (std.mem.eql(u8, c, kc)) key_idx = i;
+            }
+            if (key_idx == null) fatal("--key '{s}': no such csv column", .{kc});
+        }
+    }
+
     var rr: usize = 0; // round-robin cursor for unkeyed records
     var total: u64 = 0;
     const timing = init.environ_map.get("KANNON_TIME") != null;
@@ -169,7 +200,11 @@ pub fn main(init: std.process.Init) !void {
         // Linger: with pending records and no stdin data within linger_ms,
         // flush rather than block indefinitely on a slow producer. Skip the
         // poll when a full line is already buffered — no read() can block.
-        if (pendingBytes(pend) > 0 and std.mem.indexOfScalar(u8, r.buffered(), '\n') == null) {
+        const ready = if (csv_mode)
+            csv.rowReady(r)
+        else
+            std.mem.indexOfScalar(u8, r.buffered(), '\n') != null;
+        if (pendingBytes(pend) > 0 and !ready) {
             var fds = [_]std.posix.pollfd{.{ .fd = stdin_fd, .events = std.posix.POLL.IN, .revents = 0 }};
             const nready = std.posix.poll(&fds, @intCast(@min(cfg.linger_ms, std.math.maxInt(i32)))) catch 1;
             if (nready == 0) {
@@ -178,10 +213,17 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        const owned = nextLine(r, alloc) catch fatal("failed reading stdin", .{}) orelse break :read_loop;
+        const rec = if (csv_mode) blk: {
+            const row = csv.nextRow(r, alloc) catch fatal("failed reading stdin", .{}) orelse
+                break :read_loop;
+            break :blk csvRecord(alloc, row, cols, key_idx, static_headers.items, total + 1);
+        } else blk: {
+            const owned = nextLine(r, alloc) catch fatal("failed reading stdin", .{}) orelse
+                break :read_loop;
+            break :blk parseLine(alloc, owned, static_headers.items, total + 1);
+        };
         t_read += timer.lap();
         total += 1;
-        const rec = parseLine(alloc, owned, static_headers.items, total);
         // Keyed records partition by murmur2 like Kafka's default partitioner;
         // unkeyed records round-robin so every partition fills together.
         const target: usize = if (rec.key) |k| blk: {
@@ -232,6 +274,28 @@ const Lap = struct {
         return @intCast(@max(0, d.toNanoseconds()));
     }
 };
+
+/// Turn a CSV row into a record: JSON object value, optional column key.
+fn csvRecord(
+    alloc: std.mem.Allocator,
+    row: []u8,
+    cols: []const []const u8,
+    key_idx: ?usize,
+    static_headers: []const protocol.Header,
+    rowno: u64,
+) protocol.Record {
+    const fields = csv.splitFields(alloc, row) catch
+        fatal("csv row {d}: unterminated quoted field", .{rowno});
+    if (fields.len != cols.len)
+        fatal("csv row {d}: expected {d} field(s), got {d}", .{ rowno, cols.len, fields.len });
+    var jw = std.Io.Writer.Allocating.init(alloc);
+    csv.rowJson(&jw.writer, cols, fields) catch fatal("out of memory", .{});
+    return .{
+        .key = if (key_idx) |ki| fields[ki] else null,
+        .value = jw.written(),
+        .headers = static_headers,
+    };
+}
 
 fn pendingBytes(pend: []Pending) usize {
     var n: usize = 0;
