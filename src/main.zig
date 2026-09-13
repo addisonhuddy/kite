@@ -1,5 +1,5 @@
-//! kannon — ultra-lightweight producer-only Kafka CLI.
-//! `kannon <topic> < file` sends each stdin line as one record value.
+//! kite — ultra-lightweight producer-only Kafka CLI.
+//! `kite <topic> < file` sends each stdin line as one record value.
 
 const std = @import("std");
 const config = @import("config.zig");
@@ -24,7 +24,7 @@ fn out(comptime fmt: []const u8, args: anytype) void {
 }
 
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
-    out("kannon: " ++ fmt ++ "\n", args);
+    out("kite: " ++ fmt ++ "\n", args);
     std.process.exit(1);
 }
 
@@ -37,7 +37,7 @@ fn fatalErr(c: *const client.Client, comptime fmt: []const u8) noreturn {
 }
 
 fn usageExit(code: u8) noreturn {
-    out("usage: kannon [-v] [-H 'name: value']... [--csv [--key col]] <topic>\n" ++
+    out("usage: kite [-v] [-H 'name: value']... [--csv [--key col]] <topic>\n" ++
         "  reads records from stdin, one per line:\n" ++
         "    value                            value only\n" ++
         "    key<TAB>value                    record key + value\n" ++
@@ -144,15 +144,15 @@ pub fn main(init: std.process.Init) !void {
 
     var cfg = config.load(io, alloc, init.environ_map) catch |err| switch (err) {
         error.ConfigNotFound => fatal(
-            "no kannon.properties found (searched ./kannon.properties, $XDG_CONFIG_HOME/kannon/kannon.properties, ~/.config/kannon/kannon.properties)",
+            "no kite.properties found (searched ./kite.properties, $XDG_CONFIG_HOME/kite/kite.properties, ~/.config/kite/kite.properties)",
             .{},
         ),
-        error.MissingBootstrapServers => fatal("kannon.properties is missing required key bootstrap.servers", .{}),
+        error.MissingBootstrapServers => fatal("kite.properties is missing required key bootstrap.servers", .{}),
         error.InvalidSecurityProtocol => fatal("invalid security.protocol (want PLAINTEXT, SSL, SASL_SSL, or SASL_PLAINTEXT)", .{}),
         error.InvalidSaslMechanism => fatal("invalid sasl.mechanism (want PLAIN, SCRAM-SHA-256, or SCRAM-SHA-512)", .{}),
         error.MissingSaslMechanism => fatal("security.protocol=SASL_* requires sasl.mechanism", .{}),
         error.MissingSaslCredentials => fatal("sasl.mechanism set but sasl.username/sasl.password missing", .{}),
-        else => fatal("failed to load kannon.properties: {s}", .{@errorName(err)}),
+        else => fatal("failed to load kite.properties: {s}", .{@errorName(err)}),
     };
     cfg.verbose = verbose;
 
@@ -191,7 +191,7 @@ pub fn main(init: std.process.Init) !void {
 
     var rr: usize = 0; // round-robin cursor for unkeyed records
     var total: u64 = 0;
-    const timing = init.environ_map.get("KANNON_TIME") != null;
+    const timing = init.environ_map.get("KITE_TIME") != null;
     var t_read: u64 = 0;
     var t_flush: u64 = 0;
     var t_drain: u64 = 0;

@@ -1,4 +1,4 @@
-# Testing kannon
+# Testing kite
 
 ## Unit tests
 
@@ -58,10 +58,10 @@ SCRAM-SHA-256/512.
 
 ### Debugging
 
-Set `KANNON_DEBUG=1` to dump sent/received frames and TLS internals to stderr:
+Set `KITE_DEBUG=1` to dump sent/received frames and TLS internals to stderr:
 
 ```console
-$ KANNON_DEBUG=1 sh -c 'echo hi | ./zig-out/bin/kannon t1'
+$ KITE_DEBUG=1 sh -c 'echo hi | ./zig-out/bin/kite t1'
 ```
 
 ### Teardown

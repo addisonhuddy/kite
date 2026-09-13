@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Hard gate: zig-out/bin/kannon must stay under 1 MiB.
+# Hard gate: zig-out/bin/kite must stay under 1 MiB.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BIN=${1:-zig-out/bin/kannon}
+BIN=${1:-zig-out/bin/kite}
 MAX=$((1024 * 1024))
 size=$(stat -c%s "$BIN" 2>/dev/null || stat -f%z "$BIN")
 echo "$BIN: $size bytes"
