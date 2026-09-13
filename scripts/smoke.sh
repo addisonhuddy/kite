@@ -136,4 +136,41 @@ consume t1 --property print.key=true --property key.separator='|' \
     | grep -qF "$M-2|{\"id\":\"$M-2\",\"name\":\"bob\",\"note\":\"two\nlines\"}" || { echo "FAIL"; exit 1; }
 echo ok
 
+echo "== 14. kannon consumer compression matrix =="
+(cd "$TMP" && write_props bootstrap.servers=localhost:9092 security.protocol=PLAINTEXT)
+for codec in none gzip snappy lz4 zstd; do
+    topic="consume-$codec-$M"
+    docker exec "$C" $B/kafka-topics.sh --bootstrap-server localhost:9092 \
+        --create --topic "$topic" --partitions 3 >/dev/null
+    {
+        printf 'key-0\t%s\n' "$M-$codec-small"
+        for n in $(seq 1 49); do
+            printf 'key-%d\t%s-%s-%s\n' "$n" "$M" "$codec" \
+                'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+        done
+    } >"$TMP/$topic.in"
+    docker exec -i "$C" $B/kafka-console-producer.sh --bootstrap-server localhost:9092 \
+        --topic "$topic" --producer-property "compression.type=$codec" \
+        --property parse.key=true --property $'key.separator=\t' <"$TMP/$topic.in"
+    (cd "$TMP" && "$K" consume --from-beginning -t 3000 "$topic" | sort >"$topic.out")
+    sort "$TMP/$topic.in" >"$TMP/$topic.expected"
+    diff -u "$TMP/$topic.expected" "$TMP/$topic.out"
+done
+echo ok
+
+echo "== 15. kannon consumer selected options and round-trip =="
+docker exec "$C" $B/kafka-topics.sh --bootstrap-server localhost:9092 \
+    --create --topic "consume-roundtrip-$M" --partitions 2 >/dev/null
+docker exec "$C" $B/kafka-topics.sh --bootstrap-server localhost:9092 \
+    --create --topic "consume-copy-$M" --partitions 2 >/dev/null
+(cd "$TMP" && printf 'roundtrip-a\nroundtrip-b\nroundtrip-c\nroundtrip-d\nroundtrip-e\n' |
+    "$K" "consume-roundtrip-$M")
+(cd "$TMP" && "$K" consume --from-beginning -n 5 "consume-roundtrip-$M" |
+    "$K" "consume-copy-$M")
+docker exec "$C" $B/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+    --topic "consume-copy-$M" --from-beginning --timeout-ms 8000 2>/dev/null |
+    grep -c '^roundtrip-' | grep -q '^5$'
+(cd "$TMP" && "$K" consume --from-beginning --partition 1 -t 1000 "consume-roundtrip-$M" >/dev/null)
+echo ok
+
 echo "ALL SMOKE TESTS PASSED"

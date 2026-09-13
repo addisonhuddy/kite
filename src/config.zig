@@ -12,6 +12,8 @@ pub const Config = struct {
     ssl_truststore_location: ?[]const u8 = null,
     linger_ms: u64 = 50,
     batch_size: usize = 1 << 20,
+    fetch_max_bytes: usize = 8 << 20,
+    fetch_max_wait_ms: u64 = 500,
     /// Idempotent produce: InitProducerId handshake + per-partition sequence
     /// numbers so broker-side retries/dedup can never duplicate records.
     enable_idempotence: bool = true,
@@ -144,6 +146,24 @@ pub fn load(io: std.Io, alloc: std.mem.Allocator, env: *std.process.Environ.Map)
                 warn("invalid batch.size '{s}' ignored", .{val});
                 continue;
             };
+        } else if (std.mem.eql(u8, key, "fetch.max.bytes")) {
+            cfg.fetch_max_bytes = std.fmt.parseInt(usize, val, 10) catch {
+                warn("invalid fetch.max.bytes '{s}' ignored", .{val});
+                continue;
+            };
+            if (cfg.fetch_max_bytes >= 16 << 20) {
+                warn("fetch.max.bytes '{s}' is >= transport maximum; using default", .{val});
+                cfg.fetch_max_bytes = 8 << 20;
+            }
+        } else if (std.mem.eql(u8, key, "fetch.max.wait.ms")) {
+            cfg.fetch_max_wait_ms = std.fmt.parseInt(u64, val, 10) catch {
+                warn("invalid fetch.max.wait.ms '{s}' ignored", .{val});
+                continue;
+            };
+            if (cfg.fetch_max_wait_ms >= 15_000) {
+                warn("fetch.max.wait.ms '{s}' is too close to socket timeout; using default", .{val});
+                cfg.fetch_max_wait_ms = 500;
+            }
         } else if (std.mem.eql(u8, key, "enable.idempotence")) {
             if (std.ascii.eqlIgnoreCase(val, "true")) {
                 cfg.enable_idempotence = true;

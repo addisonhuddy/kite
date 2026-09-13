@@ -3,9 +3,12 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const decompress = @import("decompress.zig");
 
 pub const api_key = struct {
     pub const produce: i16 = 0;
+    pub const fetch: i16 = 1;
+    pub const list_offsets: i16 = 2;
     pub const metadata: i16 = 3;
     pub const api_versions: i16 = 18;
     pub const sasl_handshake: i16 = 17;
@@ -18,6 +21,8 @@ pub const version = struct {
     pub const api_versions: i16 = 3;
     pub const metadata: i16 = 12;
     pub const produce: i16 = 11;
+    pub const fetch: i16 = 12;
+    pub const list_offsets: i16 = 8;
     pub const sasl_handshake: i16 = 1;
     pub const sasl_authenticate: i16 = 2;
     pub const init_producer_id: i16 = 4;
@@ -26,6 +31,7 @@ pub const version = struct {
 pub const ErrorCode = enum(i16) {
     none = 0,
     unknown_server_error = -1,
+    offset_out_of_range = 1,
     unknown_topic_or_partition = 3,
     leader_not_available = 5,
     not_leader_or_follower = 6,
@@ -51,12 +57,16 @@ pub const ErrorCode = enum(i16) {
     illegal_sasl_state = 34,
     unsupported_version = 35,
     sasl_authentication_failed = 58,
+    fenced_leader_epoch = 74,
+    unknown_leader_epoch = 75,
+    unsupported_compression_type = 76,
     _,
 
     pub fn name(self: ErrorCode) []const u8 {
         return switch (self) {
             .none => "NONE",
             .unknown_server_error => "UNKNOWN_SERVER_ERROR",
+            .offset_out_of_range => "OFFSET_OUT_OF_RANGE",
             .unknown_topic_or_partition => "UNKNOWN_TOPIC_OR_PARTITION",
             .leader_not_available => "LEADER_NOT_AVAILABLE",
             .not_leader_or_follower => "NOT_LEADER_OR_FOLLOWER",
@@ -82,6 +92,9 @@ pub const ErrorCode = enum(i16) {
             .illegal_sasl_state => "ILLEGAL_SASL_STATE",
             .unsupported_version => "UNSUPPORTED_VERSION",
             .sasl_authentication_failed => "SASL_AUTHENTICATION_FAILED",
+            .fenced_leader_epoch => "FENCED_LEADER_EPOCH",
+            .unknown_leader_epoch => "UNKNOWN_LEADER_EPOCH",
+            .unsupported_compression_type => "UNSUPPORTED_COMPRESSION_TYPE",
             _ => "UNKNOWN_ERROR",
         };
     }
@@ -97,6 +110,8 @@ pub const ErrorCode = enum(i16) {
             .not_enough_replicas,
             .not_enough_replicas_after_append,
             .unknown_topic_or_partition,
+            .fenced_leader_epoch,
+            .unknown_leader_epoch,
             .stale_metadata,
             .group_load_in_progress,
             .not_coordinator,
@@ -270,6 +285,10 @@ pub const Decoder = struct {
         return (try d.u8v()) != 0;
     }
 
+    pub fn i8v(d: *Decoder) ProtoError!i8 {
+        return @bitCast(try d.u8v());
+    }
+
     pub fn i16v(d: *Decoder) ProtoError!i16 {
         try d.need(2);
         defer d.pos += 2;
@@ -280,6 +299,12 @@ pub const Decoder = struct {
         try d.need(4);
         defer d.pos += 4;
         return std.mem.readInt(i32, d.data[d.pos..][0..4], .big);
+    }
+
+    pub fn u32v(d: *Decoder) ProtoError!u32 {
+        try d.need(4);
+        defer d.pos += 4;
+        return std.mem.readInt(u32, d.data[d.pos..][0..4], .big);
     }
 
     pub fn i64v(d: *Decoder) ProtoError!i64 {
@@ -504,6 +529,114 @@ pub const Record = struct {
     headers: []const Header = &.{},
 };
 
+/// Walk Kafka record batch v2 data from a Fetch partition response. The
+/// callback is invoked as records are decoded, so its slices remain valid only
+/// for the duration of the call.
+pub fn decodeBatches(
+    alloc: std.mem.Allocator,
+    records: []const u8,
+    ctx: anytype,
+    comptime on_record: fn (@TypeOf(ctx), offset: i64, timestamp_ms: i64, rec: Record) anyerror!void,
+) !void {
+    var pos: usize = 0;
+    while (records.len -| pos >= 12) {
+        const base_offset = std.mem.readInt(i64, records[pos..][0..8], .big);
+        const batch_length = std.mem.readInt(i32, records[pos + 8 ..][0..4], .big);
+        pos += 12;
+        if (batch_length < 0 or @as(usize, @intCast(batch_length)) > records.len -| pos) break;
+        const batch_end = pos + @as(usize, @intCast(batch_length));
+        if (batch_length < 49) return error.Truncated;
+
+        _ = std.mem.readInt(i32, records[pos..][0..4], .big); // leader epoch
+        const magic = records[pos + 4];
+        if (magic != 2) return error.UnsupportedMagic;
+        const stored_crc = std.mem.readInt(u32, records[pos + 5 ..][0..4], .big);
+        const crc_start = pos + 9;
+        if (crc32c(records[crc_start..batch_end]) != stored_crc) return error.BadCrc;
+
+        var d = Decoder.init(records[pos..batch_end]);
+        _ = try d.i32v(); // partition leader epoch
+        _ = try d.u8v(); // magic
+        _ = try d.u32v();
+        const attributes = try d.i16v();
+        const last_offset_delta = try d.i32v();
+        const base_timestamp = try d.i64v();
+        _ = try d.i64v(); // max timestamp
+        _ = try d.i64v(); // producer id
+        _ = try d.i16v(); // producer epoch
+        _ = try d.i32v(); // base sequence
+        const records_count = try d.i32v();
+        if (records_count < 0) return error.Truncated;
+        const compressed_records = records[pos + d.pos .. batch_end];
+
+        if (attributes & (@as(i16, 1) << 5) == 0) {
+            const codec: u3 = @intCast(@as(u16, @bitCast(attributes)) & 7);
+            const decoded = try decompress.decompress(alloc, codec, compressed_records);
+            defer alloc.free(decoded);
+            var rpos: usize = 0;
+            while (rpos < decoded.len) {
+                var rd = Decoder.init(decoded[rpos..]);
+                const record_len = try rd.varint();
+                if (record_len < 0 or rd.pos > decoded.len -| rpos or
+                    @as(usize, @intCast(record_len)) > decoded.len - rpos - rd.pos)
+                    return error.Truncated;
+                const record_end = rpos + rd.pos + @as(usize, @intCast(record_len));
+                if (record_end > decoded.len) return error.Truncated;
+                const body = decoded[rpos + rd.pos .. record_end];
+                var b = Decoder.init(body);
+                _ = try b.i8v();
+                const timestamp_delta = try b.varlong();
+                const offset_delta = try b.varint();
+                const key_len = try b.varint();
+                const key: ?[]const u8 = if (key_len < 0)
+                    null
+                else blk: {
+                    const n: usize = @intCast(key_len);
+                    try b.skip(n);
+                    break :blk body[b.pos - n .. b.pos];
+                };
+                const value_len = try b.varint();
+                const value: []const u8 = if (value_len < 0)
+                    ""
+                else blk: {
+                    const n: usize = @intCast(value_len);
+                    try b.skip(n);
+                    break :blk body[b.pos - n .. b.pos];
+                };
+                const header_count = try b.varint();
+                if (header_count < 0) return error.Truncated;
+                var headers: std.ArrayListUnmanaged(Header) = .empty;
+                for (0..@as(usize, @intCast(header_count))) |_| {
+                    const hk_len = try b.varint();
+                    if (hk_len < 0) return error.Truncated;
+                    const hk_n: usize = @intCast(hk_len);
+                    const hk_start = b.pos;
+                    try b.skip(hk_n);
+                    const hk = body[hk_start..b.pos];
+                    const hv_len = try b.varint();
+                    const hv: ?[]const u8 = if (hv_len < 0)
+                        null
+                    else blk: {
+                        const hv_n: usize = @intCast(hv_len);
+                        try b.skip(hv_n);
+                        break :blk body[b.pos - hv_n .. b.pos];
+                    };
+                    try headers.append(alloc, .{ .key = hk, .value = hv });
+                }
+                try on_record(ctx, base_offset + offset_delta, base_timestamp + timestamp_delta, .{
+                    .key = key,
+                    .value = value,
+                    .headers = headers.items,
+                });
+                headers.deinit(alloc);
+                rpos = record_end;
+            }
+        }
+        _ = last_offset_delta;
+        pos = batch_end;
+    }
+}
+
 /// Records share the batch base timestamp (delta 0 each). For idempotent
 /// produce pass the InitProducerId-issued `producer_id`/`producer_epoch` and
 /// the partition's next `base_sequence`; all -1 for a plain (non-idempotent)
@@ -596,6 +729,42 @@ test "uvarint/varint round trip" {
     try std.testing.expectEqual(@as(i32, 63), try d.varint());
     try std.testing.expectEqual(@as(i32, -64), try d.varint());
     try std.testing.expectEqual(std.math.minInt(i32), try d.varint());
+}
+
+const DecodeTestSink = struct {
+    count: usize = 0,
+    offset: i64 = 0,
+    timestamp: i64 = 0,
+    record: ?Record = null,
+};
+
+fn decodeTestRecord(
+    sink: *DecodeTestSink,
+    offset: i64,
+    timestamp_ms: i64,
+    rec: Record,
+) !void {
+    sink.count += 1;
+    sink.offset = offset;
+    sink.timestamp = timestamp_ms;
+    sink.record = rec;
+}
+
+test "decodes record batch v2" {
+    var e = Encoder.init(std.testing.allocator);
+    defer e.deinit();
+    const headers = [_]Header{.{ .key = "source", .value = "test" }};
+    const input = [_]Record{
+        .{ .key = "key", .value = "value", .headers = &headers },
+        .{ .value = "empty-key" },
+    };
+    try encodeRecordBatch(&e, &input, 1000, -1, -1, -1);
+
+    var sink = DecodeTestSink{};
+    try decodeBatches(std.testing.allocator, e.written(), &sink, decodeTestRecord);
+    try std.testing.expectEqual(@as(usize, 2), sink.count);
+    try std.testing.expectEqual(@as(i64, 1), sink.offset);
+    try std.testing.expectEqual(@as(i64, 1000), sink.timestamp);
 }
 
 test "varint byte-exact fixtures" {

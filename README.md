@@ -33,6 +33,7 @@ $ zig build -Dtarget=x86_64-macos      # Intel Mac
 ```console
 $ kannon [-H 'name: value']... <topic>   # one record per stdin line
 $ kannon --csv [--key col] <topic>       # CSV rows → JSON records
+$ kannon consume [options] <topic>       # fetch records to stdout
 $ echo hello | kannon my-topic
 ```
 
@@ -67,6 +68,22 @@ $ kannon -H 'source: import-job' -H 'env: prod' my-topic < file.txt
   per-partition sequence number, and at most 5 requests stay un-acked per
   partition — broker dedup makes retries exactly-once. Set
   `enable.idempotence=false` to disable.
+
+## Consuming
+
+`kannon consume` writes one record per line in the same format accepted by the
+producer, making consume-to-produce pipelines lossless for keys and headers:
+
+```console
+$ kannon consume --from-beginning -t 3000 my-topic
+$ kannon consume --offset 42 --partition 1 -n 10 my-topic
+```
+
+The default starting position is the latest offset. Use `--from-beginning` for
+the earliest offset or `--offset N` for an absolute offset on every selected
+partition. `--partition P` selects one partition, `-n MAX` stops after a record
+count, and `-t IDLE_MS` stops after an idle interval. `-v` logs fetch ranges
+and high watermarks to stderr.
 
 ## CSV input
 
@@ -111,6 +128,8 @@ kannon reads `kannon.properties` (Java properties format, `key=value` lines,
 | `ssl.truststore.location` | optional for `SSL`/`SASL_SSL` | Path to a PEM CA bundle. Falls back to the system trust store when unset. |
 | `batch.size` | no (default `1048576`) | Per-partition record buffer cap in bytes — flush when exceeded. |
 | `linger.ms` | no (default `50`) | Flush pending records after this delay when stdin stalls. |
+| `fetch.max.bytes` | no (default `8388608`) | Maximum bytes requested per fetch; values must be below the 16 MiB transport limit. |
+| `fetch.max.wait.ms` | no (default `500`) | Maximum broker wait for a fetch response; kept below the socket timeout. |
 | `enable.idempotence` | no (default `true`) | Idempotent producer: producer id + per-partition sequences, exactly-once on retry. |
 
 Unknown keys are ignored with a warning, so a shared `server.properties`-style
@@ -175,9 +194,11 @@ all four listeners (PLAINTEXT / SSL / SASL_SSL / SASL_PLAINTEXT) and
 
 ## Internals
 
-- `src/protocol.zig` — varint/compact encoders, request framing, record batch v2 + CRC-32C
+- `src/protocol.zig` — varint/compact encoders, request framing, record batch v2 decode/encode + CRC-32C
+- `src/decompress.zig` — gzip, zstd, Snappy, and LZ4 record-batch decoders
 - `src/transport.zig` — TCP + TLS (std.crypto.tls) connection with framed send/recv
-- `src/client.zig` — bootstrap, ApiVersions negotiation, SASL, metadata, produce+retry
+- `src/client.zig` — bootstrap, ApiVersions negotiation, SASL, metadata, produce/fetch + retry
+- `src/consumer.zig` — ListOffsets/Fetch consumer loop and output formatting
 - `src/scram.zig` — RFC 5802 SCRAM-SHA-256/512 client with server-signature verification
 - `src/config.zig` — `kannon.properties` loader
 - `src/csv.zig` — quote-aware row reader, field unescaping, row→JSON
