@@ -12,6 +12,29 @@ No JVM, no librdkafka, no dependencies — a single static binary under 1 MiB.
 Speaks the Kafka wire protocol directly: flexible versions only, record batch
 v2, acks=all. **Requires Kafka 4.0+** (KRaft) on the broker side.
 
+## Quickstart
+
+Against the local docker-compose harness (see [TESTING.md](TESTING.md)):
+
+```console
+$ scripts/gen-tls.sh            # one-time: test CA + broker keystore
+$ docker compose up -d
+$ scripts/docker-init.sh        # creates topics (incl. `t1`) + SASL users
+$ cp examples/config/plaintext.properties kannon.properties
+$ zig build
+$ zig-out/bin/kannon t1 < examples/data/lines.txt
+5 record(s) produced to 't1'
+```
+
+Topic auto-creation is disabled in the harness, so produce to a topic that
+exists (`t1`) or create one first. Consume it back:
+
+```console
+$ docker exec kannon-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+    --bootstrap-server localhost:9092 --topic t1 \
+    --from-beginning --timeout-ms 5000
+```
+
 ## Build
 
 Requires Zig 0.16.x:
@@ -20,6 +43,9 @@ Requires Zig 0.16.x:
 $ zig build            # produces zig-out/bin/kannon (ReleaseSmall, stripped)
 $ scripts/check-size.sh   # hard gate: fails if the binary is >= 1 MiB
 ```
+
+The release artifact is only `zig-out/bin/kannon` — `examples/` is
+documentation/sample data and is not referenced by the build.
 
 Cross-compile for other targets, e.g.:
 
@@ -31,8 +57,7 @@ $ zig build -Dtarget=x86_64-macos      # Intel Mac
 ## Usage
 
 ```console
-$ kannon [-H 'name: value']... <topic>   # one record per stdin line
-$ kannon --csv [--key col] <topic>       # CSV rows → JSON records
+$ kannon [-v] [-H 'name: value']... [--csv [--key col]] <topic>
 $ echo hello | kannon my-topic
 ```
 
@@ -40,17 +65,52 @@ Each stdin line is one record. A plain line is value-only; a TAB separates
 the line into fields: first field = record key, last = value, any middle
 fields are per-record `name: value` headers.
 
+Cookbook, using the files in [`examples/data/`](examples/data):
+
 ```console
+$ kannon t1 < examples/data/lines.txt              # 5 value-only records
 $ printf 'value only\n' | kannon t1
-$ printf 'key\tvalue\n' | kannon t1                    # key + value
-$ printf 'key\ttrace-id: 42\tsrc: cli\tvalue\n' | kannon t1   # key + headers + value
+$ kannon t1 < examples/data/keyed.tsv              # key<TAB>value
+$ printf 'key\tvalue\n' | kannon t1
+$ kannon t1 < examples/data/headers.tsv            # key, headers, value
+$ printf 'key\ttrace-id: 42\tsrc: cli\tvalue\n' | kannon t1
 ```
 
 `-H 'name: value'` (repeatable, curl-style) attaches a header to every
 record:
 
 ```console
-$ kannon -H 'source: import-job' -H 'env: prod' my-topic < file.txt
+$ kannon -H 'source: import-job' -H 'env: prod' t1 < examples/data/lines.txt
+```
+
+Bulk load and stream:
+
+```console
+$ seq 1 100000 | kannon t1
+$ tail -f app.log | kannon logs                    # produces as lines arrive
+```
+
+CSV input (see "CSV input" below):
+
+```console
+$ kannon --csv t1 < examples/data/users.csv
+$ kannon --csv --key user_id t1 < examples/data/events.csv
+```
+
+Watch keys and headers land on the broker (docker-compose harness):
+
+```console
+$ docker exec kannon-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+    --bootstrap-server localhost:9092 --topic t1 --from-beginning \
+    --timeout-ms 8000 --property print.key=true \
+    --property print.headers=true --property key.separator='|'
+```
+
+Diagnostics on stderr (see "Diagnostics"):
+
+```console
+$ kannon -v t1 < examples/data/lines.txt           # connection/retry info
+$ KANNON_DEBUG=1 kannon t1 < examples/data/lines.txt  # hex-dump frames
 ```
 
 - The final line is produced even without a trailing newline.
@@ -131,41 +191,26 @@ All diagnostics go to stderr; stdout carries only the final
 
 ## Examples
 
-PLAINTEXT:
+`kannon.properties` templates live in [`examples/config/`](examples/config) —
+copy one into place and edit `bootstrap.servers` / credentials:
 
-```properties
-bootstrap.servers=localhost:9092
-security.protocol=PLAINTEXT
+```console
+$ cp examples/config/plaintext.properties kannon.properties
 ```
 
-TLS with a custom CA:
+| File | For |
+| --- | --- |
+| [`plaintext.properties`](examples/config/plaintext.properties) | PLAINTEXT, no auth (local broker) |
+| [`ssl.properties`](examples/config/ssl.properties) | TLS with a custom CA |
+| [`sasl-ssl-plain.properties`](examples/config/sasl-ssl-plain.properties) | SASL_SSL + PLAIN, Confluent Cloud style (`<api-key>`/`<api-secret>`) |
+| [`sasl-scram.properties`](examples/config/sasl-scram.properties) | SASL_PLAINTEXT + SCRAM-SHA-512 |
+| [`local-docker.properties`](examples/config/local-docker.properties) | The TESTING.md docker-compose harness on `localhost:9092` |
 
-```properties
-bootstrap.servers=kafka.example.com:9093
-security.protocol=SSL
-ssl.truststore.location=/path/to/ca.pem
-```
-
-SASL_SSL + PLAIN (e.g. Confluent Cloud):
-
-```properties
-bootstrap.servers=pkc-xxxx.us-east-1.aws.confluent.cloud:9092
-security.protocol=SASL_SSL
-sasl.mechanism=PLAIN
-sasl.username=<api-key>
-sasl.password=<api-secret>
-ssl.truststore.location=/etc/ssl/cert.pem
-```
-
-SASL + SCRAM-SHA-512:
-
-```properties
-bootstrap.servers=kafka.example.com:9095
-security.protocol=SASL_PLAINTEXT
-sasl.mechanism=SCRAM-SHA-512
-sasl.username=myuser
-sasl.password=mypass
-```
+Sample stdin inputs are in [`examples/data/`](examples/data): `lines.txt`
+(value-only), `keyed.tsv` (key + value), `headers.tsv` (key + headers +
+value), `users.csv` and `events.csv` (for `--csv` / `--csv --key`).
+The name `kannon.properties` is gitignored on purpose — the templates use
+different names so they stay tracked.
 
 ## Testing
 

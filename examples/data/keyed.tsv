@@ -1,0 +1,5 @@
+user-101	{"event":"page_view","page":"/home"}
+user-102	{"event":"click","target":"signup"}
+user-101	{"event":"page_view","page":"/pricing"}
+user-103	{"event":"signup","plan":"pro"}
+user-102	{"event":"logout"}
