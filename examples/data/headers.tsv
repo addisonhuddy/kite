@@ -1,0 +1,3 @@
+user-101	trace-id: 1	src: cli	{"event":"page_view","page":"/home"}
+user-102	trace-id: 2	src: cli	{"event":"click","target":"signup"}
+user-103	trace-id: 3	src: cli	{"event":"signup","plan":"pro"}
