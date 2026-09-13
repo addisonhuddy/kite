@@ -197,8 +197,8 @@ pub fn main() !void {
         };
         const p = &pend[target];
         p.records.append(alloc, rec) catch fatal("out of memory", .{});
-        p.bytes += owned.len;
-        if (p.bytes >= cfg.batch_size) {
+        p.bytes += recordSize(rec);
+        if (p.bytes + batch_overhead >= cfg.batch_size) {
             // Cap hit: flush every partition's pending buffer in one pipelined
             // round so all leader conns go in flight together.
             flushAll(&cli, topic, pend) catch |err| produceFatal(&cli, err);
@@ -226,6 +226,23 @@ fn pendingBytes(pend: []Pending) usize {
     for (pend) |p| n += p.bytes;
     return n;
 }
+
+/// Estimated encoded size of a record: key + value + header bytes plus
+/// varint framing (~16B/record, ~8B/header). Charged against batch_size so
+/// encoded batches stay under the broker's ~1MiB message.max.bytes.
+fn recordSize(rec: protocol.Record) usize {
+    var n: usize = 16 + rec.value.len;
+    if (rec.key) |k| n += k.len;
+    for (rec.headers) |h| {
+        n += h.key.len + 8;
+        if (h.value) |v| n += v.len;
+    }
+    return n;
+}
+
+/// Record-batch header (61B) plus slack, charged against batch_size on
+/// every flush check.
+const batch_overhead = 96;
 
 fn stripCr(s: []const u8) []const u8 {
     return if (s.len > 0 and s[s.len - 1] == '\r') s[0 .. s.len - 1] else s;
