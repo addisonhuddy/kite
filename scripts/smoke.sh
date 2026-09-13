@@ -158,7 +158,37 @@ for codec in none gzip snappy lz4 zstd; do
 done
 echo ok
 
-echo "== 15. kannon consumer selected options and round-trip =="
+echo "== 16. large compressed batches exceed one codec block =="
+for codec in gzip snappy lz4 zstd; do
+    topic="consume-large-$codec-$M"
+    docker exec "$C" $B/kafka-topics.sh --bootstrap-server localhost:9092 \
+        --create --topic "$topic" --partitions 3 >/dev/null
+    {
+        for n in $(seq 1 600); do
+            printf 'large-key-%d\t%s-%03d-%s\n' "$n" "$M" "$n" \
+                'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+        done
+        printf 'large-random\t'
+        head -c 70000 /dev/urandom | base64 -w0
+        printf '\n'
+    } >"$TMP/$topic.in"
+    docker exec -i "$C" $B/kafka-console-producer.sh --bootstrap-server localhost:9092 \
+        --topic "$topic" --producer-property "compression.type=$codec" \
+        --producer-property batch.size=1000000 --producer-property linger.ms=1000 \
+        --property parse.key=true --property $'key.separator=\t' <"$TMP/$topic.in"
+    (cd "$TMP" && "$K" consume --from-beginning -t 5000 -v "$topic" \
+        >"$topic.out" 2>"$topic.log")
+    sort "$TMP/$topic.in" >"$TMP/$topic.expected"
+    sort "$TMP/$topic.out" >"$TMP/$topic.sorted"
+    diff -u "$TMP/$topic.expected" "$TMP/$topic.sorted"
+    awk '/records bytes [0-9]+/ {
+        n = $NF
+        if (n > 32768) found = 1
+    } END { exit(found ? 0 : 1) }' "$TMP/$topic.log"
+done
+echo ok
+
+echo "== 17. kannon consumer selected options and round-trip =="
 docker exec "$C" $B/kafka-topics.sh --bootstrap-server localhost:9092 \
     --create --topic "consume-roundtrip-$M" --partitions 2 >/dev/null
 docker exec "$C" $B/kafka-topics.sh --bootstrap-server localhost:9092 \

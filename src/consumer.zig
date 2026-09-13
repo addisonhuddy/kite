@@ -124,7 +124,7 @@ fn listOffsets(
         const leader = leader_ptr.*;
         var parts: std.ArrayListUnmanaged(ListPart) = .empty;
         for (cursors) |*cursor| if (cursor.leader == leader)
-            try parts.append(alloc, .{ .pidx = cursor.pidx, .cursor = @constCast(cursor) });
+            try parts.append(alloc, .{ .pidx = cursor.pidx, .cursor = cursor });
         try listOffsetsLeader(c, alloc, topic, parts.items, start);
     }
     leaders.deinit(alloc);
@@ -180,7 +180,10 @@ fn listOffsetsLeader(
             const offset = try d.i64v();
             _ = try d.i32v();
             try d.tagBuffer();
-            if (code != .none) return error.FetchFailed;
+            if (code != .none) {
+                c.setErr("list offsets partition {d}: {s}", .{ pidx, code.name() });
+                return error.FetchFailed;
+            }
             for (parts) |part| {
                 if (part.pidx == pidx) part.cursor.offset = offset;
             }
@@ -280,25 +283,29 @@ fn fetchLeader(
                 return error.FetchFailed;
             }
             var range = Range{};
+            var next_from_batches: ?i64 = null;
             if (records) |blob| {
                 var ctx = RecordSink{ .out = out, .count = count, .max = opts.max_records, .range = &range };
-                protocol.decodeBatches(alloc, blob, &ctx, onRecord) catch |err| {
+                next_from_batches = protocol.decodeBatches(alloc, blob, &ctx, onRecord) catch |err| {
                     c.setErr("decode fetch partition {d}: {s}", .{ pidx, @errorName(err) });
                     return error.FetchFailed;
                 };
             }
             if (range.last) |last| {
                 if (part.cursor.offset <= last + 1) part.cursor.offset = last + 1;
-            } else if (part.cursor.offset < high_watermark) {
-                part.cursor.offset = high_watermark;
+            }
+            if (next_from_batches) |next| {
+                if (part.cursor.offset < next) part.cursor.offset = next;
             }
             if (range.first != null) {
                 progress.* = true;
-                c.vlog("fetch partition {d}: offsets {d}..{d}, high watermark {d}", .{
-                    pidx, range.first.?, range.last.?, high_watermark,
+                c.vlog("fetch partition {d}: offsets {d}..{d}, high watermark {d}, records bytes {d}", .{
+                    pidx, range.first.?, range.last.?, high_watermark, if (records) |blob| blob.len else 0,
                 });
             } else {
-                c.vlog("fetch partition {d}: offsets empty..empty, high watermark {d}", .{ pidx, high_watermark });
+                c.vlog("fetch partition {d}: offsets empty..empty, high watermark {d}, records bytes {d}", .{
+                    pidx, high_watermark, if (records) |blob| blob.len else 0,
+                });
             }
         }
         try d.tagBuffer();

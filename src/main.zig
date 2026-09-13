@@ -360,7 +360,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
         .max_records = max_records,
         .idle_ms = idle_ms,
     }, &stdout.interface) catch |err| switch (err) {
-        error.PartitionNotFound => fatal("partition not found", .{}),
+        error.PartitionNotFound => fatal("partition {d} not found in topic '{s}'", .{ partition orelse -1, topic_name }),
         error.FetchFailed => fatalErr(&cli, "consume failed"),
         else => fatalErr(&cli, "consume failed"),
     };
