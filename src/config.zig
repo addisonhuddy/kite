@@ -38,10 +38,8 @@ pub const LoadError = error{
 };
 
 fn warn(comptime fmt: []const u8, args: anytype) void {
-    var buf: [512]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
-    w.interface.print("kannon: warning: " ++ fmt ++ "\n", args) catch {};
-    w.interface.flush() catch {};
+    if (@import("builtin").is_test) return; // stderr writes corrupt the 0.16 test-runner IPC
+    std.debug.print("kannon: warning: " ++ fmt ++ "\n", args);
 }
 
 const Props = std.StringHashMap([]const u8);
@@ -72,13 +70,13 @@ pub fn parse(alloc: std.mem.Allocator, text: []const u8) !Props {
     return map;
 }
 
-fn configPaths(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged([]const u8)) !void {
+fn configPaths(alloc: std.mem.Allocator, env: *std.process.Environ.Map, list: *std.ArrayListUnmanaged([]const u8)) !void {
     try list.append(alloc, "./kannon.properties");
-    if (std.posix.getenv("XDG_CONFIG_HOME")) |xdg| {
+    if (env.get("XDG_CONFIG_HOME")) |xdg| {
         if (xdg.len > 0)
             try list.append(alloc, try std.fmt.allocPrint(alloc, "{s}/kannon/kannon.properties", .{xdg}));
     }
-    if (std.posix.getenv("HOME")) |home| {
+    if (env.get("HOME")) |home| {
         if (home.len > 0) {
             const p = try std.fmt.allocPrint(alloc, "{s}/.config/kannon/kannon.properties", .{home});
             for (list.items) |q|
@@ -90,13 +88,13 @@ fn configPaths(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged([]const u
 
 /// Find and parse the first kannon.properties on the search path, then
 /// validate it into a Config.
-pub fn load(alloc: std.mem.Allocator) LoadError!Config {
+pub fn load(io: std.Io, alloc: std.mem.Allocator, env: *std.process.Environ.Map) LoadError!Config {
     var paths: std.ArrayListUnmanaged([]const u8) = .empty;
-    try configPaths(alloc, &paths);
+    try configPaths(alloc, env, &paths);
 
     var text: ?[]u8 = null;
     for (paths.items) |p| {
-        const t = std.fs.cwd().readFileAlloc(alloc, p, 1 << 20) catch |err| switch (err) {
+        const t = std.Io.Dir.cwd().readFileAlloc(io, p, alloc, .limited(1 << 20)) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return error.ConfigNotFound,
         };

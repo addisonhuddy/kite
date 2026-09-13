@@ -25,13 +25,16 @@ const tls_plain_len = 32 * 1024;
 const max_response_len = 16 << 20;
 
 pub const Conn = struct {
-    stream: std.net.Stream,
+    stream: std.Io.net.Stream,
+    io: std.Io,
+    debug: bool,
     rbuf: [rbuf_len]u8,
     wbuf: [wbuf_len]u8,
     tls_rbuf: [tls_plain_len]u8,
     tls_wbuf: [tls_plain_len]u8,
-    net_reader: std.net.Stream.Reader,
-    net_writer: std.net.Stream.Writer,
+    net_reader: std.Io.net.Stream.Reader,
+    net_writer: std.Io.net.Stream.Writer,
+    ca_lock: std.Io.RwLock,
     tls_client: ?std.crypto.tls.Client,
     input: *std.Io.Reader,
     output: *std.Io.Writer,
@@ -39,73 +42,74 @@ pub const Conn = struct {
     port: u16,
 
     pub fn close(c: *Conn) void {
-        c.stream.close();
+        c.stream.close(c.io);
     }
 };
 
 /// Connect TCP to host:port. host may be DNS or IP literal.
-fn tcpConnect(alloc: std.mem.Allocator, host: []const u8, port: u16) !std.net.Stream {
-    const list = std.net.getAddressList(alloc, host, port) catch return error.ConnectFailed;
-    defer list.deinit();
-    var last_err: anyerror = error.ConnectFailed;
-    for (list.addrs) |addr| {
-        const s = std.net.tcpConnectToAddress(addr) catch |err| {
-            last_err = err;
-            continue;
-        };
-        // 15s timeouts keep a hung broker from stalling the CLI forever.
-        const tv = std.posix.timeval{ .sec = 15, .usec = 0 };
-        std.posix.setsockopt(s.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
-        std.posix.setsockopt(s.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
-        const one: c_int = 1;
-        std.posix.setsockopt(s.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
-        // NB: no SO_SNDBUF — explicit values clamp to wmem_max (~208KB here),
-        // smaller than tcp autotuning's ceiling.
-        return s;
-    }
-    return last_err;
+fn tcpConnect(io: std.Io, host: []const u8, port: u16) !std.Io.net.Stream {
+    const hn = std.Io.net.HostName.init(host) catch return error.ConnectFailed;
+    const s = hn.connect(io, port, .{ .mode = .stream }) catch return error.ConnectFailed;
+    // 15s timeouts keep a hung broker from stalling the CLI forever.
+    const tv = std.posix.timeval{ .sec = 15, .usec = 0 };
+    std.posix.setsockopt(s.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+    std.posix.setsockopt(s.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+    const one: c_int = 1;
+    std.posix.setsockopt(s.socket.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
+    // NB: no SO_SNDBUF — explicit values clamp to wmem_max (~208KB here),
+    // smaller than tcp autotuning's ceiling.
+    return s;
 }
 
 /// Establish a connection: TCP, then TLS if `ca` is set (SNI + verification on).
 pub fn connect(
+    io: std.Io,
     alloc: std.mem.Allocator,
+    env: *std.process.Environ.Map,
     host: []const u8,
     port: u16,
-    ca: ?std.crypto.Certificate.Bundle,
+    ca: ?*std.crypto.Certificate.Bundle,
 ) TransportError!*Conn {
-    const stream = tcpConnect(alloc, host, port) catch return error.ConnectFailed;
-    errdefer stream.close();
+    const stream = tcpConnect(io, host, port) catch return error.ConnectFailed;
+    errdefer stream.close(io);
 
     const c = try alloc.create(Conn);
     errdefer alloc.destroy(c);
     c.* = .{
         .stream = stream,
+        .io = io,
+        .debug = env.get("KANNON_DEBUG") != null,
         .rbuf = undefined,
         .wbuf = undefined,
         .tls_rbuf = undefined,
         .tls_wbuf = undefined,
         .net_reader = undefined,
         .net_writer = undefined,
+        .ca_lock = .init,
         .tls_client = null,
         .input = undefined,
         .output = undefined,
         .host = host,
         .port = port,
     };
-    c.net_reader = stream.reader(&c.rbuf);
-    c.net_writer = stream.writer(&c.wbuf);
-    c.input = c.net_reader.interface();
+    c.net_reader = stream.reader(io, &c.rbuf);
+    c.net_writer = stream.writer(io, &c.wbuf);
+    c.input = &c.net_reader.interface;
     c.output = &c.net_writer.interface;
 
     if (ca) |bundle| {
+        var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+        io.randomSecure(&entropy) catch io.random(&entropy);
         const client = std.crypto.tls.Client.init(c.input, c.output, .{
             .host = .{ .explicit = host },
-            .ca = .{ .bundle = bundle },
+            .ca = .{ .bundle = .{ .gpa = alloc, .io = io, .lock = &c.ca_lock, .bundle = bundle } },
             .read_buffer = &c.tls_rbuf,
             .write_buffer = &c.tls_wbuf,
+            .entropy = &entropy,
+            .realtime_now = .now(io, .real),
         }) catch |err| {
             // errdefers above close the stream and free `c`.
-            if (std.posix.getenv("KANNON_DEBUG") != null)
+            if (c.debug)
                 std.debug.print("tls init: {s}\n", .{@errorName(err)});
             const failed: TransportError = switch (err) {
                 error.TlsCertificateNotVerified, error.CertificateHostMismatch, error.CertificateIssuerMismatch, error.CertificateExpired, error.CertificateNotYetValid, error.CertificatePublicKeyInvalid, error.CertificateSignatureInvalid, error.UnsupportedCertificateVersion => error.TlsHandshakeAuthFailed,
@@ -131,7 +135,7 @@ pub fn send(c: *Conn, payload: []const u8) TransportError!void {
 pub fn sendv(c: *Conn, parts: []const []const u8) TransportError!void {
     var total: usize = 0;
     for (parts) |p| total += p.len;
-    if (std.posix.getenv("KANNON_DEBUG") != null) {
+    if (c.debug) {
         const first = parts[0];
         std.debug.print("send {d}B: {x}\n", .{ total, first[0..@min(first.len, 200)] });
     }
@@ -140,7 +144,7 @@ pub fn sendv(c: *Conn, parts: []const []const u8) TransportError!void {
     c.output.writeAll(&hdr) catch return error.IoFailed;
     for (parts) |p| c.output.writeAll(p) catch return error.IoFailed;
     c.output.flush() catch |err| {
-        if (std.posix.getenv("KANNON_DEBUG") != null)
+        if (c.debug)
             std.debug.print("send flush: {s}\n", .{@errorName(err)});
         return error.IoFailed;
     };
@@ -161,7 +165,7 @@ pub const Response = struct {
 /// response except ApiVersions, which is always header v0.
 pub fn recv(c: *Conn, alloc: std.mem.Allocator, expect_corr: i32, header_tags: bool) TransportError!Response {
     const hdr = c.input.takeArray(4) catch |err| {
-        if (std.posix.getenv("KANNON_DEBUG") != null) {
+        if (c.debug) {
             std.debug.print("recv hdr: {s}", .{@errorName(err)});
             if (c.tls_client) |*t| std.debug.print(" read_err={s}", .{@errorName(t.read_err orelse error{NoErr}.NoErr)});
             std.debug.print("\n", .{});
@@ -174,7 +178,7 @@ pub fn recv(c: *Conn, alloc: std.mem.Allocator, expect_corr: i32, header_tags: b
     errdefer alloc.free(frame);
     c.input.readSliceAll(frame) catch return error.IoFailed;
 
-    if (std.posix.getenv("KANNON_DEBUG") != null) {
+    if (c.debug) {
         const n = @min(frame.len, 512);
         std.debug.print("recv {d}B: {x}\n", .{ frame.len, frame[0..n] });
     }
