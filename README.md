@@ -14,7 +14,7 @@ v2, acks=all. **Requires Kafka 4.0+** (KRaft) on the broker side.
 
 ## Build
 
-Requires Zig 0.15.x:
+Requires Zig 0.16.x:
 
 ```console
 $ zig build            # produces zig-out/bin/kannon (ReleaseSmall, stripped)
