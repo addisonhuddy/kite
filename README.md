@@ -52,8 +52,7 @@ zig build -Dtarget=aarch64-macos
 zig build -Dtarget=x86_64-linux
 ```
 
-There are no package-manager or binary-download instructions: the supported
-installation is the source build above.
+The source build is the supported installation method.
 
 ## Quickstart
 
@@ -94,21 +93,30 @@ After installing `kite` as described above, the same commands can use
 
 The files in [`examples/data/`](examples/data) are ready-to-use inputs.
 
-```text
-Plain values:         zig-out/bin/kite events < examples/data/lines.txt
-Keys and values:      zig-out/bin/kite events < examples/data/keyed.tsv
-Keys and headers:     zig-out/bin/kite events < examples/data/headers.tsv
-Every-record header:  zig-out/bin/kite -H 'source: import' events < examples/data/lines.txt
-CSV values:           zig-out/bin/kite --csv events < examples/data/users.csv
-CSV with a key:       zig-out/bin/kite --csv --key user_id events < examples/data/events.csv
-Follow new records:   tail -f app.log | zig-out/bin/kite logs
-Partition/offset:     zig-out/bin/kite consume --partition 0 --offset 42 -n 10 events
-Consume then produce: zig-out/bin/kite consume --from-beginning -t 5000 src |
-                      zig-out/bin/kite dst
+```sh
+# plain values, one per line
+zig-out/bin/kite events < examples/data/lines.txt
+# key<TAB>value
+zig-out/bin/kite events < examples/data/keyed.tsv
+# key<TAB>headers<TAB>value
+zig-out/bin/kite events < examples/data/headers.tsv
+# attach a header to every record (-H is repeatable)
+zig-out/bin/kite -H 'source: import' events < examples/data/lines.txt
+# CSV rows as JSON values, optionally keyed by a column
+zig-out/bin/kite --csv events < examples/data/users.csv
+zig-out/bin/kite --csv --key user_id events < examples/data/events.csv
+# stream a log as it grows
+tail -f app.log | zig-out/bin/kite logs
+# follow new records (Ctrl-C to stop)
+zig-out/bin/kite consume events
+# read one partition from an offset, at most 10 records
+zig-out/bin/kite consume --partition 0 --offset 42 -n 10 -t 3000 events
+# copy a topic
+zig-out/bin/kite consume --from-beginning -t 5000 src | zig-out/bin/kite dst
 ```
 
-`-H` is repeatable. The consumer output is in the same textual shape accepted
-by the producer, subject to the format boundaries described below.
+The consumer output is in the same textual shape accepted by the producer,
+subject to the format boundaries described below.
 
 ## Consuming
 
