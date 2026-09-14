@@ -17,9 +17,10 @@ round-trip losslessly (keys and headers included):
 $ kite consume --from-beginning -t 3000 my-topic
 ```
 
-No JVM, no librdkafka, no dependencies — a single static binary under 1 MiB.
-Speaks the Kafka wire protocol directly: flexible versions only, record batch
-v2, acks=all. **Requires Kafka 4.0+** (KRaft) on the broker side.
+No JVM, no librdkafka, no dependencies — a single static binary, ~565 KiB
+stripped and ~200 KiB after `scripts/pack.sh` (UPX/LZMA). Speaks the Kafka
+wire protocol directly: flexible versions only, record batch v2, acks=all.
+**Requires Kafka 4.0+** (KRaft) on the broker side.
 
 ## Quickstart
 
@@ -44,6 +45,7 @@ Requires Zig 0.16.x:
 ```console
 $ zig build            # produces zig-out/bin/kite (ReleaseSmall, stripped)
 $ scripts/check-size.sh   # hard gate: fails if the binary is >= 1 MiB
+$ scripts/pack.sh         # optional: UPX-pack the binary (~200 KiB) for release
 ```
 
 The release artifact is only `zig-out/bin/kite` — `examples/` is
