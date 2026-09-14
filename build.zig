@@ -25,7 +25,7 @@ pub fn build(b: *std.Build) void {
         .error_tracing = false,
     });
 
-    const exe = b.addExecutable(.{ .name = "kannon", .root_module = mod });
+    const exe = b.addExecutable(.{ .name = "kite", .root_module = mod });
     b.installArtifact(exe);
 
     const test_step = b.step("test", "Run unit tests");

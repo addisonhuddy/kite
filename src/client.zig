@@ -110,7 +110,7 @@ pub const Client = struct {
     /// Verbose diagnostic to stderr, gated on `cfg.verbose` (-v).
     pub fn vlog(c: *Client, comptime fmt: []const u8, args: anytype) void {
         if (!c.cfg.verbose) return;
-        std.debug.print("kannon: " ++ fmt ++ "\n", args);
+        std.debug.print("kite: " ++ fmt ++ "\n", args);
     }
 
     fn loadCa(c: *Client) !*std.crypto.Certificate.Bundle {
@@ -249,7 +249,7 @@ pub const Client = struct {
         // all (header v1 request, header v0 response, legacy string types).
         const flexible = key != protocol.api_key.sasl_handshake;
         const resp_tags = key != protocol.api_key.api_versions and key != protocol.api_key.sasl_handshake;
-        try protocol.encodeRequest(&e, key, ver, flexible, "kannon", ctx, body_fn);
+        try protocol.encodeRequest(&e, key, ver, flexible, "kite", ctx, body_fn);
         try transport.send(conn, e.written());
         return try transport.recv(conn, alloc, protocol.lastCorrelationId(), resp_tags);
     }
@@ -260,7 +260,7 @@ pub const Client = struct {
         const Ctx = struct {};
         const body = struct {
             fn f(e: *Encoder, _: Ctx) protocol.ProtoError!void {
-                try e.compactString("kannon");
+                try e.compactString("kite");
                 try e.compactString("0.1.0");
                 try e.tagBuffer();
             }
@@ -872,7 +872,7 @@ pub const Client = struct {
         }
 
         var head = Encoder.init(c.alloc);
-        try protocol.encodeRequestHeader(&head, protocol.api_key.produce, protocol.version.produce, true, "kannon");
+        try protocol.encodeRequestHeader(&head, protocol.api_key.produce, protocol.version.produce, true, "kite");
         try head.compactString(null); // transactional_id
         try head.i16v(-1); // acks=all
         try head.i32v(15000); // timeout_ms
@@ -940,7 +940,7 @@ pub const Client = struct {
             try d.tagBuffer(); // topic tags
         }
         const throttle = try d.i32v();
-        if (throttle > 0) std.debug.print("kannon: broker throttled produce {d}ms\n", .{throttle});
+        if (throttle > 0) std.debug.print("kite: broker throttled produce {d}ms\n", .{throttle});
         try d.tagBuffer();
     }
 };

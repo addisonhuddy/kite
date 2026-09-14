@@ -4,7 +4,7 @@
 # inside the container is the broker itself).
 set -euo pipefail
 
-C=${KANNON_CONTAINER:-kannon-kafka}
+C=${KITE_CONTAINER:-kite-kafka}
 B=/opt/kafka/bin
 BS=localhost:9092
 

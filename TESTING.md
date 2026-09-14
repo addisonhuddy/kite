@@ -1,4 +1,4 @@
-# Testing kannon
+# Testing kite
 
 ## Unit tests
 
@@ -56,17 +56,17 @@ multi-partition, unknown-topic error, TLS with the test CA, TLS cert-verificatio
 failure, SASL PLAIN on both SASL listeners, bad-password failure, and
 SCRAM-SHA-256/512.
 
-The smoke script also includes Kannon consumer checks. For compression-specific
+The smoke script also includes Kite consumer checks. For compression-specific
 Fetch coverage, produce batches with Kafka's `compression.type` set to
 `none`, `gzip`, `snappy`, `lz4`, and `zstd`, then compare
-`kannon consume --from-beginning -t 3000 TOPIC | sort` with the input.
+`kite consume --from-beginning -t 3000 TOPIC | sort` with the input.
 
 ### Debugging
 
-Set `KANNON_DEBUG=1` to dump sent/received frames and TLS internals to stderr:
+Set `KITE_DEBUG=1` to dump sent/received frames and TLS internals to stderr:
 
 ```console
-$ KANNON_DEBUG=1 sh -c 'echo hi | ./zig-out/bin/kannon t1'
+$ KITE_DEBUG=1 sh -c 'echo hi | ./zig-out/bin/kite t1'
 ```
 
 ### Teardown

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Smoke test: exercises kannon against the docker-compose Kafka on all four
+# Smoke test: exercises kite against the docker-compose Kafka on all four
 # listeners. Run from the repo root after `docker compose up -d` +
 # `scripts/docker-init.sh` and `zig build`.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 ROOT=$PWD
-K=$ROOT/zig-out/bin/kannon
-C=kannon-kafka
+K=$ROOT/zig-out/bin/kite
+C=kite-kafka
 B=/opt/kafka/bin
 M=smoke-$(date +%s)-$RANDOM # unique marker so pre-existing records don't collide
 TMP=$(mktemp -d)
@@ -20,10 +20,10 @@ consume() { # topic, flags... — prints all records sorted
         --from-beginning --timeout-ms 8000 "$@" 2>/dev/null
 }
 
-write_props() { printf '%s\n' "$@" > "$TMP/kannon.properties"; }
-expect_err() { # runs kannon, expects failure matching a pattern in stderr
+write_props() { printf '%s\n' "$@" > "$TMP/kite.properties"; }
+expect_err() { # runs kite, expects failure matching a pattern in stderr
     if (cd "$TMP" && printf 'x\n' | "$K" "$1") 2>"$TMP/err"; then
-        echo "FAIL: expected kannon to fail on $1"; exit 1
+        echo "FAIL: expected kite to fail on $1"; exit 1
     fi
     grep -qi "$2" "$TMP/err" || { echo "FAIL: stderr was: $(cat "$TMP/err")"; exit 1; }
     echo ok
@@ -136,7 +136,7 @@ consume t1 --property print.key=true --property key.separator='|' \
     | grep -qF "$M-2|{\"id\":\"$M-2\",\"name\":\"bob\",\"note\":\"two\nlines\"}" || { echo "FAIL"; exit 1; }
 echo ok
 
-echo "== 14. kannon consumer compression matrix =="
+echo "== 14. kite consumer compression matrix =="
 (cd "$TMP" && write_props bootstrap.servers=localhost:9092 security.protocol=PLAINTEXT)
 for codec in none gzip snappy lz4 zstd; do
     topic="consume-$codec-$M"
@@ -188,7 +188,7 @@ for codec in gzip snappy lz4 zstd; do
 done
 echo ok
 
-echo "== 17. kannon consumer selected options and round-trip =="
+echo "== 17. kite consumer selected options and round-trip =="
 docker exec "$C" $B/kafka-topics.sh --bootstrap-server localhost:9092 \
     --create --topic "consume-roundtrip-$M" --partitions 2 >/dev/null
 docker exec "$C" $B/kafka-topics.sh --bootstrap-server localhost:9092 \

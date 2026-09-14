@@ -78,7 +78,7 @@ pub fn connect(
     c.* = .{
         .stream = stream,
         .io = io,
-        .debug = env.get("KANNON_DEBUG") != null,
+        .debug = env.get("KITE_DEBUG") != null,
         .rbuf = undefined,
         .wbuf = undefined,
         .tls_rbuf = undefined,
