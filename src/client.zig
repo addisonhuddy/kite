@@ -13,7 +13,7 @@ const Conn = transport.Conn;
 
 const BrokerAddr = struct { host: []const u8, port: u16 };
 
-const Partition = struct { index: i32, leader: i32 };
+pub const Partition = struct { index: i32, leader: i32 };
 
 const ApiRange = struct { min: i16, max: i16 };
 
@@ -108,7 +108,7 @@ pub const Client = struct {
     }
 
     /// Verbose diagnostic to stderr, gated on `cfg.verbose` (-v).
-    fn vlog(c: *Client, comptime fmt: []const u8, args: anytype) void {
+    pub fn vlog(c: *Client, comptime fmt: []const u8, args: anytype) void {
         if (!c.cfg.verbose) return;
         std.debug.print("kite: " ++ fmt ++ "\n", args);
     }
@@ -205,6 +205,8 @@ pub const Client = struct {
         for ([_][2]i16{
             .{ protocol.api_key.produce, protocol.version.produce },
             .{ protocol.api_key.metadata, protocol.version.metadata },
+            .{ protocol.api_key.fetch, protocol.version.fetch },
+            .{ protocol.api_key.list_offsets, protocol.version.list_offsets },
         }) |kv| {
             if (!c.checkVersion(kv[0], kv[1])) {
                 const r = c.api_ranges.get(kv[0]);
@@ -227,7 +229,20 @@ pub const Client = struct {
         ctx: anytype,
         comptime body_fn: fn (*Encoder, @TypeOf(ctx)) protocol.ProtoError!void,
     ) !Resp {
-        var e = Encoder.init(c.alloc);
+        return c.sendRequestAlloc(c.alloc, conn, key, ver, ctx, body_fn);
+    }
+
+    pub fn sendRequestAlloc(
+        c: *Client,
+        alloc: std.mem.Allocator,
+        conn: *Conn,
+        key: i16,
+        ver: i16,
+        ctx: anytype,
+        comptime body_fn: fn (*Encoder, @TypeOf(ctx)) protocol.ProtoError!void,
+    ) !Resp {
+        _ = c;
+        var e = Encoder.init(alloc);
         defer e.deinit();
         // ApiVersions and SaslHandshake are the non-/semi-flexible oddballs:
         // ApiVersions answers header v0; SaslHandshake v1 is not flexible at
@@ -236,7 +251,7 @@ pub const Client = struct {
         const resp_tags = key != protocol.api_key.api_versions and key != protocol.api_key.sasl_handshake;
         try protocol.encodeRequest(&e, key, ver, flexible, "kite", ctx, body_fn);
         try transport.send(conn, e.written());
-        return try transport.recv(conn, c.alloc, protocol.lastCorrelationId(), resp_tags);
+        return try transport.recv(conn, alloc, protocol.lastCorrelationId(), resp_tags);
     }
 
     // -- ApiVersions ---------------------------------------------------------
@@ -549,7 +564,7 @@ pub const Client = struct {
     const Inflight = struct { node: i32, key: u64, n: usize };
     const conns_per_partition = 2;
 
-    fn connKey(node: i32, slot: u32) u64 {
+    pub fn connKey(node: i32, slot: u32) u64 {
         return (@as(u64, @intCast(node)) << 32) | slot;
     }
 
@@ -794,7 +809,7 @@ pub const Client = struct {
         }
     }
 
-    fn partitionLeader(c: *Client, pidx: i32) ?i32 {
+    pub fn partitionLeader(c: *Client, pidx: i32) ?i32 {
         for (c.partitions.items) |p|
             if (p.index == pidx) return p.leader;
         return null;
@@ -811,11 +826,11 @@ pub const Client = struct {
         try c.bootstrap();
     }
 
-    fn sleep(c: *Client, ms: u64) void {
+    pub fn sleep(c: *Client, ms: u64) void {
         std.Io.sleep(c.io, .fromMilliseconds(@intCast(ms)), .awake) catch {};
     }
 
-    fn connFor(c: *Client, node: i32, key: u64) !*Conn {
+    pub fn connFor(c: *Client, node: i32, key: u64) !*Conn {
         if (c.conns.get(key)) |conn| return conn;
         const addr = c.brokers.get(node) orelse {
             c.setErr("no address for broker node {d}", .{node});
@@ -827,7 +842,7 @@ pub const Client = struct {
         return conn;
     }
 
-    fn dropConn(c: *Client, key: u64) void {
+    pub fn dropConn(c: *Client, key: u64) void {
         if (c.conns.fetchRemove(key)) |kv| {
             c.vlog("dropping connection to broker {d}", .{key >> 32});
             kv.value.close();
