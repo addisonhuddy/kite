@@ -1,4 +1,4 @@
-//! kannon — ultra-lightweight producer-only Kafka CLI.
+//! kannon — ultra-lightweight Kafka CLI.
 //! `kannon <topic> < file` sends each stdin line as one record value.
 
 const std = @import("std");
@@ -8,6 +8,7 @@ const protocol = @import("protocol.zig");
 const transport = @import("transport.zig");
 const scram = @import("scram.zig");
 const csv = @import("csv.zig");
+const consumer = @import("consumer.zig");
 
 // unused-import anchors so `zig build test` covers every module
 comptime {
@@ -17,6 +18,7 @@ comptime {
     _ = transport;
     _ = scram;
     _ = csv;
+    _ = consumer;
 }
 
 fn out(comptime fmt: []const u8, args: anytype) void {
@@ -46,7 +48,11 @@ fn usageExit(code: u8) noreturn {
         "  --csv           parse stdin as RFC 4180 CSV; first row is the header,\n" ++
         "                  each row becomes a JSON object value\n" ++
         "  --key <col>     CSV column to use as the record key\n" ++
-        "  -v, --verbose   connection/retry diagnostics on stderr\n", .{});
+        "  -v, --verbose   connection/retry diagnostics on stderr\n\n" ++
+        "usage: kannon consume [-v] [--from-beginning | --offset N] [--partition P] [-n MAX] [-t IDLE_MS] <topic>\n" ++
+        "  emits records in producer stdin format; default start position is latest\n" ++
+        "  -n MAX          stop after MAX records\n" ++
+        "  -t IDLE_MS      stop after IDLE_MS without a record\n", .{});
     std.process.exit(code);
 }
 
@@ -106,6 +112,10 @@ pub fn main(init: std.process.Init) !void {
     const alloc = init.arena.allocator();
 
     const args = init.minimal.args.toSlice(alloc) catch fatal("out of memory", .{});
+    if (args.len > 1 and std.mem.eql(u8, args[1], "consume")) {
+        runConsume(init, args[2..], alloc);
+        return;
+    }
     var static_headers: std.ArrayListUnmanaged(protocol.Header) = .empty;
     var topic_arg: ?[]const u8 = null;
     var verbose = false;
@@ -258,6 +268,107 @@ pub fn main(init: std.process.Init) !void {
     w.interface.print("{d} record(s) produced to '{s}'\n", .{ total, topic }) catch {};
     w.interface.flush() catch {};
     cli.deinit();
+}
+
+fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.Allocator) noreturn {
+    var verbose = false;
+    var start: consumer.Options.Start = .latest;
+    var offset: i64 = 0;
+    var partition: ?i32 = null;
+    var max_records: ?u64 = null;
+    var idle_ms: ?u64 = null;
+    var topic: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
+            verbose = true;
+        } else if (std.mem.eql(u8, arg, "--from-beginning")) {
+            if (start == .offset) usage();
+            start = .earliest;
+        } else if (std.mem.eql(u8, arg, "--offset")) {
+            i += 1;
+            if (i >= args.len) usage();
+            if (start == .earliest) usage();
+            offset = std.fmt.parseInt(i64, args[i], 10) catch usage();
+            if (offset < 0) usage();
+            start = .offset;
+        } else if (std.mem.startsWith(u8, arg, "--offset=")) {
+            if (start == .earliest) usage();
+            offset = std.fmt.parseInt(i64, arg["--offset=".len..], 10) catch usage();
+            if (offset < 0) usage();
+            start = .offset;
+        } else if (std.mem.eql(u8, arg, "--partition")) {
+            i += 1;
+            if (i >= args.len) usage();
+            partition = std.fmt.parseInt(i32, args[i], 10) catch usage();
+            if (partition.? < 0) usage();
+        } else if (std.mem.startsWith(u8, arg, "--partition=")) {
+            partition = std.fmt.parseInt(i32, arg["--partition=".len..], 10) catch usage();
+            if (partition.? < 0) usage();
+        } else if (std.mem.eql(u8, arg, "-n")) {
+            i += 1;
+            if (i >= args.len) usage();
+            max_records = std.fmt.parseInt(u64, args[i], 10) catch usage();
+        } else if (std.mem.startsWith(u8, arg, "-n") and arg.len > 2) {
+            max_records = std.fmt.parseInt(u64, arg[2..], 10) catch usage();
+        } else if (std.mem.eql(u8, arg, "-t")) {
+            i += 1;
+            if (i >= args.len) usage();
+            idle_ms = std.fmt.parseInt(u64, args[i], 10) catch usage();
+        } else if (std.mem.startsWith(u8, arg, "-t") and arg.len > 2) {
+            idle_ms = std.fmt.parseInt(u64, arg[2..], 10) catch usage();
+        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            usageExit(0);
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            usage();
+        } else if (topic == null) {
+            topic = arg;
+        } else usage();
+    }
+    const topic_name = topic orelse usage();
+    if (topic_name.len == 0) usage();
+
+    var cfg = config.load(init.io, alloc, init.environ_map) catch |err| switch (err) {
+        error.ConfigNotFound => fatal(
+            "no kannon.properties found (searched ./kannon.properties, $XDG_CONFIG_HOME/kannon/kannon.properties, ~/.config/kannon/kannon.properties)",
+            .{},
+        ),
+        error.MissingBootstrapServers => fatal("kannon.properties is missing required key bootstrap.servers", .{}),
+        error.InvalidSecurityProtocol => fatal("invalid security.protocol (want PLAINTEXT, SSL, SASL_SSL, or SASL_PLAINTEXT)", .{}),
+        error.InvalidSaslMechanism => fatal("invalid sasl.mechanism (want PLAIN, SCRAM-SHA-256, or SCRAM-SHA-512)", .{}),
+        error.MissingSaslMechanism => fatal("security.protocol=SASL_* requires sasl.mechanism", .{}),
+        error.MissingSaslCredentials => fatal("sasl.mechanism set but sasl.username/sasl.password missing", .{}),
+        else => fatal("failed to load kannon.properties: {s}", .{@errorName(err)}),
+    };
+    cfg.verbose = verbose;
+    var cli = client.Client.init(alloc, init.io, init.environ_map, &cfg);
+    cli.bootstrap() catch fatalErr(&cli, "could not reach any bootstrap server");
+    cli.refreshMetadata(topic_name) catch |err| switch (err) {
+        error.TopicNotFound => fatal("topic '{s}' does not exist", .{topic_name}),
+        error.TopicAuthorizationFailed => fatal("not authorized to read topic '{s}'", .{topic_name}),
+        else => fatalErr(&cli, "metadata lookup failed"),
+    };
+
+    var stdout_buf: [64 * 1024]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &stdout_buf);
+    const consumed = consumer.run(&cli, .{
+        .topic = topic_name,
+        .start = start,
+        .offset = offset,
+        .partition = partition,
+        .max_records = max_records,
+        .idle_ms = idle_ms,
+    }, &stdout.interface) catch |err| switch (err) {
+        error.PartitionNotFound => fatal("partition {d} not found in topic '{s}'", .{ partition orelse -1, topic_name }),
+        error.FetchFailed => fatalErr(&cli, "consume failed"),
+        else => fatalErr(&cli, "consume failed"),
+    };
+    stdout.interface.flush() catch {};
+    if (max_records != null or idle_ms != null)
+        std.debug.print("{d} record(s) consumed from '{s}'\n", .{ consumed, topic_name });
+    cli.deinit();
+    std.process.exit(0);
 }
 
 /// Lap timer over the monotonic `Io` clock (replaces std.time.Timer).
