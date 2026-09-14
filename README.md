@@ -1,10 +1,10 @@
-# kannon
+# kite
 
-An ultra-lightweight Kafka producer CLI written in Zig. `kannon` reads lines
+An ultra-lightweight Kafka producer CLI written in Zig. `kite` reads lines
 from stdin and produces each line as a record to a topic:
 
 ```console
-$ kannon my-topic < file.txt
+$ kite my-topic < file.txt
 3 record(s) produced to 'my-topic'
 ```
 
@@ -20,9 +20,9 @@ Against the local docker-compose harness (see [TESTING.md](TESTING.md)):
 $ scripts/gen-tls.sh            # one-time: test CA + broker keystore
 $ docker compose up -d
 $ scripts/docker-init.sh        # creates topics (incl. `t1`) + SASL users
-$ cp examples/config/plaintext.properties kannon.properties
+$ cp examples/config/plaintext.properties kite.properties
 $ zig build
-$ zig-out/bin/kannon t1 < examples/data/lines.txt
+$ zig-out/bin/kite t1 < examples/data/lines.txt
 5 record(s) produced to 't1'
 ```
 
@@ -30,7 +30,7 @@ Topic auto-creation is disabled in the harness, so produce to a topic that
 exists (`t1`) or create one first. Consume it back:
 
 ```console
-$ docker exec kannon-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+$ docker exec kite-kafka /opt/kafka/bin/kafka-console-consumer.sh \
     --bootstrap-server localhost:9092 --topic t1 \
     --from-beginning --timeout-ms 5000
 ```
@@ -40,11 +40,11 @@ $ docker exec kannon-kafka /opt/kafka/bin/kafka-console-consumer.sh \
 Requires Zig 0.16.x:
 
 ```console
-$ zig build            # produces zig-out/bin/kannon (ReleaseSmall, stripped)
+$ zig build            # produces zig-out/bin/kite (ReleaseSmall, stripped)
 $ scripts/check-size.sh   # hard gate: fails if the binary is >= 1 MiB
 ```
 
-The release artifact is only `zig-out/bin/kannon` — `examples/` is
+The release artifact is only `zig-out/bin/kite` — `examples/` is
 documentation/sample data and is not referenced by the build.
 
 Cross-compile for other targets, e.g.:
@@ -57,9 +57,9 @@ $ zig build -Dtarget=x86_64-macos      # Intel Mac
 ## Usage
 
 ```console
-$ kannon [-v] [-H 'name: value']... [--csv [--key col]] <topic>
-$ kannon consume [options] <topic>       # fetch records to stdout
-$ echo hello | kannon my-topic
+$ kite [-v] [-H 'name: value']... [--csv [--key col]] <topic>
+$ kite consume [options] <topic>       # fetch records to stdout
+$ echo hello | kite my-topic
 ```
 
 Each stdin line is one record. A plain line is value-only; a TAB separates
@@ -69,39 +69,39 @@ fields are per-record `name: value` headers.
 Cookbook, using the files in [`examples/data/`](examples/data):
 
 ```console
-$ kannon t1 < examples/data/lines.txt              # 5 value-only records
-$ printf 'value only\n' | kannon t1
-$ kannon t1 < examples/data/keyed.tsv              # key<TAB>value
-$ printf 'key\tvalue\n' | kannon t1
-$ kannon t1 < examples/data/headers.tsv            # key, headers, value
-$ printf 'key\ttrace-id: 42\tsrc: cli\tvalue\n' | kannon t1
+$ kite t1 < examples/data/lines.txt              # 5 value-only records
+$ printf 'value only\n' | kite t1
+$ kite t1 < examples/data/keyed.tsv              # key<TAB>value
+$ printf 'key\tvalue\n' | kite t1
+$ kite t1 < examples/data/headers.tsv            # key, headers, value
+$ printf 'key\ttrace-id: 42\tsrc: cli\tvalue\n' | kite t1
 ```
 
 `-H 'name: value'` (repeatable, curl-style) attaches a header to every
 record:
 
 ```console
-$ kannon -H 'source: import-job' -H 'env: prod' t1 < examples/data/lines.txt
+$ kite -H 'source: import-job' -H 'env: prod' t1 < examples/data/lines.txt
 ```
 
 Bulk load and stream:
 
 ```console
-$ seq 1 100000 | kannon t1
-$ tail -f app.log | kannon logs                    # produces as lines arrive
+$ seq 1 100000 | kite t1
+$ tail -f app.log | kite logs                    # produces as lines arrive
 ```
 
 CSV input (see "CSV input" below):
 
 ```console
-$ kannon --csv t1 < examples/data/users.csv
-$ kannon --csv --key user_id t1 < examples/data/events.csv
+$ kite --csv t1 < examples/data/users.csv
+$ kite --csv --key user_id t1 < examples/data/events.csv
 ```
 
 Watch keys and headers land on the broker (docker-compose harness):
 
 ```console
-$ docker exec kannon-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+$ docker exec kite-kafka /opt/kafka/bin/kafka-console-consumer.sh \
     --bootstrap-server localhost:9092 --topic t1 --from-beginning \
     --timeout-ms 8000 --property print.key=true \
     --property print.headers=true --property key.separator='|'
@@ -110,8 +110,8 @@ $ docker exec kannon-kafka /opt/kafka/bin/kafka-console-consumer.sh \
 Diagnostics on stderr (see "Diagnostics"):
 
 ```console
-$ kannon -v t1 < examples/data/lines.txt           # connection/retry info
-$ KANNON_DEBUG=1 kannon t1 < examples/data/lines.txt  # hex-dump frames
+$ kite -v t1 < examples/data/lines.txt           # connection/retry info
+$ KITE_DEBUG=1 kite t1 < examples/data/lines.txt  # hex-dump frames
 ```
 
 - The final line is produced even without a trailing newline.
@@ -131,12 +131,12 @@ $ KANNON_DEBUG=1 kannon t1 < examples/data/lines.txt  # hex-dump frames
 
 ## Consuming
 
-`kannon consume` writes one record per line in the same format accepted by the
+`kite consume` writes one record per line in the same format accepted by the
 producer, making consume-to-produce pipelines lossless for keys and headers:
 
 ```console
-$ kannon consume --from-beginning -t 3000 my-topic
-$ kannon consume --offset 42 --partition 1 -n 10 my-topic
+$ kite consume --from-beginning -t 3000 my-topic
+$ kite consume --offset 42 --partition 1 -n 10 my-topic
 ```
 
 The default starting position is the latest offset. Use `--from-beginning` for
@@ -151,7 +151,7 @@ and high watermarks to stderr.
 and every following row becomes one record whose value is a JSON object:
 
 ```console
-$ kannon --csv my-topic < data.csv
+$ kite --csv my-topic < data.csv
 ```
 
 ```text
@@ -163,7 +163,7 @@ id,name,note              →  {"id":"1","name":"alice","note":"hi"}
   a quoted newline does not split the record.
 - `--key <col>` uses a column as the record key (it stays in the JSON
   value), so keyed rows get murmur2 partitioning:
-  `kannon --csv --key id my-topic < data.csv`
+  `kite --csv --key id my-topic < data.csv`
 - All fields are emitted as JSON strings — no type guessing, so IDs like
   `007` survive intact.
 - CRLF endings and a UTF-8 BOM are handled; a row with the wrong number
@@ -171,12 +171,12 @@ id,name,note              →  {"id":"1","name":"alice","note":"hi"}
 
 ## Configuration
 
-kannon reads `kannon.properties` (Java properties format, `key=value` lines,
+kite reads `kite.properties` (Java properties format, `key=value` lines,
 `#`/`!` comments). Search order — first match wins:
 
-1. `./kannon.properties` (current directory)
-2. `$XDG_CONFIG_HOME/kannon/kannon.properties`
-3. `~/.config/kannon/kannon.properties`
+1. `./kite.properties` (current directory)
+2. `$XDG_CONFIG_HOME/kite/kite.properties`
+3. `~/.config/kite/kite.properties`
 
 | Key | Required | Values |
 | --- | --- | --- |
@@ -203,18 +203,18 @@ All diagnostics go to stderr; stdout carries only the final
 - `-v` / `--verbose` — connection lifecycle (bootstrap, per-broker connects,
   drops), partition counts, the assigned producer id, and every retry attempt
   with its backoff.
-- `KANNON_DEBUG=1` — hex-dumps outbound request frames and logs TLS
+- `KITE_DEBUG=1` — hex-dumps outbound request frames and logs TLS
   handshake errors.
-- `KANNON_TIME=1` — prints `read/send/drain` millisecond totals and the
+- `KITE_TIME=1` — prints `read/send/drain` millisecond totals and the
   connection count on exit (perf tuning).
 
 ## Examples
 
-`kannon.properties` templates live in [`examples/config/`](examples/config) —
+`kite.properties` templates live in [`examples/config/`](examples/config) —
 copy one into place and edit `bootstrap.servers` / credentials:
 
 ```console
-$ cp examples/config/plaintext.properties kannon.properties
+$ cp examples/config/plaintext.properties kite.properties
 ```
 
 | File | For |
@@ -228,7 +228,7 @@ $ cp examples/config/plaintext.properties kannon.properties
 Sample stdin inputs are in [`examples/data/`](examples/data): `lines.txt`
 (value-only), `keyed.tsv` (key + value), `headers.tsv` (key + headers +
 value), `users.csv` and `events.csv` (for `--csv` / `--csv --key`).
-The name `kannon.properties` is gitignored on purpose — the templates use
+The name `kite.properties` is gitignored on purpose — the templates use
 different names so they stay tracked.
 
 ## Testing
@@ -245,5 +245,5 @@ all four listeners (PLAINTEXT / SSL / SASL_SSL / SASL_PLAINTEXT) and
 - `src/client.zig` — bootstrap, ApiVersions negotiation, SASL, metadata, produce/fetch + retry
 - `src/consumer.zig` — ListOffsets/Fetch consumer loop and output formatting
 - `src/scram.zig` — RFC 5802 SCRAM-SHA-256/512 client with server-signature verification
-- `src/config.zig` — `kannon.properties` loader
+- `src/config.zig` — `kite.properties` loader
 - `src/csv.zig` — quote-aware row reader, field unescaping, row→JSON

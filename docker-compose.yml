@@ -1,7 +1,7 @@
 services:
   kafka:
     image: apache/kafka:4.0.0
-    container_name: kannon-kafka
+    container_name: kite-kafka
     ports:
       - "127.0.0.1:9092:9092" # PLAINTEXT
       - "127.0.0.1:9093:9093" # SSL

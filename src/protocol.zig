@@ -818,13 +818,13 @@ test "varint byte-exact fixtures" {
 test "compact string round trip" {
     var e = Encoder.init(std.testing.allocator);
     defer e.deinit();
-    try e.compactString("kannon");
+    try e.compactString("kite");
     try e.compactString(null);
     try e.compactString("");
     try e.compactArrayLen(3);
 
     var d = Decoder.init(e.written());
-    try std.testing.expectEqualStrings("kannon", (try d.compactString()).?);
+    try std.testing.expectEqualStrings("kite", (try d.compactString()).?);
     try std.testing.expect((try d.compactString()) == null);
     try std.testing.expectEqualStrings("", (try d.compactString()).?);
     try std.testing.expectEqual(@as(i64, 3), try d.compactArrayLen());

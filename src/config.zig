@@ -41,7 +41,7 @@ pub const LoadError = error{
 
 fn warn(comptime fmt: []const u8, args: anytype) void {
     if (@import("builtin").is_test) return; // stderr writes corrupt the 0.16 test-runner IPC
-    std.debug.print("kannon: warning: " ++ fmt ++ "\n", args);
+    std.debug.print("kite: warning: " ++ fmt ++ "\n", args);
 }
 
 const Props = std.StringHashMap([]const u8);
@@ -58,13 +58,13 @@ pub fn parse(alloc: std.mem.Allocator, text: []const u8) !Props {
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0 or line[0] == '#' or line[0] == '!') continue;
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse {
-            warn("kannon.properties line {d}: ignoring line without '=': {s}", .{ lineno, line });
+            warn("kite.properties line {d}: ignoring line without '=': {s}", .{ lineno, line });
             continue;
         };
         const key = std.mem.trim(u8, line[0..eq], " \t");
         const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
         if (key.len == 0) {
-            warn("kannon.properties line {d}: ignoring empty key", .{lineno});
+            warn("kite.properties line {d}: ignoring empty key", .{lineno});
             continue;
         }
         try map.put(key, value);
@@ -73,14 +73,14 @@ pub fn parse(alloc: std.mem.Allocator, text: []const u8) !Props {
 }
 
 fn configPaths(alloc: std.mem.Allocator, env: *std.process.Environ.Map, list: *std.ArrayListUnmanaged([]const u8)) !void {
-    try list.append(alloc, "./kannon.properties");
+    try list.append(alloc, "./kite.properties");
     if (env.get("XDG_CONFIG_HOME")) |xdg| {
         if (xdg.len > 0)
-            try list.append(alloc, try std.fmt.allocPrint(alloc, "{s}/kannon/kannon.properties", .{xdg}));
+            try list.append(alloc, try std.fmt.allocPrint(alloc, "{s}/kite/kite.properties", .{xdg}));
     }
     if (env.get("HOME")) |home| {
         if (home.len > 0) {
-            const p = try std.fmt.allocPrint(alloc, "{s}/.config/kannon/kannon.properties", .{home});
+            const p = try std.fmt.allocPrint(alloc, "{s}/.config/kite/kite.properties", .{home});
             for (list.items) |q|
                 if (std.mem.eql(u8, q, p)) return;
             try list.append(alloc, p);
@@ -88,7 +88,7 @@ fn configPaths(alloc: std.mem.Allocator, env: *std.process.Environ.Map, list: *s
     }
 }
 
-/// Find and parse the first kannon.properties on the search path, then
+/// Find and parse the first kite.properties on the search path, then
 /// validate it into a Config.
 pub fn load(io: std.Io, alloc: std.mem.Allocator, env: *std.process.Environ.Map) LoadError!Config {
     var paths: std.ArrayListUnmanaged([]const u8) = .empty;
