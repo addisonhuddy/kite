@@ -4,6 +4,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const client = @import("client.zig");
+const cli_args = @import("cli.zig");
 const protocol = @import("protocol.zig");
 const transport = @import("transport.zig");
 const scram = @import("scram.zig");
@@ -14,6 +15,7 @@ const consumer = @import("consumer.zig");
 comptime {
     _ = config;
     _ = client;
+    _ = cli_args;
     _ = protocol;
     _ = transport;
     _ = scram;
@@ -41,35 +43,19 @@ fn fatalErr(c: *const client.Client, comptime fmt: []const u8) noreturn {
         fatal(fmt, .{});
 }
 
-fn usageExit(code: u8) noreturn {
-    out("usage: kite [-v] [-H 'name: value']... [--csv [--key col]] <topic>\n" ++
-        "  reads records from stdin, one per line:\n" ++
-        "    value                            value only\n" ++
-        "    key<TAB>value                    record key + value\n" ++
-        "    key<TAB>h1: v1<TAB>...<TAB>value key + headers + value\n" ++
-        "  -H 'name: value' adds the header to every record (repeatable)\n" ++
-        "  --csv           parse stdin as RFC 4180 CSV; first row is the header,\n" ++
-        "                  each row becomes a JSON object value\n" ++
-        "  --key <col>     CSV column to use as the record key\n" ++
-        "  -v, --verbose   connection/retry diagnostics on stderr\n\n" ++
-        "usage: kite consume [-v] [--from-beginning | --offset N] [--partition P] [-n MAX] [-t IDLE_MS] <topic>\n" ++
-        "  emits records in producer stdin format; default start position is latest\n" ++
-        "  -n MAX          stop after MAX records\n" ++
-        "  -t IDLE_MS      stop after IDLE_MS without a record\n", .{});
-    std.process.exit(code);
+fn writeText(init: std.process.Init, file: std.Io.File, text: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    var w = file.writer(init.io, &buf);
+    w.interface.writeAll(text) catch {};
+    w.interface.flush() catch {};
 }
 
-fn usage() noreturn {
-    usageExit(1);
-}
-
-/// Parse a 'name: value' header (curl -H style). Name/value are trimmed.
-fn parseHeaderArg(s: []const u8) protocol.Header {
-    const colon = std.mem.indexOfScalar(u8, s, ':') orelse
-        fatal("malformed header '{s}' (want 'name: value')", .{s});
-    const name = std.mem.trim(u8, s[0..colon], " \t");
-    if (name.len == 0) fatal("malformed header '{s}' (want 'name: value')", .{s});
-    return .{ .key = name, .value = std.mem.trim(u8, s[colon + 1 ..], " \t") };
+fn parseFatal(init: std.process.Init, message: []const u8, usage_text: []const u8) noreturn {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stderr().writer(init.io, &buf);
+    w.interface.print("kite: {s}\n{s}", .{ message, usage_text }) catch {};
+    w.interface.flush() catch {};
+    std.process.exit(1);
 }
 
 /// Parse one stdin line into a record. First TAB-field = key (empty = null),
@@ -94,7 +80,9 @@ fn parseLine(
         } else {
             if (std.mem.indexOfScalar(u8, f, ':') == null)
                 fatal("line {d}: malformed header '{s}' (want 'name: value')", .{ lineno, f });
-            headers.append(alloc, parseHeaderArg(f)) catch fatal("out of memory", .{});
+            headers.append(alloc, cli_args.parseHeaderArg(f) catch
+                fatal("line {d}: malformed header '{s}' (want 'name: value')", .{ lineno, f })) catch
+                fatal("out of memory", .{});
         }
     }
     return .{
@@ -119,41 +107,20 @@ pub fn main(init: std.process.Init) !void {
         runConsume(init, args[2..], alloc);
         return;
     }
-    var static_headers: std.ArrayListUnmanaged(protocol.Header) = .empty;
-    var topic_arg: ?[]const u8 = null;
-    var verbose = false;
-    var csv_mode = false;
-    var csv_key_col: ?[]const u8 = null;
-    var ai: usize = 1;
-    while (ai < args.len) : (ai += 1) {
-        const a = args[ai];
-        if (std.mem.eql(u8, a, "-H")) {
-            ai += 1;
-            if (ai >= args.len) usage();
-            static_headers.append(alloc, parseHeaderArg(args[ai])) catch fatal("out of memory", .{});
-        } else if (std.mem.startsWith(u8, a, "-H") and a.len > 2) {
-            static_headers.append(alloc, parseHeaderArg(a[2..])) catch fatal("out of memory", .{});
-        } else if (std.mem.eql(u8, a, "--csv")) {
-            csv_mode = true;
-        } else if (std.mem.eql(u8, a, "--key")) {
-            ai += 1;
-            if (ai >= args.len) usage();
-            csv_key_col = args[ai];
-        } else if (std.mem.startsWith(u8, a, "--key=")) {
-            csv_key_col = a["--key=".len..];
-        } else if (std.mem.eql(u8, a, "-v") or std.mem.eql(u8, a, "--verbose")) {
-            verbose = true;
-        } else if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
-            usageExit(0);
-        } else if (std.mem.startsWith(u8, a, "-")) {
-            usage();
-        } else if (topic_arg == null) {
-            topic_arg = a;
-        } else usage();
-    }
-    const topic = topic_arg orelse usage();
-    if (topic.len == 0) usage();
-    if (csv_key_col != null and !csv_mode) usage();
+    const parsed = cli_args.parseProduce(alloc, args[1..]);
+    const produce = switch (parsed) {
+        .help => {
+            writeText(init, std.Io.File.stdout(), cli_args.produce_help);
+            return;
+        },
+        .err => |message| parseFatal(init, message, cli_args.produce_usage),
+        .ok => |value| value,
+    };
+    const topic = produce.topic;
+    const static_headers = produce.headers;
+    const verbose = produce.verbose;
+    const csv_mode = produce.csv;
+    const csv_key_col = produce.key_col;
 
     var cfg = config.load(io, alloc, init.environ_map) catch |err| switch (err) {
         error.ConfigNotFound => fatal(
@@ -229,11 +196,11 @@ pub fn main(init: std.process.Init) !void {
         const rec = if (csv_mode) blk: {
             const row = csv.nextRow(r, alloc) catch fatal("failed reading stdin", .{}) orelse
                 break :read_loop;
-            break :blk csvRecord(alloc, row, cols, key_idx, static_headers.items, total + 1);
+            break :blk csvRecord(alloc, row, cols, key_idx, static_headers, total + 1);
         } else blk: {
             const owned = nextLine(r, alloc) catch fatal("failed reading stdin", .{}) orelse
                 break :read_loop;
-            break :blk parseLine(alloc, owned, static_headers.items, total + 1);
+            break :blk parseLine(alloc, owned, static_headers, total + 1);
         };
         t_read += timer.lap();
         total += 1;
@@ -274,63 +241,17 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.Allocator) noreturn {
-    var verbose = false;
-    var start: consumer.Options.Start = .latest;
-    var offset: i64 = 0;
-    var partition: ?i32 = null;
-    var max_records: ?u64 = null;
-    var idle_ms: ?u64 = null;
-    var topic: ?[]const u8 = null;
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
-            verbose = true;
-        } else if (std.mem.eql(u8, arg, "--from-beginning")) {
-            if (start == .offset) usage();
-            start = .earliest;
-        } else if (std.mem.eql(u8, arg, "--offset")) {
-            i += 1;
-            if (i >= args.len) usage();
-            if (start == .earliest) usage();
-            offset = std.fmt.parseInt(i64, args[i], 10) catch usage();
-            if (offset < 0) usage();
-            start = .offset;
-        } else if (std.mem.startsWith(u8, arg, "--offset=")) {
-            if (start == .earliest) usage();
-            offset = std.fmt.parseInt(i64, arg["--offset=".len..], 10) catch usage();
-            if (offset < 0) usage();
-            start = .offset;
-        } else if (std.mem.eql(u8, arg, "--partition")) {
-            i += 1;
-            if (i >= args.len) usage();
-            partition = std.fmt.parseInt(i32, args[i], 10) catch usage();
-            if (partition.? < 0) usage();
-        } else if (std.mem.startsWith(u8, arg, "--partition=")) {
-            partition = std.fmt.parseInt(i32, arg["--partition=".len..], 10) catch usage();
-            if (partition.? < 0) usage();
-        } else if (std.mem.eql(u8, arg, "-n")) {
-            i += 1;
-            if (i >= args.len) usage();
-            max_records = std.fmt.parseInt(u64, args[i], 10) catch usage();
-        } else if (std.mem.startsWith(u8, arg, "-n") and arg.len > 2) {
-            max_records = std.fmt.parseInt(u64, arg[2..], 10) catch usage();
-        } else if (std.mem.eql(u8, arg, "-t")) {
-            i += 1;
-            if (i >= args.len) usage();
-            idle_ms = std.fmt.parseInt(u64, args[i], 10) catch usage();
-        } else if (std.mem.startsWith(u8, arg, "-t") and arg.len > 2) {
-            idle_ms = std.fmt.parseInt(u64, arg[2..], 10) catch usage();
-        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            usageExit(0);
-        } else if (std.mem.startsWith(u8, arg, "-")) {
-            usage();
-        } else if (topic == null) {
-            topic = arg;
-        } else usage();
-    }
-    const topic_name = topic orelse usage();
-    if (topic_name.len == 0) usage();
+    const parsed = cli_args.parseConsume(alloc, args);
+    const consume = switch (parsed) {
+        .help => {
+            writeText(init, std.Io.File.stdout(), cli_args.consume_help);
+            std.process.exit(0);
+        },
+        .err => |message| parseFatal(init, message, cli_args.consume_usage),
+        .ok => |value| value,
+    };
+    const topic_name = consume.topic;
+    const verbose = consume.verbose;
 
     var cfg = config.load(init.io, alloc, init.environ_map) catch |err| switch (err) {
         error.ConfigNotFound => fatal(
@@ -357,18 +278,18 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     var stdout = std.Io.File.stdout().writer(init.io, &stdout_buf);
     const consumed = consumer.run(&cli, .{
         .topic = topic_name,
-        .start = start,
-        .offset = offset,
-        .partition = partition,
-        .max_records = max_records,
-        .idle_ms = idle_ms,
+        .start = consume.start,
+        .offset = consume.offset,
+        .partition = consume.partition,
+        .max_records = consume.max_records,
+        .idle_ms = consume.idle_ms,
     }, &stdout.interface) catch |err| switch (err) {
-        error.PartitionNotFound => fatal("partition {d} not found in topic '{s}'", .{ partition orelse -1, topic_name }),
+        error.PartitionNotFound => fatal("partition {d} not found in topic '{s}'", .{ consume.partition orelse -1, topic_name }),
         error.FetchFailed => fatalErr(&cli, "consume failed"),
         else => fatalErr(&cli, "consume failed"),
     };
     stdout.interface.flush() catch {};
-    if (max_records != null or idle_ms != null)
+    if (consume.max_records != null or consume.idle_ms != null)
         std.debug.print("{d} record(s) consumed from '{s}'\n", .{ consumed, topic_name });
     cli.deinit();
     std.process.exit(0);
