@@ -1,11 +1,20 @@
 # kite
 
-An ultra-lightweight Kafka producer CLI written in Zig. `kite` reads lines
-from stdin and produces each line as a record to a topic:
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+
+An ultra-lightweight Kafka producer/consumer CLI written in Zig. `kite`
+reads lines from stdin and produces each line as a record to a topic:
 
 ```console
 $ kite my-topic < file.txt
 3 record(s) produced to 'my-topic'
+```
+
+`kite consume` fetches records back to stdout in the same format, so records
+round-trip losslessly (keys and headers included):
+
+```console
+$ kite consume --from-beginning -t 3000 my-topic
 ```
 
 No JVM, no librdkafka, no dependencies — a single static binary under 1 MiB.
@@ -14,25 +23,18 @@ v2, acks=all. **Requires Kafka 4.0+** (KRaft) on the broker side.
 
 ## Quickstart
 
-Against the local docker-compose harness (see [TESTING.md](TESTING.md)):
+Point kite at any Kafka 4.0+ broker (see
+[Configuration](#configuration)):
 
 ```console
-$ scripts/gen-tls.sh            # one-time: test CA + broker keystore
-$ docker compose up -d
-$ scripts/docker-init.sh        # creates topics (incl. `t1`) + SASL users
-$ cp examples/config/plaintext.properties kite.properties
+$ cp examples/config/plaintext.properties kite.properties   # set bootstrap.servers
 $ zig build
-$ zig-out/bin/kite t1 < examples/data/lines.txt
-5 record(s) produced to 't1'
-```
-
-Topic auto-creation is disabled in the harness, so produce to a topic that
-exists (`t1`) or create one first. Consume it back:
-
-```console
-$ docker exec kite-kafka /opt/kafka/bin/kafka-console-consumer.sh \
-    --bootstrap-server localhost:9092 --topic t1 \
-    --from-beginning --timeout-ms 5000
+$ zig-out/bin/kite my-topic < examples/data/lines.txt
+5 record(s) produced to 'my-topic'
+$ zig-out/bin/kite consume --from-beginning -t 3000 my-topic
+line one
+line two
+...
 ```
 
 ## Build
@@ -98,13 +100,12 @@ $ kite --csv t1 < examples/data/users.csv
 $ kite --csv --key user_id t1 < examples/data/events.csv
 ```
 
-Watch keys and headers land on the broker (docker-compose harness):
+Watch keys and headers land on the broker — `kite consume` prints them in
+the same `key<TAB>headers<TAB>value` layout the producer accepts:
 
 ```console
-$ docker exec kite-kafka /opt/kafka/bin/kafka-console-consumer.sh \
-    --bootstrap-server localhost:9092 --topic t1 --from-beginning \
-    --timeout-ms 8000 --property print.key=true \
-    --property print.headers=true --property key.separator='|'
+$ kite consume --from-beginning -t 3000 t1
+key	trace-id: 42	src: cli	value
 ```
 
 Diagnostics on stderr (see "Diagnostics"):
@@ -135,8 +136,16 @@ $ KITE_DEBUG=1 kite t1 < examples/data/lines.txt  # hex-dump frames
 producer, making consume-to-produce pipelines lossless for keys and headers:
 
 ```console
-$ kite consume --from-beginning -t 3000 my-topic
+$ kite consume --from-beginning -t 3000 my-topic     # dump a whole topic
 $ kite consume --offset 42 --partition 1 -n 10 my-topic
+$ kite consume my-topic                            # follow new records (Ctrl-C to stop)
+```
+
+Copy a topic by piping consume straight back into produce — keys and headers
+survive the hop:
+
+```console
+$ kite consume --from-beginning -t 5000 src-topic | kite dst-topic
 ```
 
 The default starting position is the latest offset. Use `--from-beginning` for
@@ -223,7 +232,6 @@ $ cp examples/config/plaintext.properties kite.properties
 | [`ssl.properties`](examples/config/ssl.properties) | TLS with a custom CA |
 | [`sasl-ssl-plain.properties`](examples/config/sasl-ssl-plain.properties) | SASL_SSL + PLAIN, Confluent Cloud style (`<api-key>`/`<api-secret>`) |
 | [`sasl-scram.properties`](examples/config/sasl-scram.properties) | SASL_PLAINTEXT + SCRAM-SHA-512 |
-| [`local-docker.properties`](examples/config/local-docker.properties) | The TESTING.md docker-compose harness on `localhost:9092` |
 
 Sample stdin inputs are in [`examples/data/`](examples/data): `lines.txt`
 (value-only), `keyed.tsv` (key + value), `headers.tsv` (key + headers +
@@ -233,9 +241,9 @@ different names so they stay tracked.
 
 ## Testing
 
-See [TESTING.md](TESTING.md) — a docker-compose Kafka 4.0.0 harness exercising
-all four listeners (PLAINTEXT / SSL / SASL_SSL / SASL_PLAINTEXT) and
-`scripts/smoke.sh` end-to-end.
+See [TESTING.md](TESTING.md) — `zig build test` unit tests plus a
+broker-agnostic `scripts/smoke.sh` produce/consume roundtrip for any
+Kafka 4.0+ cluster.
 
 ## Internals
 
@@ -247,3 +255,7 @@ all four listeners (PLAINTEXT / SSL / SASL_SSL / SASL_PLAINTEXT) and
 - `src/scram.zig` — RFC 5802 SCRAM-SHA-256/512 client with server-signature verification
 - `src/config.zig` — `kite.properties` loader
 - `src/csv.zig` — quote-aware row reader, field unescaping, row→JSON
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
