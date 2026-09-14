@@ -21,6 +21,9 @@ comptime {
     _ = consumer;
 }
 
+// Panics print just the message — pulls in no DWARF/stack-trace machinery.
+pub const panic = std.debug.simple_panic;
+
 fn out(comptime fmt: []const u8, args: anytype) void {
     std.debug.print(fmt, args);
 }
