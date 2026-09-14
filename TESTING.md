@@ -19,14 +19,13 @@ cluster by copying an [`examples/config/`](examples/config) template to
 ```console
 $ cp examples/config/plaintext.properties kite.properties   # edit as needed
 $ zig build
-$ scripts/smoke.sh [topic]
+$ scripts/smoke.sh <topic>
 ```
 
-`smoke.sh` produces a few uniquely-marked records (plain and keyed) to a
-topic, reads them back with `kite consume --from-beginning`, and diffs the
-roundtrip. With no argument it uses a fresh `kite-smoke-<timestamp>` topic
-(requires broker-side auto-creation); pass a topic name to test an existing
-one.
+`smoke.sh` produces a few uniquely-marked records (plain and keyed) to an
+existing topic, reads them back with `kite consume --from-beginning`, and
+diffs the roundtrip. The topic must already exist — kite never auto-creates
+topics on produce.
 
 For consumer compression coverage, produce batches to a topic with another
 client using `compression.type` set to `none`, `gzip`, `snappy`, `lz4`, and
