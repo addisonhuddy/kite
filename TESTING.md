@@ -2,40 +2,61 @@
 
 ## Unit tests
 
-```console
-$ zig build test
+```sh
+zig build test
 ```
 
-Covers the wire encoders (byte-exact varint/compact fixtures), record batch
-CRC-32C, the properties parser, and the SCRAM implementation against the
-RFC 7677 test vector.
+This covers the wire encoders, record batches, properties parser, CSV reader,
+SCRAM vectors, and the isolated CLI parser.
+
+## CLI regression checks
+
+Build first, then run the offline checks:
+
+```sh
+scripts/cli-check.sh
+```
+
+The script points `HOME`, `XDG_CONFIG_HOME`, and the working directory at an
+empty temporary tree. It captures stdout, stderr, and exit status separately,
+checking both help pages and actionable parser errors without a broker.
+
+## Binary size
+
+```sh
+scripts/check-size.sh
+```
+
+The default stripped binary must stay below 1 MiB. `scripts/pack.sh` is an
+optional UPX/LZMA packaging step.
 
 ## End-to-end: any Kafka 4.0+ broker
 
-There is no bundled broker harness — point kite at any Kafka 4.0+ (KRaft)
-cluster by copying an [`examples/config/`](examples/config) template to
-`./kite.properties` and setting `bootstrap.servers` (plus auth if needed):
+There is no bundled broker harness. Copy an
+[`examples/config/`](examples/config) template to `./kite.properties`, set
+`bootstrap.servers` and any required authentication, build, and run:
 
-```console
-$ cp examples/config/plaintext.properties kite.properties   # edit as needed
-$ zig build
-$ scripts/smoke.sh <topic>
+```sh
+cp examples/config/plaintext.properties kite.properties
+zig build
+scripts/smoke.sh EXISTING_TOPIC
 ```
 
-`smoke.sh` produces a few uniquely-marked records (plain and keyed) to an
-existing topic, reads them back with `kite consume --from-beginning`, and
-diffs the roundtrip. The topic must already exist — kite never auto-creates
-topics on produce.
+The topic must already exist; kite never creates topics. `smoke.sh` produces
+marked plain and keyed records, consumes them from the beginning with an idle
+timeout, and compares the roundtrip.
 
-For consumer compression coverage, produce batches to a topic with another
-client using `compression.type` set to `none`, `gzip`, `snappy`, `lz4`, and
-`zstd`, then compare `kite consume --from-beginning -t 3000 TOPIC | sort`
-against the input.
+For consumer compression coverage, produce batches with another client using
+`none`, `gzip`, `snappy`, `lz4`, and `zstd`, then compare:
 
-### Debugging
+```sh
+zig-out/bin/kite consume --from-beginning -t 3000 EXISTING_TOPIC | sort
+```
 
-Set `KITE_DEBUG=1` to dump sent/received frames and TLS internals to stderr:
+## Debugging
 
-```console
-$ KITE_DEBUG=1 sh -c 'echo hi | ./zig-out/bin/kite t1'
+Set `KITE_DEBUG=1` to dump frames and TLS details to stderr:
+
+```sh
+KITE_DEBUG=1 sh -c 'echo hi | ./zig-out/bin/kite EXISTING_TOPIC'
 ```
