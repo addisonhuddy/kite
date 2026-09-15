@@ -10,6 +10,7 @@ const transport = @import("transport.zig");
 const scram = @import("scram.zig");
 const csv = @import("csv.zig");
 const consumer = @import("consumer.zig");
+const install = @import("install.zig");
 
 // unused-import anchors so `zig build test` covers every module
 comptime {
@@ -21,6 +22,7 @@ comptime {
     _ = scram;
     _ = csv;
     _ = consumer;
+    _ = install;
 }
 
 // Panics print just the message — pulls in no DWARF/stack-trace machinery.
@@ -105,6 +107,10 @@ pub fn main(init: std.process.Init) !void {
     const args = init.minimal.args.toSlice(alloc) catch fatal("out of memory", .{});
     if (args.len > 1 and std.mem.eql(u8, args[1], "consume")) {
         runConsume(init, args[2..], alloc);
+        return;
+    }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "install")) {
+        install.run(init, args[2..], alloc);
         return;
     }
     const parsed = cli_args.parseProduce(alloc, args[1..]);

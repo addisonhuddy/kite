@@ -32,11 +32,13 @@ kite consume --from-beginning -t 3000 events
 
 ## Install
 
-Run the installer to build `kite`, install it to `~/.local/bin` (override with
-`KITE_INSTALL_DIR`), and offer to add that directory to your `PATH`:
+Build `kite`, then use the built-in installer to copy it to `~/.local/bin`
+(override with `--dir` or `KITE_INSTALL_DIR`) and offer to add that directory
+to your `PATH` (`--yes` skips the prompt):
 
 ```sh
-scripts/install.sh
+zig build
+zig-out/bin/kite install
 ```
 
 ### Manual
