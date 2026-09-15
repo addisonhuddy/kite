@@ -105,6 +105,7 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         }
         leader_seen.deinit(round_alloc);
         try out.flush();
+        if (opts.stats) |s| s.maybeRender();
         if (progress) last_record = std.Io.Timestamp.now(c.io, .awake);
     }
     return count;
