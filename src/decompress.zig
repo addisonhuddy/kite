@@ -13,7 +13,7 @@ pub fn decompress(alloc: std.mem.Allocator, codec: u3, input: []const u8) ![]u8 
         1 => streamFlate(alloc, input),
         2 => streamSnappy(alloc, input),
         3 => streamLz4(alloc, input),
-        4 => streamZstd(alloc, input),
+        // zstd (4) is deliberately unsupported: its decoder costs ~50 KiB of binary.
         else => error.UnsupportedCompression,
     };
 }
@@ -23,17 +23,6 @@ fn streamFlate(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     var d = std.compress.flate.Decompress.init(&reader, .gzip, &.{});
-    _ = try d.reader.streamRemaining(&out.writer);
-    return out.toOwnedSlice();
-}
-
-fn streamZstd(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
-    var reader: std.Io.Reader = .fixed(input);
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    var d = std.compress.zstd.Decompress.init(&reader, &.{}, .{
-        .window_len = 8 * 1024 * 1024,
-    });
     _ = try d.reader.streamRemaining(&out.writer);
     return out.toOwnedSlice();
 }
@@ -245,16 +234,6 @@ test "decompresses gzip" {
         0xdc, 0x12, 0x00, 0x00, 0x00,
     };
     const result = try decompress(std.testing.allocator, 1, &compressed);
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("abcabcabcabcabcabc", result);
-}
-
-test "decompresses zstd" {
-    const compressed = [_]u8{
-        0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0x4d, 0x00, 0x00, 0x18, 0x61,
-        0x62, 0x63, 0x01, 0x00, 0x76, 0x6e, 0x08, 0xeb, 0xfe, 0x13, 0x27,
-    };
-    const result = try decompress(std.testing.allocator, 4, &compressed);
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("abcabcabcabcabcabc", result);
 }
