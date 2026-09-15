@@ -27,7 +27,7 @@ checking both help pages and actionable parser errors without a broker.
 scripts/check-size.sh
 ```
 
-The default stripped binary must stay below 1 MiB. `scripts/pack.sh` is an
+The default stripped binary must stay below 600,000 bytes. `scripts/pack.sh` is an
 optional UPX/LZMA packaging step.
 
 ## End-to-end: any Kafka 4.0+ broker
@@ -47,7 +47,8 @@ marked plain and keyed records, consumes them from the beginning with an idle
 timeout, and compares the roundtrip.
 
 For consumer compression coverage, produce batches with another client using
-`none`, `gzip`, `snappy`, `lz4`, and `zstd`, then compare:
+`none`, `gzip`, `snappy`, and `lz4` (zstd batches fail with
+`UnsupportedCompression`), then compare:
 
 ```sh
 zig-out/bin/kite consume --from-beginning -t 3000 EXISTING_TOPIC | sort
