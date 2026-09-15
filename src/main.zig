@@ -11,6 +11,8 @@ const scram = @import("scram.zig");
 const csv = @import("csv.zig");
 const consumer = @import("consumer.zig");
 const install = @import("install.zig");
+const term = @import("term.zig");
+const stats_mod = @import("stats.zig");
 
 // unused-import anchors so `zig build test` covers every module
 comptime {
@@ -23,6 +25,8 @@ comptime {
     _ = csv;
     _ = consumer;
     _ = install;
+    _ = term;
+    _ = stats_mod;
 }
 
 // Panics print just the message — pulls in no DWARF/stack-trace machinery.
@@ -33,7 +37,10 @@ fn out(comptime fmt: []const u8, args: anytype) void {
 }
 
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
-    out("kite: " ++ fmt ++ "\n", args);
+    if (term.color.enabled)
+        out(term.red ++ "kite:" ++ term.reset ++ " " ++ fmt ++ "\n", args)
+    else
+        out("kite: " ++ fmt ++ "\n", args);
     std.process.exit(1);
 }
 
@@ -55,7 +62,10 @@ fn writeText(init: std.process.Init, file: std.Io.File, text: []const u8) void {
 fn parseFatal(init: std.process.Init, message: []const u8, usage_text: []const u8) noreturn {
     var buf: [4096]u8 = undefined;
     var w = std.Io.File.stderr().writer(init.io, &buf);
-    w.interface.print("kite: {s}\n{s}", .{ message, usage_text }) catch {};
+    if (term.color.enabled)
+        w.interface.print("{s}kite:{s} {s}\n{s}", .{ term.red, term.reset, message, usage_text }) catch {}
+    else
+        w.interface.print("kite: {s}\n{s}", .{ message, usage_text }) catch {};
     w.interface.flush() catch {};
     std.process.exit(1);
 }
@@ -103,6 +113,7 @@ const Pending = struct {
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const alloc = init.arena.allocator();
+    term.color = .{ .enabled = term.detect(io, std.Io.File.stderr(), init.environ_map) };
 
     const args = init.minimal.args.toSlice(alloc) catch fatal("out of memory", .{});
     if (args.len > 1 and std.mem.eql(u8, args[1], "consume")) {
@@ -116,7 +127,11 @@ pub fn main(init: std.process.Init) !void {
     const parsed = cli_args.parseProduce(alloc, args[1..]);
     const produce = switch (parsed) {
         .help => {
-            writeText(init, std.Io.File.stdout(), cli_args.produce_help);
+            if (term.detect(io, std.Io.File.stdout(), init.environ_map)) {
+                term.color.enabled = true;
+                const page = term.renderHelp(alloc, cli_args.produce_help) catch fatal("out of memory", .{});
+                writeText(init, std.Io.File.stdout(), page);
+            } else writeText(init, std.Io.File.stdout(), cli_args.produce_help);
             return;
         },
         .err => |message| parseFatal(init, message, cli_args.produce_usage),
@@ -182,6 +197,7 @@ pub fn main(init: std.process.Init) !void {
     var t_flush: u64 = 0;
     var t_drain: u64 = 0;
     var timer = Lap.init(io);
+    var stats = stats_mod.Stats.init(io, topic, (std.Io.File.stderr().isTty(io) catch false) and !verbose);
     read_loop: while (true) {
         // Linger: with pending records and no stdin data within linger_ms,
         // flush rather than block indefinitely on a slow producer. Skip the
@@ -195,6 +211,8 @@ pub fn main(init: std.process.Init) !void {
             const nready = std.posix.poll(&fds, @intCast(@min(cfg.linger_ms, std.math.maxInt(i32)))) catch 1;
             if (nready == 0) {
                 flushAll(&cli, topic, pend) catch |err| produceFatal(&cli, err);
+                if (cli.last_offset) |off| stats.noteOffset(off);
+                stats.maybeRender();
                 continue;
             }
         }
@@ -210,6 +228,8 @@ pub fn main(init: std.process.Init) !void {
         };
         t_read += timer.lap();
         total += 1;
+        stats.add(1, recordSize(rec));
+        stats.maybeRender();
         // Keyed records partition by murmur2 like Kafka's default partitioner;
         // unkeyed records round-robin so every partition fills together.
         const target: usize = if (rec.key) |k| blk: {
@@ -227,9 +247,12 @@ pub fn main(init: std.process.Init) !void {
             // Cap hit: flush every partition's pending buffer in one pipelined
             // round so all leader conns go in flight together.
             flushAll(&cli, topic, pend) catch |err| produceFatal(&cli, err);
+            if (cli.last_offset) |off| stats.noteOffset(off);
             t_flush += timer.lap();
             if (cli.outstanding_bytes >= 96 << 20) {
                 cli.produceDrainUntil(topic, 96 << 20) catch |err| produceFatal(&cli, err);
+                if (cli.last_offset) |off| stats.noteOffset(off);
+                stats.maybeRender();
                 t_drain += timer.lap();
             }
         }
@@ -237,6 +260,8 @@ pub fn main(init: std.process.Init) !void {
 
     flushAll(&cli, topic, pend) catch |err| produceFatal(&cli, err);
     cli.produceDrain(topic) catch |err| produceFatal(&cli, err);
+    if (cli.last_offset) |off| stats.noteOffset(off);
+    stats.finish();
     if (timing) std.debug.print("read {d}ms send {d}ms drain {d}ms conns {d}\n", .{ t_read / 1_000_000, t_flush / 1_000_000, (t_drain + timer.lap()) / 1_000_000, cli.conns.count() });
 
     var buf: [256]u8 = undefined;
@@ -250,7 +275,11 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     const parsed = cli_args.parseConsume(alloc, args);
     const consume = switch (parsed) {
         .help => {
-            writeText(init, std.Io.File.stdout(), cli_args.consume_help);
+            if (term.detect(init.io, std.Io.File.stdout(), init.environ_map)) {
+                term.color.enabled = true;
+                const page = term.renderHelp(alloc, cli_args.consume_help) catch fatal("out of memory", .{});
+                writeText(init, std.Io.File.stdout(), page);
+            } else writeText(init, std.Io.File.stdout(), cli_args.consume_help);
             std.process.exit(0);
         },
         .err => |message| parseFatal(init, message, cli_args.consume_usage),
@@ -282,6 +311,8 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
 
     var stdout_buf: [64 * 1024]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(init.io, &stdout_buf);
+    var stats = stats_mod.Stats.init(init.io, topic_name, (std.Io.File.stderr().isTty(init.io) catch false) and
+        !(std.Io.File.stdout().isTty(init.io) catch false) and !verbose);
     const consumed = consumer.run(&cli, .{
         .topic = topic_name,
         .start = consume.start,
@@ -289,6 +320,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
         .partition = consume.partition,
         .max_records = consume.max_records,
         .idle_ms = consume.idle_ms,
+        .stats = &stats,
     }, &stdout.interface) catch |err| switch (err) {
         error.PartitionNotFound => fatal("partition {d} not found in topic '{s}'", .{ consume.partition orelse -1, topic_name }),
         error.FetchFailed => fatalErr(&cli, "consume failed"),
@@ -297,6 +329,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     stdout.interface.flush() catch {};
     if (consume.max_records != null or consume.idle_ms != null)
         std.debug.print("{d} record(s) consumed from '{s}'\n", .{ consumed, topic_name });
+    if (consume.max_records != null or consume.idle_ms != null) stats.finish();
     cli.deinit();
     std.process.exit(0);
 }
