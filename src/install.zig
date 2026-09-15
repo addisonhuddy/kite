@@ -20,9 +20,17 @@ pub fn run(init: std.process.Init, args: []const []const u8, alloc: std.mem.Allo
 
     const home = init.environ_map.get("HOME") orelse
         fatal(init, "HOME is not set", .{});
-    const dest = options.dir orelse init.environ_map.get("KITE_INSTALL_DIR") orelse
+    const raw_dest = options.dir orelse init.environ_map.get("KITE_INSTALL_DIR") orelse
         std.fs.path.join(alloc, &.{ home, ".local", "bin" }) catch
         fatal(init, "out of memory", .{});
+    const dest = if (std.fs.path.isAbsolute(raw_dest))
+        raw_dest
+    else blk: {
+        const cwd = std.process.currentPathAlloc(init.io, alloc) catch |err|
+            fatal(init, "could not determine current directory: {s}", .{@errorName(err)});
+        break :blk std.fs.path.resolve(alloc, &.{ cwd, raw_dest }) catch
+            fatal(init, "out of memory", .{});
+    };
     const installed = std.fs.path.join(alloc, &.{ dest, "kite" }) catch
         fatal(init, "out of memory", .{});
     const executable = std.process.executablePathAlloc(init.io, alloc) catch |err|
@@ -153,19 +161,23 @@ fn addPathLine(init: std.process.Init, alloc: std.mem.Allocator, rc: []const u8,
         if (std.mem.indexOf(u8, contents, line) != null) return;
     }
 
-    const contents = std.fmt.allocPrint(alloc, "{s}\n# added by kite install\n{s}\n", .{
-        existing orelse "",
-        line,
-    }) catch fatal(init, "out of memory", .{});
-    var file = std.Io.Dir.cwd().createFileAtomic(init.io, rc, .{
-        .permissions = std.Io.File.Permissions.fromMode(0o644),
-        .make_path = true,
-        .replace = true,
-    }) catch |err| fatal(init, "could not update {s}: {s}", .{ rc, @errorName(err) });
-    defer file.deinit(init.io);
-    file.file.writeStreamingAll(init.io, contents) catch |err|
+    const parent = std.fs.path.dirname(rc) orelse
+        fatal(init, "could not determine parent directory for {s}", .{rc});
+    std.Io.Dir.cwd().createDirPath(init.io, parent) catch |err|
+        fatal(init, "could not create parent directory for {s}: {s}", .{ rc, @errorName(err) });
+    const addition = std.fmt.allocPrint(alloc, "\n# added by kite install\n{s}\n", .{line}) catch
+        fatal(init, "out of memory", .{});
+    var file = std.Io.Dir.openFileAbsolute(init.io, rc, .{ .mode = .read_write }) catch |err| switch (err) {
+        error.FileNotFound => std.Io.Dir.createFileAbsolute(init.io, rc, .{
+            .permissions = std.Io.File.Permissions.fromMode(0o644),
+            .truncate = false,
+        }) catch |create_err| fatal(init, "could not update {s}: {s}", .{ rc, @errorName(create_err) }),
+        else => fatal(init, "could not update {s}: {s}", .{ rc, @errorName(err) }),
+    };
+    defer file.close(init.io);
+    const stat = file.stat(init.io) catch |err|
         fatal(init, "could not update {s}: {s}", .{ rc, @errorName(err) });
-    file.replace(init.io) catch |err|
+    file.writePositionalAll(init.io, addition, stat.size) catch |err|
         fatal(init, "could not update {s}: {s}", .{ rc, @errorName(err) });
 }
 
