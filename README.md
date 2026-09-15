@@ -5,8 +5,8 @@ Kite is a small Kafka command-line producer and consumer written in Zig.
 writes records to stdout.
 
 ```sh
-printf 'hello\n' | zig-out/bin/kite events
-zig-out/bin/kite consume --from-beginning -t 3000 events
+printf 'hello\n' | kite events
+kite consume --from-beginning -t 3000 events
 ```
 
 ## Contents
@@ -32,15 +32,19 @@ zig-out/bin/kite consume --from-beginning -t 3000 events
 
 ## Install
 
-Build from source:
+Run the installer to build `kite`, install it to `~/.local/bin` (override with
+`KITE_INSTALL_DIR`), and offer to add that directory to your `PATH`:
+
+```sh
+scripts/install.sh
+```
+
+### Manual
+
+Build from source and install the executable yourself:
 
 ```sh
 zig build
-```
-
-The executable is `zig-out/bin/kite`. Optionally install it for your user:
-
-```sh
 install -m755 zig-out/bin/kite ~/.local/bin/kite
 ```
 
@@ -56,18 +60,19 @@ The source build is the supported installation method.
 
 ## Quickstart
 
-Choose an existing topic, copy a configuration template, edit the broker
-address (and credentials if needed), then build:
+Choose an existing topic, copy a configuration template, and edit the broker
+address (and credentials if needed):
 
 ```sh
 cp examples/config/plaintext.properties kite.properties
-zig build
 ```
+
+Examples assume `kite` is installed on your `PATH`; see [Install](#install).
 
 Produce the checked-in sample data:
 
 ```sh
-zig-out/bin/kite events < examples/data/lines.txt
+kite events < examples/data/lines.txt
 ```
 
 ```text
@@ -77,7 +82,7 @@ zig-out/bin/kite events < examples/data/lines.txt
 Read from the beginning and stop after 3 seconds without a record:
 
 ```sh
-zig-out/bin/kite consume --from-beginning -t 3000 events
+kite consume --from-beginning -t 3000 events
 ```
 
 ```text
@@ -86,33 +91,30 @@ line two
 ...
 ```
 
-After installing `kite` as described above, the same commands can use
-`kite` instead of `zig-out/bin/kite`.
-
 ## Common recipes
 
 The files in [`examples/data/`](examples/data) are ready-to-use inputs.
 
 ```sh
 # plain values, one per line
-zig-out/bin/kite events < examples/data/lines.txt
+kite events < examples/data/lines.txt
 # key<TAB>value
-zig-out/bin/kite events < examples/data/keyed.tsv
+kite events < examples/data/keyed.tsv
 # key<TAB>headers<TAB>value
-zig-out/bin/kite events < examples/data/headers.tsv
+kite events < examples/data/headers.tsv
 # attach a header to every record (-H is repeatable)
-zig-out/bin/kite -H 'source: import' events < examples/data/lines.txt
+kite -H 'source: import' events < examples/data/lines.txt
 # CSV rows as JSON values, optionally keyed by a column
-zig-out/bin/kite --csv events < examples/data/users.csv
-zig-out/bin/kite --csv --key user_id events < examples/data/events.csv
+kite --csv events < examples/data/users.csv
+kite --csv --key user_id events < examples/data/events.csv
 # stream a log as it grows
-tail -f app.log | zig-out/bin/kite logs
+tail -f app.log | kite logs
 # follow new records (Ctrl-C to stop)
-zig-out/bin/kite consume events
+kite consume events
 # read one partition from an offset, at most 10 records
-zig-out/bin/kite consume --partition 0 --offset 42 -n 10 -t 3000 events
+kite consume --partition 0 --offset 42 -n 10 -t 3000 events
 # copy a topic
-zig-out/bin/kite consume --from-beginning -t 5000 src | zig-out/bin/kite dst
+kite consume --from-beginning -t 5000 src | kite dst
 ```
 
 The consumer output is in the same textual shape accepted by the producer,
