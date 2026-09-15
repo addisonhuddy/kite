@@ -203,7 +203,8 @@ colors can be disabled with a non-empty `NO_COLOR`, forced with
 - `KITE_DEBUG=1` enables frame and TLS diagnostics.
 - `KITE_TIME=1` prints producer timing totals and connection count.
 
-The default stripped binary is about 565 KiB and must remain below 1 MiB.
+The default stripped binary is about 560 KB on Linux (about 535 KB on macOS
+arm64) and must remain below 600,000 bytes.
 `scripts/pack.sh` can produce an optional UPX/LZMA artifact of about 200 KiB.
 
 ## Troubleshooting
@@ -235,7 +236,8 @@ See [TESTING.md](TESTING.md) for broker-agnostic and broker-backed checks.
 Internals:
 
 - `src/protocol.zig` — Kafka encoders, framing, and record batches
-- `src/decompress.zig` — gzip, zstd, Snappy, and LZ4 decoders
+- `src/decompress.zig` — gzip, Snappy, and LZ4 decoders (no zstd, to keep the
+  binary small)
 - `src/transport.zig` — TCP and TLS transport
 - `src/client.zig` — bootstrap, metadata, SASL, produce, fetch, and retry
 - `src/consumer.zig` — ListOffsets/Fetch loop and output formatting
