@@ -1,263 +1,237 @@
 # kite
 
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+Kite is a small Kafka command-line producer and consumer written in Zig.
+`kite TOPIC` reads stdin, one record per line, while `kite consume TOPIC`
+writes records to stdout.
 
-An ultra-lightweight Kafka producer/consumer CLI written in Zig. `kite`
-reads lines from stdin and produces each line as a record to a topic:
-
-```console
-$ kite my-topic < file.txt
-3 record(s) produced to 'my-topic'
+```sh
+printf 'hello\n' | zig-out/bin/kite events
+zig-out/bin/kite consume --from-beginning -t 3000 events
 ```
 
-`kite consume` fetches records back to stdout in the same format, so records
-round-trip losslessly (keys and headers included):
+## Contents
 
-```console
-$ kite consume --from-beginning -t 3000 my-topic
+- [Prerequisites](#prerequisites)
+- [Install](#install)
+- [Quickstart](#quickstart)
+- [Common recipes](#common-recipes)
+- [Consuming](#consuming)
+- [Input/output format and CSV](#inputoutput-format-and-csv)
+- [Configuration](#configuration)
+- [Output streams](#output-streams)
+- [Troubleshooting](#troubleshooting)
+- [Development and testing](#development-and-testing)
+- [License](#license)
+
+## Prerequisites
+
+- Zig 0.16.x.
+- A reachable Kafka 4.0+ KRaft broker.
+- Permission to read and write the topic.
+- The topic must already exist; kite never creates topics.
+
+## Install
+
+Build from source:
+
+```sh
+zig build
 ```
 
-No JVM, no librdkafka, no dependencies — a single static binary, ~565 KiB
-stripped and ~200 KiB after `scripts/pack.sh` (UPX/LZMA). Speaks the Kafka
-wire protocol directly: flexible versions only, record batch v2, acks=all.
-**Requires Kafka 4.0+** (KRaft) on the broker side.
+The executable is `zig-out/bin/kite`. Optionally install it for your user:
+
+```sh
+install -m755 zig-out/bin/kite ~/.local/bin/kite
+```
+
+Put `~/.local/bin` on `PATH` if it is not there already. Cross-compile with,
+for example:
+
+```sh
+zig build -Dtarget=aarch64-macos
+zig build -Dtarget=x86_64-linux
+```
+
+The source build is the supported installation method.
 
 ## Quickstart
 
-Point kite at any Kafka 4.0+ broker (see
-[Configuration](#configuration)):
+Choose an existing topic, copy a configuration template, edit the broker
+address (and credentials if needed), then build:
 
-```console
-$ cp examples/config/plaintext.properties kite.properties   # set bootstrap.servers
-$ zig build
-$ zig-out/bin/kite my-topic < examples/data/lines.txt
-5 record(s) produced to 'my-topic'
-$ zig-out/bin/kite consume --from-beginning -t 3000 my-topic
+```sh
+cp examples/config/plaintext.properties kite.properties
+zig build
+```
+
+Produce the checked-in sample data:
+
+```sh
+zig-out/bin/kite events < examples/data/lines.txt
+```
+
+```text
+5 record(s) produced to 'events'
+```
+
+Read from the beginning and stop after 3 seconds without a record:
+
+```sh
+zig-out/bin/kite consume --from-beginning -t 3000 events
+```
+
+```text
 line one
 line two
 ...
 ```
 
-## Build
+After installing `kite` as described above, the same commands can use
+`kite` instead of `zig-out/bin/kite`.
 
-Requires Zig 0.16.x:
+## Common recipes
 
-```console
-$ zig build            # produces zig-out/bin/kite (ReleaseSmall, stripped)
-$ scripts/check-size.sh   # hard gate: fails if the binary is >= 1 MiB
-$ scripts/pack.sh         # optional: UPX-pack the binary (~200 KiB) for release
+The files in [`examples/data/`](examples/data) are ready-to-use inputs.
+
+```sh
+# plain values, one per line
+zig-out/bin/kite events < examples/data/lines.txt
+# key<TAB>value
+zig-out/bin/kite events < examples/data/keyed.tsv
+# key<TAB>headers<TAB>value
+zig-out/bin/kite events < examples/data/headers.tsv
+# attach a header to every record (-H is repeatable)
+zig-out/bin/kite -H 'source: import' events < examples/data/lines.txt
+# CSV rows as JSON values, optionally keyed by a column
+zig-out/bin/kite --csv events < examples/data/users.csv
+zig-out/bin/kite --csv --key user_id events < examples/data/events.csv
+# stream a log as it grows
+tail -f app.log | zig-out/bin/kite logs
+# follow new records (Ctrl-C to stop)
+zig-out/bin/kite consume events
+# read one partition from an offset, at most 10 records
+zig-out/bin/kite consume --partition 0 --offset 42 -n 10 -t 3000 events
+# copy a topic
+zig-out/bin/kite consume --from-beginning -t 5000 src | zig-out/bin/kite dst
 ```
 
-The release artifact is only `zig-out/bin/kite` — `examples/` is
-documentation/sample data and is not referenced by the build.
-
-Cross-compile for other targets, e.g.:
-
-```console
-$ zig build -Dtarget=aarch64-macos     # Apple Silicon
-$ zig build -Dtarget=x86_64-macos      # Intel Mac
-```
-
-## Usage
-
-```console
-$ kite [-v] [-H 'name: value']... [--csv [--key col]] <topic>
-$ kite consume [options] <topic>       # fetch records to stdout
-$ echo hello | kite my-topic
-```
-
-Each stdin line is one record. A plain line is value-only; a TAB separates
-the line into fields: first field = record key, last = value, any middle
-fields are per-record `name: value` headers.
-
-Cookbook, using the files in [`examples/data/`](examples/data):
-
-```console
-$ kite t1 < examples/data/lines.txt              # 5 value-only records
-$ printf 'value only\n' | kite t1
-$ kite t1 < examples/data/keyed.tsv              # key<TAB>value
-$ printf 'key\tvalue\n' | kite t1
-$ kite t1 < examples/data/headers.tsv            # key, headers, value
-$ printf 'key\ttrace-id: 42\tsrc: cli\tvalue\n' | kite t1
-```
-
-`-H 'name: value'` (repeatable, curl-style) attaches a header to every
-record:
-
-```console
-$ kite -H 'source: import-job' -H 'env: prod' t1 < examples/data/lines.txt
-```
-
-Bulk load and stream:
-
-```console
-$ seq 1 100000 | kite t1
-$ tail -f app.log | kite logs                    # produces as lines arrive
-```
-
-CSV input (see "CSV input" below):
-
-```console
-$ kite --csv t1 < examples/data/users.csv
-$ kite --csv --key user_id t1 < examples/data/events.csv
-```
-
-Watch keys and headers land on the broker — `kite consume` prints them in
-the same `key<TAB>headers<TAB>value` layout the producer accepts:
-
-```console
-$ kite consume --from-beginning -t 3000 t1
-key	trace-id: 42	src: cli	value
-```
-
-Diagnostics on stderr (see "Diagnostics"):
-
-```console
-$ kite -v t1 < examples/data/lines.txt           # connection/retry info
-$ KITE_DEBUG=1 kite t1 < examples/data/lines.txt  # hex-dump frames
-```
-
-- The final line is produced even without a trailing newline.
-- Records are buffered per partition and flushed when a `batch.size` cap is
-  hit, after a `linger.ms` linger, or at EOF.
-- Keyed records partition by murmur2 (like Kafka's default partitioner);
-  unkeyed records round-robin so all partitions fill together.
-- Produces are pipelined: one connection per partition with up to ~96 MiB
-  in flight before acks are awaited.
-- `acks=-1`; retriable errors are retried with exponential backoff and a
-  metadata refresh. Retried records may reorder within their partition.
-- Idempotent produce is on by default (`enable.idempotence`): the producer
-  gets a producer id/epoch via InitProducerId, each batch carries a
-  per-partition sequence number, and at most 5 requests stay un-acked per
-  partition — broker dedup makes retries exactly-once. Set
-  `enable.idempotence=false` to disable.
+The consumer output is in the same textual shape accepted by the producer,
+subject to the format boundaries described below.
 
 ## Consuming
 
-`kite consume` writes one record per line in the same format accepted by the
-producer, making consume-to-produce pipelines lossless for keys and headers:
+By default, `kite consume` starts at the latest offset, selects all partitions,
+and follows new records indefinitely. `--from-beginning` starts at the earliest
+available offset; `--offset N` starts at offset N in every selected partition.
+`--partition P` selects one partition.
 
-```console
-$ kite consume --from-beginning -t 3000 my-topic     # dump a whole topic
-$ kite consume --offset 42 --partition 1 -n 10 my-topic
-$ kite consume my-topic                            # follow new records (Ctrl-C to stop)
-```
+`-n MAX` stops after MAX records. Without `-t`, a count-limited read may wait
+indefinitely for enough records. `-t IDLE_MS` stops after that many
+milliseconds without a record. An idle-bounded read is not a guarantee of a
+complete topic snapshot.
 
-Copy a topic by piping consume straight back into produce — keys and headers
-survive the hop:
+## Input/output format and CSV
 
-```console
-$ kite consume --from-beginning -t 5000 src-topic | kite dst-topic
-```
-
-The default starting position is the latest offset. Use `--from-beginning` for
-the earliest offset or `--offset N` for an absolute offset on every selected
-partition. `--partition P` selects one partition, `-n MAX` stops after a record
-count, and `-t IDLE_MS` stops after an idle interval. `-v` logs fetch ranges
-and high watermarks to stderr.
-
-## CSV input
-
-`--csv` parses stdin as RFC 4180 CSV: the first row supplies column names
-and every following row becomes one record whose value is a JSON object:
-
-```console
-$ kite --csv my-topic < data.csv
-```
+Plain input is one value per line. TAB-separated input has these shapes:
 
 ```text
-id,name,note              →  {"id":"1","name":"alice","note":"hi"}
-1,alice,hi
+value
+key<TAB>value
+key<TAB>name: value<TAB>...<TAB>value
 ```
 
-- Quoted fields may contain commas, `""` escapes, and embedded newlines —
-  a quoted newline does not split the record.
-- `--key <col>` uses a column as the record key (it stays in the JSON
-  value), so keyed rows get murmur2 partitioning:
-  `kite --csv --key id my-topic < data.csv`
-- All fields are emitted as JSON strings — no type guessing, so IDs like
-  `007` survive intact.
-- CRLF endings and a UTF-8 BOM are handled; a row with the wrong number
-  of fields aborts with `csv row N: expected M field(s), got K`.
+The TAB and newline delimiters are not escaped. Binary data or records
+containing delimiters are therefore not generally safe to roundtrip. Null and
+empty keys, values, and header values may not remain distinct: a null key is
+printed as an empty field, and a null header value as `name: `. Compatible
+textual keys and headers can roundtrip. A consume-to-produce pipe does not
+preserve ordering across partitions, offsets, or timestamps.
+
+`--csv` reads RFC 4180 CSV. The first row supplies column names and each later
+row becomes a JSON object value. `--key COL` uses a CSV column as the Kafka
+record key while retaining it in the JSON value. Quoted commas, escaped
+quotes, embedded newlines, CRLF endings, and a UTF-8 BOM are supported; all
+JSON fields are strings.
 
 ## Configuration
 
-kite reads `kite.properties` (Java properties format, `key=value` lines,
-`#`/`!` comments). Search order — first match wins:
+Kite reads the first `kite.properties` found in this order:
 
-1. `./kite.properties` (current directory)
+1. `./kite.properties`
 2. `$XDG_CONFIG_HOME/kite/kite.properties`
 3. `~/.config/kite/kite.properties`
 
-| Key | Required | Values |
+The parser supports a `key=value` subset of Java properties. Blank lines and
+`#`/`!` comments are accepted; unknown keys are ignored with a warning.
+
+| Key | Default | Meaning |
 | --- | --- | --- |
-| `bootstrap.servers` | yes | Comma-separated `host:port` list. Each is tried in order; the first reachable broker is used for bootstrapping. |
-| `security.protocol` | no (default `PLAINTEXT`) | `PLAINTEXT`, `SSL`, `SASL_SSL`, `SASL_PLAINTEXT` |
-| `sasl.mechanism` | required for `SASL_*` | `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512` |
-| `sasl.username` | required for `SASL_*` | |
-| `sasl.password` | required for `SASL_*` | |
-| `ssl.truststore.location` | optional for `SSL`/`SASL_SSL` | Path to a PEM CA bundle. Falls back to the system trust store when unset. |
-| `batch.size` | no (default `1048576`) | Per-partition record buffer cap in bytes — flush when exceeded. |
-| `linger.ms` | no (default `50`) | Flush pending records after this delay when stdin stalls. |
-| `fetch.max.bytes` | no (default `8388608`) | Maximum bytes requested per fetch; values must be below the 16 MiB transport limit. |
-| `fetch.max.wait.ms` | no (default `500`) | Maximum broker wait for a fetch response; kept below the socket timeout. |
-| `enable.idempotence` | no (default `true`) | Idempotent producer: producer id + per-partition sequences, exactly-once on retry. |
+| `bootstrap.servers` | required | Comma-separated `host:port` brokers. |
+| `security.protocol` | `PLAINTEXT` | `PLAINTEXT`, `SSL`, `SASL_SSL`, or `SASL_PLAINTEXT`. |
+| `sasl.mechanism` | none | `PLAIN`, `SCRAM-SHA-256`, or `SCRAM-SHA-512`. |
+| `sasl.username` | none | Required for SASL. |
+| `sasl.password` | none | Required for SASL. |
+| `ssl.truststore.location` | system trust store | Optional PEM CA bundle for TLS. |
+| `batch.size` | `1048576` | Per-partition producer buffer cap in bytes. |
+| `linger.ms` | `50` | Producer flush delay when stdin stalls. |
+| `fetch.max.bytes` | `8388608` | Maximum bytes requested per fetch. |
+| `fetch.max.wait.ms` | `500` | Maximum broker wait for a fetch. |
+| `enable.idempotence` | `true` | Broker deduplicates retried producer batches. |
 
-Unknown keys are ignored with a warning, so a shared `server.properties`-style
-file works.
+Templates are in [`examples/config/`](examples/config). Idempotence means
+broker deduplication of retried batches, not end-to-end exactly-once
+processing.
 
-## Diagnostics
+## Output streams
 
-All diagnostics go to stderr; stdout carries only the final
-`N record(s) produced to '<topic>'` line.
+The producer writes its success summary to stdout and diagnostics to stderr.
+The consumer writes records to stdout and diagnostics, including a bounded-run
+summary, to stderr.
 
-- `-v` / `--verbose` — connection lifecycle (bootstrap, per-broker connects,
-  drops), partition counts, the assigned producer id, and every retry attempt
-  with its backoff.
-- `KITE_DEBUG=1` — hex-dumps outbound request frames and logs TLS
-  handshake errors.
-- `KITE_TIME=1` — prints `read/send/drain` millisecond totals and the
-  connection count on exit (perf tuning).
+- `-v` / `--verbose` enables connection, retry, and fetch diagnostics.
+- `KITE_DEBUG=1` enables frame and TLS diagnostics.
+- `KITE_TIME=1` prints producer timing totals and connection count.
 
-## Examples
+The default stripped binary is about 565 KiB and must remain below 1 MiB.
+`scripts/pack.sh` can produce an optional UPX/LZMA artifact of about 200 KiB.
 
-`kite.properties` templates live in [`examples/config/`](examples/config) —
-copy one into place and edit `bootstrap.servers` / credentials:
+## Troubleshooting
 
-```console
-$ cp examples/config/plaintext.properties kite.properties
+- **No configuration:** copy a template to one of the search-path locations,
+  edit `bootstrap.servers`, and retry with `-v`.
+- **Topic does not exist:** create the topic with your Kafka administration
+  tooling; kite never creates topics.
+- **Bootstrap unreachable:** check DNS, firewall rules, host/port, and run
+  with `-v` for connection diagnostics.
+- **Authentication or TLS failure:** check the SASL settings and CA bundle;
+  use `KITE_DEBUG=1` for handshake details.
+- **Consumer is waiting:** the default starts at latest. Use
+  `--from-beginning`, `--offset`, or a bounded `-t` as appropriate.
+
+## Development and testing
+
+```sh
+zig build
+zig build test
+scripts/cli-check.sh
+scripts/check-size.sh
+scripts/pack.sh
+scripts/smoke.sh EXISTING_TOPIC
 ```
 
-| File | For |
-| --- | --- |
-| [`plaintext.properties`](examples/config/plaintext.properties) | PLAINTEXT, no auth (local broker) |
-| [`ssl.properties`](examples/config/ssl.properties) | TLS with a custom CA |
-| [`sasl-ssl-plain.properties`](examples/config/sasl-ssl-plain.properties) | SASL_SSL + PLAIN, Confluent Cloud style (`<api-key>`/`<api-secret>`) |
-| [`sasl-scram.properties`](examples/config/sasl-scram.properties) | SASL_PLAINTEXT + SCRAM-SHA-512 |
+See [TESTING.md](TESTING.md) for broker-agnostic and broker-backed checks.
 
-Sample stdin inputs are in [`examples/data/`](examples/data): `lines.txt`
-(value-only), `keyed.tsv` (key + value), `headers.tsv` (key + headers +
-value), `users.csv` and `events.csv` (for `--csv` / `--csv --key`).
-The name `kite.properties` is gitignored on purpose — the templates use
-different names so they stay tracked.
+Internals:
 
-## Testing
-
-See [TESTING.md](TESTING.md) — `zig build test` unit tests plus a
-broker-agnostic `scripts/smoke.sh` produce/consume roundtrip for any
-Kafka 4.0+ cluster.
-
-## Internals
-
-- `src/protocol.zig` — varint/compact encoders, request framing, record batch v2 decode/encode + CRC-32C
-- `src/decompress.zig` — gzip, zstd, Snappy, and LZ4 record-batch decoders
-- `src/transport.zig` — TCP + TLS (std.crypto.tls) connection with framed send/recv
-- `src/client.zig` — bootstrap, ApiVersions negotiation, SASL, metadata, produce/fetch + retry
-- `src/consumer.zig` — ListOffsets/Fetch consumer loop and output formatting
-- `src/scram.zig` — RFC 5802 SCRAM-SHA-256/512 client with server-signature verification
+- `src/protocol.zig` — Kafka encoders, framing, and record batches
+- `src/decompress.zig` — gzip, zstd, Snappy, and LZ4 decoders
+- `src/transport.zig` — TCP and TLS transport
+- `src/client.zig` — bootstrap, metadata, SASL, produce, fetch, and retry
+- `src/consumer.zig` — ListOffsets/Fetch loop and output formatting
+- `src/scram.zig` — SCRAM-SHA-256/512 client
 - `src/config.zig` — `kite.properties` loader
-- `src/csv.zig` — quote-aware row reader, field unescaping, row→JSON
+- `src/csv.zig` — CSV reader and JSON conversion
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Kite is licensed under the [Apache License 2.0](LICENSE).
