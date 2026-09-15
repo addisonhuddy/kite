@@ -1,6 +1,7 @@
 const std = @import("std");
 const client = @import("client.zig");
 const protocol = @import("protocol.zig");
+const stats = @import("stats.zig");
 
 const Encoder = protocol.Encoder;
 const Decoder = protocol.Decoder;
@@ -13,6 +14,7 @@ pub const Options = struct {
     partition: ?i32 = null,
     max_records: ?u64 = null,
     idle_ms: ?u64 = null,
+    stats: ?*stats.Stats = null,
 };
 
 const Cursor = struct {
@@ -103,6 +105,7 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         }
         leader_seen.deinit(round_alloc);
         try out.flush();
+        if (opts.stats) |s| s.maybeRender();
         if (progress) last_record = std.Io.Timestamp.now(c.io, .awake);
     }
     return count;
@@ -285,7 +288,7 @@ fn fetchLeader(
             var range = Range{};
             var next_from_batches: ?i64 = null;
             if (records) |blob| {
-                var ctx = RecordSink{ .out = out, .count = count, .max = opts.max_records, .range = &range };
+                var ctx = RecordSink{ .out = out, .count = count, .max = opts.max_records, .range = &range, .stats = opts.stats };
                 next_from_batches = protocol.decodeBatches(alloc, blob, &ctx, onRecord) catch |err| {
                     c.setErr("decode fetch partition {d}: {s}", .{ pidx, @errorName(err) });
                     return error.FetchFailed;
@@ -323,6 +326,7 @@ const RecordSink = struct {
     count: *u64,
     max: ?u64,
     range: *Range,
+    stats: ?*stats.Stats,
 };
 
 fn onRecord(ctx: *RecordSink, offset: i64, _: i64, rec: protocol.Record) !void {
@@ -342,6 +346,10 @@ fn onRecord(ctx: *RecordSink, offset: i64, _: i64, rec: protocol.Record) !void {
     }
     try ctx.out.writeByte('\n');
     ctx.count.* += 1;
+    if (ctx.stats) |s| {
+        s.add(1, rec.value.len + if (rec.key) |key| key.len else 0);
+        s.noteOffset(offset);
+    }
     ctx.range.first = ctx.range.first orelse offset;
     ctx.range.last = offset;
 }

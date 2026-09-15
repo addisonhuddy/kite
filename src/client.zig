@@ -6,6 +6,7 @@ const config = @import("config.zig");
 const protocol = @import("protocol.zig");
 const transport = @import("transport.zig");
 const scram = @import("scram.zig");
+const term = @import("term.zig");
 
 const Encoder = protocol.Encoder;
 const Decoder = protocol.Decoder;
@@ -53,6 +54,8 @@ pub const Client = struct {
     producer_id: i64 = -1,
     producer_epoch: i16 = -1,
     producer_inited: bool = false,
+    last_offset: ?i64 = null,
+    acked_records: u64 = 0,
     /// pidx -> next base sequence number (idempotent produce only).
     seqs: std.AutoHashMapUnmanaged(i32, i32),
 
@@ -94,6 +97,7 @@ pub const Client = struct {
             o.encoders.deinit(c.alloc);
             c.alloc.free(o.pidx);
             c.alloc.free(o.batches);
+            c.alloc.free(o.counts);
         }
         c.outstanding.deinit(c.alloc);
         c.seqs.deinit(c.alloc);
@@ -110,7 +114,10 @@ pub const Client = struct {
     /// Verbose diagnostic to stderr, gated on `cfg.verbose` (-v).
     pub fn vlog(c: *Client, comptime fmt: []const u8, args: anytype) void {
         if (!c.cfg.verbose) return;
-        std.debug.print("kite: " ++ fmt ++ "\n", args);
+        if (term.color.enabled)
+            std.debug.print("{s}kite:{s} " ++ fmt ++ "\n", .{ term.dim, term.reset } ++ args)
+        else
+            std.debug.print("kite: " ++ fmt ++ "\n", args);
     }
 
     fn loadCa(c: *Client) !*std.crypto.Certificate.Bundle {
@@ -557,6 +564,7 @@ pub const Client = struct {
         corr: i32, // <0 = the send never completed; all parts retriable
         pidx: []i32,
         batches: [][]const u8,
+        counts: []u32,
         bytes: usize,
         encoders: std.ArrayListUnmanaged(Encoder) = .empty,
     };
@@ -617,6 +625,7 @@ pub const Client = struct {
                 .corr = -1,
                 .pidx = try c.alloc.alloc(i32, 1),
                 .batches = try c.alloc.alloc([]const u8, 1),
+                .counts = try c.alloc.alloc(u32, 1),
                 .bytes = 0,
             };
             // Assign the batch's base sequence up front; the counter advances
@@ -642,6 +651,7 @@ pub const Client = struct {
             try o.encoders.append(c.alloc, be);
             o.pidx[0] = pidx;
             o.batches[0] = be.written();
+            o.counts[0] = @intCast(sets[i].len);
             o.bytes = be.written().len;
             c.outstanding_bytes += o.bytes;
             // Idempotent produce allows at most 5 un-acked requests per
@@ -705,7 +715,7 @@ pub const Client = struct {
     }
 
     fn produceDrainStop(c: *Client, topic: []const u8, stop: DrainStop) !void {
-        const PendingPart = struct { pidx: i32, batch: []const u8 };
+        const PendingPart = struct { pidx: i32, batch: []const u8, count: u32 };
         var retry: std.ArrayListUnmanaged(PendingPart) = .empty;
         defer retry.deinit(c.alloc);
 
@@ -730,15 +740,15 @@ pub const Client = struct {
             if (o.corr >= 0) {
                 var codes = std.AutoHashMapUnmanaged(i32, protocol.ErrorCode).empty;
                 defer codes.deinit(c.alloc);
-                if (c.produceRecv(o.conn, o.corr, &codes)) |_| {
-                    for (o.pidx, o.batches) |pi, b| {
+                if (c.produceRecv(o.conn, o.corr, &codes, o, null)) |_| {
+                    for (o.pidx, o.batches, o.counts) |pi, b, count| {
                         const code = codes.get(pi) orelse .none;
                         switch (code) {
                             // duplicate_sequence_number: broker already
                             // appended this batch — dedup success.
                             .none, .duplicate_sequence_number => {},
                             else => if (code.retriable()) {
-                                try retry.append(c.alloc, .{ .pidx = pi, .batch = b });
+                                try retry.append(c.alloc, .{ .pidx = pi, .batch = b, .count = count });
                             } else {
                                 c.setErr("produce to {s}[{d}]: {s}", .{ topic, pi, code.name() });
                                 return error.ProduceFailed;
@@ -747,12 +757,12 @@ pub const Client = struct {
                     }
                 } else |_| {
                     c.dropConn(o.ckey);
-                    for (o.pidx, o.batches) |pi, b|
-                        try retry.append(c.alloc, .{ .pidx = pi, .batch = b });
+                    for (o.pidx, o.batches, o.counts) |pi, b, count|
+                        try retry.append(c.alloc, .{ .pidx = pi, .batch = b, .count = count });
                 }
             } else {
-                for (o.pidx, o.batches) |pi, b|
-                    try retry.append(c.alloc, .{ .pidx = pi, .batch = b });
+                for (o.pidx, o.batches, o.counts) |pi, b, count|
+                    try retry.append(c.alloc, .{ .pidx = pi, .batch = b, .count = count });
             }
         }
 
@@ -784,7 +794,7 @@ pub const Client = struct {
                 };
                 var codes = std.AutoHashMapUnmanaged(i32, protocol.ErrorCode).empty;
                 defer codes.deinit(c.alloc);
-                c.produceRecv(conn, corr, &codes) catch {
+                c.produceRecv(conn, corr, &codes, null, pp.count) catch {
                     c.dropConn(claim.key);
                     c.releaseConn(pp.pidx);
                     try retry.append(c.alloc, pp);
@@ -909,6 +919,8 @@ pub const Client = struct {
         conn: *Conn,
         corr: i32,
         codes: *std.AutoHashMapUnmanaged(i32, protocol.ErrorCode),
+        outstanding: ?*const Outstanding,
+        retry_count: ?u32,
     ) !void {
         const resp = try transport.recv(conn, c.alloc, corr, true);
         defer c.alloc.free(resp.frame);
@@ -923,7 +935,7 @@ pub const Client = struct {
             while (p < nparts) : (p += 1) {
                 const pidx = try d.i32v();
                 const code: protocol.ErrorCode = @enumFromInt(try d.i16v());
-                _ = try d.i64v(); // base_offset
+                const base_offset = try d.i64v();
                 _ = try d.i64v(); // log_append_time_ms
                 _ = try d.i64v(); // log_start_offset
                 const nerrs = try d.compactArrayLen(); // record_errors
@@ -936,11 +948,27 @@ pub const Client = struct {
                 _ = try d.compactString(); // error_message
                 try d.tagBuffer(); // partition tags
                 try codes.put(c.alloc, pidx, code);
+                if (code == .none) {
+                    const count = if (outstanding) |o| blk: {
+                        for (o.pidx, o.counts) |op, oc| if (op == pidx) break :blk oc;
+                        break :blk 0;
+                    } else retry_count orelse 0;
+                    if (count > 0) {
+                        const last = base_offset + @as(i64, count) - 1;
+                        if (c.last_offset == null or last > c.last_offset.?) c.last_offset = last;
+                        c.acked_records += count;
+                    }
+                }
             }
             try d.tagBuffer(); // topic tags
         }
         const throttle = try d.i32v();
-        if (throttle > 0) std.debug.print("kite: broker throttled produce {d}ms\n", .{throttle});
+        if (throttle > 0) {
+            if (term.color.enabled)
+                std.debug.print("{s}kite:{s} broker throttled produce {d}ms\n", .{ term.yellow, term.reset, throttle })
+            else
+                std.debug.print("kite: broker throttled produce {d}ms\n", .{throttle});
+        }
         try d.tagBuffer();
     }
 };

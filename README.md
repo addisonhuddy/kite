@@ -188,6 +188,13 @@ The producer writes its success summary to stdout and diagnostics to stderr.
 The consumer writes records to stdout and diagnostics, including a bounded-run
 summary, to stderr.
 
+While stderr is a terminal, producer and bounded consumer runs also show a
+live one-line rate and byte statistic on stderr. The live line is disabled by
+`-v` / `--verbose`; final summaries include a second detail line with elapsed
+time, message rate, byte rate, and the last offset when available. Terminal
+colors can be disabled with a non-empty `NO_COLOR`, forced with
+`KITE_COLOR=always`, or disabled explicitly with `KITE_COLOR=never`.
+
 - `-v` / `--verbose` enables connection, retry, and fetch diagnostics.
 - `KITE_DEBUG=1` enables frame and TLS diagnostics.
 - `KITE_TIME=1` prints producer timing totals and connection count.
