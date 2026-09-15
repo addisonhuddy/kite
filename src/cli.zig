@@ -36,12 +36,17 @@ pub const consume_usage =
     "Usage: kite consume [OPTIONS] TOPIC\n" ++
     "Try 'kite consume --help' for examples.\n";
 
+pub const install_usage =
+    "Usage: kite install [OPTIONS]\n" ++
+    "Try 'kite install --help' for details.\n";
+
 pub const produce_help =
     "kite - Write stdin records to a Kafka topic\n" ++
     "\n" ++
     "Usage:\n" ++
     "  kite [OPTIONS] TOPIC\n" ++
     "  kite consume [OPTIONS] TOPIC  Use 'kite consume --help' for details.\n" ++
+    "  kite install [OPTIONS]       Use 'kite install --help' for details.\n" ++
     "\n" ++
     "Options:\n" ++
     "  -H HEADER             Add a 'name: value' header (repeatable).\n" ++
@@ -94,6 +99,18 @@ pub const consume_help =
     "Configuration:\n" ++
     "  Search order: ./kite.properties, $XDG_CONFIG_HOME/kite/kite.properties,\n" ++
     "  then ~/.config/kite/kite.properties. Templates are in examples/config/.\n";
+
+pub const install_help =
+    "kite install - Install the current kite executable\n" ++
+    "\n" ++
+    "Usage:\n" ++
+    "  kite install [OPTIONS]\n" ++
+    "\n" ++
+    "Options:\n" ++
+    "  --dir DIR             Install to DIR (default: $KITE_INSTALL_DIR or\n" ++
+    "                        ~/.local/bin).\n" ++
+    "  -y, --yes             Add the install directory to PATH without prompting.\n" ++
+    "  -h, --help            Show this help and exit.\n";
 
 fn errorResult(comptime T: type, alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) Result(T) {
     return .{ .err = std.fmt.allocPrint(alloc, fmt, args) catch "out of memory" };
@@ -363,7 +380,7 @@ test "help is detected in argument order" {
 
 test "help text stays plain and narrow" {
     try std.testing.expect(produce_help.len != consume_help.len);
-    for ([_][]const u8{ produce_help, consume_help }) |page| {
+    for ([_][]const u8{ produce_help, consume_help, install_help }) |page| {
         try std.testing.expect(std.mem.indexOf(u8, page, "-h, --help") != null);
         var lines = std.mem.splitScalar(u8, page, '\n');
         while (lines.next()) |line| {

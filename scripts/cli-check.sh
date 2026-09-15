@@ -47,6 +47,8 @@ cmp -s "$TMP/root-help.out" "$TMP/root-short-help.out" || {
 }
 run_case consume-help 0 nonempty empty consume --help
 run_case consume-short-help 0 nonempty empty consume -h
+run_case install-help 0 nonempty empty install --help
+run_case install-unknown 1 empty "unknown option" install --bogus
 cmp -s "$TMP/consume-help.out" "$TMP/consume-short-help.out" || {
     echo "FAIL consume help differs between -h and --help"
     exit 1
@@ -93,6 +95,19 @@ run_case conflict-first 1 empty "kite: --offset cannot be combined with --from-b
 run_case conflict-second 1 empty "kite: --offset cannot be combined with --from-beginning" consume --offset 1 --from-beginning demo
 run_case consume-unknown 1 empty "kite: unknown option '--bogus'" consume --bogus demo
 run_case consume-extra 1 empty "kite: unexpected argument 'b'" consume a b
+
+run_case install-copy 0 nonempty "Add that line" install --dir "$TMP/bin"
+[ -x "$TMP/bin/kite" ] || { echo "FAIL install-copy: binary missing"; exit 1; }
+
+set +e
+(cd "$TMP/work" && SHELL=/bin/bash HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" install --dir "$TMP/bin" --yes >"$TMP/install-yes.out" 2>"$TMP/install-yes.err")
+status=$?
+set -e
+[ "$status" -eq 0 ] || { echo "FAIL install-yes: exit $status"; exit 1; }
+grep -Fq "export PATH=\"$TMP/bin:\$PATH\"" "$TMP/home/.bashrc" || {
+    echo "FAIL install-yes: PATH line missing"; exit 1;
+}
+echo "PASS install-yes"
 
 run_case produce-no-config 1 empty "no kite.properties found" demo
 run_case consume-no-config 1 empty "no kite.properties found" consume demo
