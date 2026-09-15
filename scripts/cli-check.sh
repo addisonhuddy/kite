@@ -98,6 +98,8 @@ run_case consume-extra 1 empty "kite: unexpected argument 'b'" consume a b
 
 run_case install-copy 0 nonempty "Add that line" install --dir "$TMP/bin"
 [ -x "$TMP/bin/kite" ] || { echo "FAIL install-copy: binary missing"; exit 1; }
+run_case install-relative 0 nonempty "$TMP/work/rel/bin" install --dir rel/bin
+[ -x "$TMP/work/rel/bin/kite" ] || { echo "FAIL install-relative: binary missing"; exit 1; }
 
 set +e
 (cd "$TMP/work" && SHELL=/bin/bash HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" install --dir "$TMP/bin" --yes >"$TMP/install-yes.out" 2>"$TMP/install-yes.err")
@@ -108,6 +110,20 @@ grep -Fq "export PATH=\"$TMP/bin:\$PATH\"" "$TMP/home/.bashrc" || {
     echo "FAIL install-yes: PATH line missing"; exit 1;
 }
 echo "PASS install-yes"
+
+mkdir -p "$TMP/home2"
+printf '%s\n' '# managed by dotfiles' >"$TMP/home2/real.bashrc"
+ln -s real.bashrc "$TMP/home2/.bashrc"
+set +e
+(cd "$TMP/work" && SHELL=/bin/bash HOME="$TMP/home2" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" install --dir "$TMP/bin" --yes >"$TMP/install-symlink.out" 2>"$TMP/install-symlink.err")
+status=$?
+set -e
+[ "$status" -eq 0 ] || { echo "FAIL install-symlink: exit $status"; exit 1; }
+[ -L "$TMP/home2/.bashrc" ] || { echo "FAIL install-symlink: rc symlink replaced"; exit 1; }
+grep -Fq "export PATH=\"$TMP/bin:\$PATH\"" "$TMP/home2/real.bashrc" || {
+    echo "FAIL install-symlink: PATH line missing"; exit 1;
+}
+echo "PASS install-symlink"
 
 run_case produce-no-config 1 empty "no kite.properties found" demo
 run_case consume-no-config 1 empty "no kite.properties found" consume demo
