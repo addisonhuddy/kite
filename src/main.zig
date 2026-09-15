@@ -191,7 +191,7 @@ pub fn main(init: std.process.Init) !void {
     var t_flush: u64 = 0;
     var t_drain: u64 = 0;
     var timer = Lap.init(io);
-    var stats = stats_mod.Stats.init(io, "produced to", topic, (std.Io.File.stderr().isTty(io) catch false) and !verbose);
+    var stats = stats_mod.Stats.init(io, topic, (std.Io.File.stderr().isTty(io) catch false) and !verbose);
     read_loop: while (true) {
         // Linger: with pending records and no stdin data within linger_ms,
         // flush rather than block indefinitely on a slow producer. Skip the
@@ -305,7 +305,8 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
 
     var stdout_buf: [64 * 1024]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(init.io, &stdout_buf);
-    var stats = stats_mod.Stats.init(init.io, "consumed from", topic_name, (std.Io.File.stderr().isTty(init.io) catch false) and !verbose);
+    var stats = stats_mod.Stats.init(init.io, topic_name, (std.Io.File.stderr().isTty(init.io) catch false) and
+        !(std.Io.File.stdout().isTty(init.io) catch false) and !verbose);
     const consumed = consumer.run(&cli, .{
         .topic = topic_name,
         .start = consume.start,

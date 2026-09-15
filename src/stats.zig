@@ -16,7 +16,6 @@ pub fn fmtBytes(value: u64, buf: []u8) []const u8 {
 
 pub const Stats = struct {
     io: std.Io,
-    label: []const u8,
     topic: []const u8,
     started: std.Io.Timestamp,
     last_render: std.Io.Timestamp,
@@ -30,9 +29,9 @@ pub const Stats = struct {
     last_rate: f64 = 0,
     last_byte_rate: f64 = 0,
 
-    pub fn init(io: std.Io, label: []const u8, topic: []const u8, live: bool) Stats {
+    pub fn init(io: std.Io, topic: []const u8, live: bool) Stats {
         const now = std.Io.Timestamp.now(io, .awake);
-        return .{ .io = io, .label = label, .topic = topic, .started = now, .last_render = now, .win_start = now, .live = live };
+        return .{ .io = io, .topic = topic, .started = now, .last_render = now, .win_start = now, .live = live };
     }
 
     pub fn add(s: *Stats, n_records: u64, n_bytes: u64) void {
@@ -70,15 +69,15 @@ pub const Stats = struct {
         var b1: [32]u8 = undefined;
         var b2: [32]u8 = undefined;
         var b3: [32]u8 = undefined;
+        var offset_buf: [48]u8 = undefined;
         var line: [256]u8 = undefined;
         const count = fmtCount(s.records, &b1);
         const msg_rate = fmtCount(@intFromFloat(@max(0, rate.records)), &b2);
         const byte_rate = fmtBytes(@intFromFloat(@max(0, rate.bytes)), &b3);
         const elapsed = s.started.durationTo(now).toNanoseconds();
-        const offset = if (s.last_offset) |off| std.fmt.allocPrint(std.heap.page_allocator, "  offset {d}", .{off}) catch "" else "";
-        defer if (s.last_offset != null) std.heap.page_allocator.free(offset);
+        const offset = if (s.last_offset) |off| std.fmt.bufPrint(&offset_buf, "  offset {d}", .{off}) catch "" else "";
         const text = if (term.color.enabled) blk: {
-            break :blk std.fmt.bufPrint(&line, "\r\x1b[K{s}{s}{s}  {s}{s}{s} msgs  {s}{s}{s} msg/s  {s}{s}{s}/s{s}  {d:.1}s\n", .{
+            break :blk std.fmt.bufPrint(&line, "\r\x1b[K{s}{s}{s}  {s}{s}{s} msgs  {s}{s}{s} msg/s  {s}{s}{s}/s{s}  {d:.1}s", .{
                 term.cyan, s.topic,                                            term.reset,
                 term.bold, count,                                              term.reset,
                 term.bold, msg_rate,                                           term.reset,
@@ -86,7 +85,7 @@ pub const Stats = struct {
                 offset,    @as(f64, @floatFromInt(elapsed)) / 1_000_000_000.0,
             }) catch return;
         } else blk: {
-            break :blk std.fmt.bufPrint(&line, "\r\x1b[K{s}  {s} msgs  {s} msg/s  {s}/s{s}  {d:.1}s\n", .{
+            break :blk std.fmt.bufPrint(&line, "\r\x1b[K{s}  {s} msgs  {s} msg/s  {s}/s{s}  {d:.1}s", .{
                 s.topic, count, msg_rate, byte_rate, offset, @as(f64, @floatFromInt(elapsed)) / 1_000_000_000.0,
             }) catch return;
         };
