@@ -28,27 +28,62 @@ pub fn Result(comptime T: type) type {
     };
 }
 
+pub const version = "0.1.0";
+
+pub const Mode = enum {
+    produce,
+    consume,
+    install,
+};
+
+pub const ModeSplit = struct {
+    mode: Mode,
+    rest: []const []const u8,
+};
+
+pub fn splitMode(alloc: std.mem.Allocator, args: []const []const u8) Result(ModeSplit) {
+    var mode: Mode = .produce;
+    var rest: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--consume")) {
+            if (mode == .install)
+                return .{ .err = "--consume cannot be combined with --install" };
+            mode = .consume;
+        } else if (std.mem.eql(u8, arg, "-i") or std.mem.eql(u8, arg, "--install")) {
+            if (mode == .consume)
+                return .{ .err = "--consume cannot be combined with --install" };
+            mode = .install;
+        } else {
+            rest.append(alloc, arg) catch return .{ .err = "out of memory" };
+        }
+    }
+    return .{ .ok = .{ .mode = mode, .rest = rest.toOwnedSlice(alloc) catch return .{ .err = "out of memory" } } };
+}
+
 pub const produce_usage =
     "Usage: kite [OPTIONS] TOPIC\n" ++
     "Try 'kite --help' for examples.\n";
 
 pub const consume_usage =
-    "Usage: kite consume [OPTIONS] TOPIC\n" ++
-    "Try 'kite consume --help' for examples.\n";
+    "Usage: kite -c [OPTIONS] TOPIC\n" ++
+    "Try 'kite -c --help' for examples.\n";
 
 pub const install_usage =
-    "Usage: kite install [OPTIONS]\n" ++
-    "Try 'kite install --help' for details.\n";
+    "Usage: kite -i [OPTIONS]\n" ++
+    "Try 'kite -i --help' for details.\n";
 
 pub const produce_help =
     "kite - Write stdin records to a Kafka topic\n" ++
     "\n" ++
     "Usage:\n" ++
-    "  kite [OPTIONS] TOPIC\n" ++
-    "  kite consume [OPTIONS] TOPIC  Use 'kite consume --help' for details.\n" ++
-    "  kite install [OPTIONS]       Use 'kite install --help' for details.\n" ++
+    "  kite [OPTIONS] TOPIC          Produce stdin lines to TOPIC (default).\n" ++
+    "  kite -c [OPTIONS] TOPIC       Consume TOPIC to stdout. See 'kite -c --help'.\n" ++
+    "  kite -i [OPTIONS]             Install this executable. See 'kite -i --help'.\n" ++
     "\n" ++
     "Options:\n" ++
+    "  -c, --consume         Consume instead of produce.\n" ++
+    "  -i, --install         Install the executable to ~/.local/bin.\n" ++
+    "  -V, --version         Print the version and exit.\n" ++
     "  -H HEADER             Add a 'name: value' header (repeatable).\n" ++
     "  --csv                 Read RFC 4180 CSV and write JSON values.\n" ++
     "  --key COL             Use CSV column COL as the record key; requires --csv.\n" ++
@@ -66,19 +101,20 @@ pub const produce_help =
     "  kite -H 'source: import' events < examples/data/headers.tsv\n" ++
     "  kite --csv events < examples/data/users.csv\n" ++
     "  kite --csv --key user_id events < examples/data/events.csv\n" ++
-    "  kite consume --from-beginning -t 3000 events\n" ++
+    "  kite -c --from-beginning -t 3000 events\n" ++
     "\n" ++
     "Configuration:\n" ++
     "  Search order: ./kite.properties, $XDG_CONFIG_HOME/kite/kite.properties,\n" ++
     "  then ~/.config/kite/kite.properties. Templates are in examples/config/.\n";
 
 pub const consume_help =
-    "kite consume - Read Kafka records to stdout\n" ++
+    "kite -c - Read Kafka records to stdout\n" ++
     "\n" ++
     "Usage:\n" ++
-    "  kite consume [OPTIONS] TOPIC\n" ++
+    "  kite -c [OPTIONS] TOPIC\n" ++
     "\n" ++
     "Options:\n" ++
+    "  -c, --consume         Consume instead of produce.\n" ++
     "  --from-beginning      Start at the earliest available offset.\n" ++
     "  --offset N            Start at offset N in each selected partition.\n" ++
     "                        Cannot be combined with --from-beginning.\n" ++
@@ -92,19 +128,19 @@ pub const consume_help =
     "Without -t, -n may wait indefinitely when no new records arrive.\n" ++
     "\n" ++
     "Examples:\n" ++
-    "  kite consume events\n" ++
-    "  kite consume --from-beginning -t 3000 events\n" ++
-    "  kite consume --partition 0 --offset 42 -n 10 -t 3000 events\n" ++
+    "  kite -c events\n" ++
+    "  kite -c --from-beginning -t 3000 events\n" ++
+    "  kite -c --partition 0 --offset 42 -n 10 -t 3000 events\n" ++
     "\n" ++
     "Configuration:\n" ++
     "  Search order: ./kite.properties, $XDG_CONFIG_HOME/kite/kite.properties,\n" ++
     "  then ~/.config/kite/kite.properties. Templates are in examples/config/.\n";
 
 pub const install_help =
-    "kite install - Install the current kite executable\n" ++
+    "kite -i - Install the current kite executable\n" ++
     "\n" ++
     "Usage:\n" ++
-    "  kite install [OPTIONS]\n" ++
+    "  kite -i [OPTIONS]\n" ++
     "\n" ++
     "Options:\n" ++
     "  --dir DIR             Install to DIR (default: $KITE_INSTALL_DIR or\n" ++
@@ -315,6 +351,47 @@ test "produce parser accepts option spellings and zero-independent fields" {
             try std.testing.expect(args.csv);
             try std.testing.expectEqualStrings("id", args.key_col.?);
             try std.testing.expectEqual(@as(usize, 2), args.headers.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "mode flags are split from arguments" {
+    const alloc = std.heap.page_allocator;
+    const before = splitMode(alloc, &.{ "-c", "events" });
+    switch (before) {
+        .ok => |result| {
+            try std.testing.expectEqual(Mode.consume, result.mode);
+            try std.testing.expectEqualSlices([]const u8, &.{"events"}, result.rest);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const after = splitMode(alloc, &.{ "events", "-c" });
+    switch (after) {
+        .ok => |result| {
+            try std.testing.expectEqual(Mode.consume, result.mode);
+            try std.testing.expectEqualSlices([]const u8, &.{"events"}, result.rest);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const duplicate = splitMode(alloc, &.{ "-c", "--consume", "events" });
+    switch (duplicate) {
+        .ok => |result| {
+            try std.testing.expectEqual(Mode.consume, result.mode);
+            try std.testing.expectEqualSlices([]const u8, &.{"events"}, result.rest);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try expectErr(ModeSplit, splitMode(alloc, &.{ "-c", "-i", "events" }), "--consume cannot be combined with --install");
+
+    const produce = splitMode(alloc, &.{"consume"});
+    switch (produce) {
+        .ok => |result| {
+            try std.testing.expectEqual(Mode.produce, result.mode);
+            try std.testing.expectEqualSlices([]const u8, &.{"consume"}, result.rest);
         },
         else => return error.TestUnexpectedResult,
     }
