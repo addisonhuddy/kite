@@ -32,19 +32,32 @@ optional UPX/LZMA packaging step.
 
 ## End-to-end: any Kafka 4.0+ broker
 
-There is no bundled broker harness. Copy an
-[`examples/config/`](examples/config) template to `./kite.properties`, set
-`bootstrap.servers` and any required authentication, build, and run:
+There is no bundled broker harness. Point kite at a broker with
+`KITE_BOOTSTRAP_SERVERS` (or copy an [`examples/config/`](examples/config)
+template to `./kite.properties` and set `bootstrap.servers` plus any
+authentication), build, and run:
 
 ```sh
-cp examples/config/plaintext.properties kite.properties
+export KITE_BOOTSTRAP_SERVERS=localhost:9092
 zig build
 scripts/smoke.sh EXISTING_TOPIC
 ```
 
 The topic must already exist; kite never creates topics. `smoke.sh` produces
 marked plain and keyed records, consumes them from the beginning with an idle
-timeout, and compares the roundtrip.
+timeout, compares the roundtrip, checks a `--json` produce/consume roundtrip
+(key, nested value, headers), and asserts that an out-of-range `--offset`
+fails with the valid range instead of replaying the partition.
+
+Behaviours worth checking by hand on a terminal (not covered by the scripts):
+
+```sh
+kite -c EXISTING_TOPIC                 # 'waiting for records' line, Ctrl-C -> summary, exit 130
+kite -c -B EXISTING_TOPIC | head -2    # exits 0 promptly once head closes the pipe
+kite -c -B EXISTING_TOPIC | wc -l      # stops after 5 s idle without -t/--idle/-f
+seq 1 100000 | kite EXISTING_TOPIC     # live rate line, then produce summary with per-partition offsets
+kite -b 127.0.0.1:1 -c EXISTING_TOPIC  # 'connection refused by 127.0.0.1:1'
+```
 
 For consumer compression coverage, produce batches with another client using
 `none`, `gzip`, `snappy`, and `lz4` (zstd batches fail with

@@ -13,6 +13,7 @@ const consumer = @import("consumer.zig");
 const install = @import("install.zig");
 const term = @import("term.zig");
 const stats_mod = @import("stats.zig");
+const json = @import("json.zig");
 
 // unused-import anchors so `zig build test` covers every module
 comptime {
@@ -27,6 +28,7 @@ comptime {
     _ = install;
     _ = term;
     _ = stats_mod;
+    _ = json;
 }
 
 // Panics print just the message — pulls in no DWARF/stack-trace machinery.
@@ -36,7 +38,11 @@ fn out(comptime fmt: []const u8, args: anytype) void {
     std.debug.print(fmt, args);
 }
 
+/// Live stderr status line to erase before printing a fatal error.
+var live_stats: ?*stats_mod.Stats = null;
+
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
+    if (live_stats) |s| s.clearLine();
     if (term.color.enabled)
         out(term.red ++ "kite:" ++ term.reset ++ " " ++ fmt ++ "\n", args)
     else
@@ -154,32 +160,14 @@ pub fn main(init: std.process.Init) !void {
     };
     const topic = produce.topic;
     const static_headers = produce.headers;
-    const verbose = produce.verbose;
+    const verbose = produce.common.verbose;
     const csv_mode = produce.csv;
+    const json_mode = produce.common.json;
     const csv_key_col = produce.key_col;
 
-    var cfg = config.load(io, alloc, init.environ_map) catch |err| switch (err) {
-        error.ConfigNotFound => fatal(
-            "no kite.properties found (searched ./kite.properties, $XDG_CONFIG_HOME/kite/kite.properties, ~/.config/kite/kite.properties)",
-            .{},
-        ),
-        error.MissingBootstrapServers => fatal("kite.properties is missing required key bootstrap.servers", .{}),
-        error.InvalidSecurityProtocol => fatal("invalid security.protocol (want PLAINTEXT, SSL, SASL_SSL, or SASL_PLAINTEXT)", .{}),
-        error.InvalidSaslMechanism => fatal("invalid sasl.mechanism (want PLAIN, SCRAM-SHA-256, or SCRAM-SHA-512)", .{}),
-        error.MissingSaslMechanism => fatal("security.protocol=SASL_* requires sasl.mechanism", .{}),
-        error.MissingSaslCredentials => fatal("sasl.mechanism set but sasl.username/sasl.password missing", .{}),
-        else => fatal("failed to load kite.properties: {s}", .{@errorName(err)}),
-    };
-    cfg.verbose = verbose;
-
+    var cfg = loadConfig(init, alloc, produce.common);
     var cli = client.Client.init(alloc, io, init.environ_map, &cfg);
-    cli.bootstrap() catch fatalErr(&cli, "could not reach any bootstrap server");
-
-    cli.refreshMetadata(topic) catch |err| switch (err) {
-        error.TopicNotFound => fatal("topic '{s}' does not exist", .{topic}),
-        error.TopicAuthorizationFailed => fatal("not authorized to read topic '{s}'", .{topic}),
-        else => fatalErr(&cli, "metadata lookup failed"),
-    };
+    connectAndResolve(&cli, topic, "write");
 
     const nparts = cli.partitionCount();
     var pend = alloc.alloc(Pending, nparts) catch fatal("out of memory", .{});
@@ -189,6 +177,9 @@ pub fn main(init: std.process.Init) !void {
     var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
     const r = &stdin_reader.interface;
     const stdin_fd = std.Io.File.stdin().handle;
+    const stderr_tty = std.Io.File.stderr().isTty(io) catch false;
+    if (stderr_tty and (std.Io.File.stdin().isTty(io) catch false))
+        note("reading records from the terminal, one per line (Ctrl-D to finish)", .{});
 
     var cols: [][]const u8 = &.{};
     var key_idx: ?usize = null;
@@ -212,7 +203,9 @@ pub fn main(init: std.process.Init) !void {
     var t_flush: u64 = 0;
     var t_drain: u64 = 0;
     var timer = Lap.init(io);
-    var stats = stats_mod.Stats.init(io, topic, (std.Io.File.stderr().isTty(io) catch false) and !verbose);
+    var stats = stats_mod.Stats.init(io, topic, stderr_tty and !verbose);
+    defer stats.deinit();
+    live_stats = &stats;
     read_loop: while (true) {
         // Linger: with pending records and no stdin data within linger_ms,
         // flush rather than block indefinitely on a slow producer. Skip the
@@ -226,7 +219,6 @@ pub fn main(init: std.process.Init) !void {
             const nready = std.posix.poll(&fds, @intCast(@min(cfg.linger_ms, std.math.maxInt(i32)))) catch 1;
             if (nready == 0) {
                 flushAll(&cli, topic, pend) catch |err| produceFatal(&cli, err);
-                if (cli.last_offset) |off| stats.noteOffset(off);
                 stats.maybeRender();
                 continue;
             }
@@ -239,6 +231,10 @@ pub fn main(init: std.process.Init) !void {
         } else blk: {
             const owned = nextLine(r, alloc) catch fatal("failed reading stdin", .{}) orelse
                 break :read_loop;
+            if (json_mode) {
+                if (std.mem.trim(u8, owned, " \t").len == 0) continue;
+                break :blk jsonRecord(alloc, owned, static_headers, total + 1);
+            }
             break :blk parseLine(alloc, owned, static_headers, total + 1);
         };
         t_read += timer.lap();
@@ -262,11 +258,9 @@ pub fn main(init: std.process.Init) !void {
             // Cap hit: flush every partition's pending buffer in one pipelined
             // round so all leader conns go in flight together.
             flushAll(&cli, topic, pend) catch |err| produceFatal(&cli, err);
-            if (cli.last_offset) |off| stats.noteOffset(off);
             t_flush += timer.lap();
             if (cli.outstanding_bytes >= 96 << 20) {
                 cli.produceDrainUntil(topic, 96 << 20) catch |err| produceFatal(&cli, err);
-                if (cli.last_offset) |off| stats.noteOffset(off);
                 stats.maybeRender();
                 t_drain += timer.lap();
             }
@@ -275,15 +269,187 @@ pub fn main(init: std.process.Init) !void {
 
     flushAll(&cli, topic, pend) catch |err| produceFatal(&cli, err);
     cli.produceDrain(topic) catch |err| produceFatal(&cli, err);
-    if (cli.last_offset) |off| stats.noteOffset(off);
-    stats.finish();
+    for (cli.last_offsets.items) |po| stats.noteOffset(po.pidx, po.offset);
     if (timing) std.debug.print("read {d}ms send {d}ms drain {d}ms conns {d}\n", .{ t_read / 1_000_000, t_flush / 1_000_000, (t_drain + timer.lap()) / 1_000_000, cli.conns.count() });
 
-    var buf: [256]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
-    w.interface.print("{d} record(s) produced to '{s}'\n", .{ total, topic }) catch {};
-    w.interface.flush() catch {};
+    produceSummary(&cli, &stats, total, nparts);
     cli.deinit();
+}
+
+/// Post-produce report on stderr; stdout stays free for pipeline data.
+fn produceSummary(cli: *client.Client, stats: *stats_mod.Stats, total: u64, nparts: usize) void {
+    const parts_used = cli.last_offsets.items.len;
+    stats.clearLine();
+    if (term.color.enabled)
+        std.debug.print("{s}{d}{s} record(s) produced to '{s}{s}{s}' across {d} of {d} partition(s)\n", .{
+            term.bold, total, term.reset, term.cyan, stats.topic, term.reset, parts_used, nparts,
+        })
+    else
+        std.debug.print("{d} record(s) produced to '{s}' across {d} of {d} partition(s)\n", .{
+            total, stats.topic, parts_used, nparts,
+        });
+    stats.finish();
+    if (total > 0) {
+        var lat_buf: [32]u8 = undefined;
+        const secs = stats.elapsedSecs();
+        const per_req = if (cli.produce_requests > 0)
+            std.fmt.bufPrint(&lat_buf, "{d:.1}ms", .{secs * 1000.0 / @as(f64, @floatFromInt(cli.produce_requests))}) catch "?"
+        else
+            "n/a";
+        std.debug.print("{d} produce request(s), {d} retried batch(es), {s} avg per request, {d} connection(s)\n", .{
+            cli.produce_requests, cli.produce_retries, per_req, cli.conns.count(),
+        });
+    }
+    if (cli.acked_records != total)
+        std.debug.print("warning: broker acknowledged {d} of {d} record(s)\n", .{ cli.acked_records, total });
+}
+
+/// Parse a `--json` input line: {"key":..,"value":..,"headers":{..}}. A
+/// non-string value is forwarded verbatim so JSON objects can be sent
+/// directly; headers may be an object or an array of {"key","value"}.
+fn jsonRecord(
+    alloc: std.mem.Allocator,
+    line: []const u8,
+    static_headers: []const protocol.Header,
+    lineno: u64,
+) protocol.Record {
+    var sc = json.Scanner{ .src = line, .alloc = alloc };
+    var key: ?[]const u8 = null;
+    var value: ?[]const u8 = null;
+    var headers: std.ArrayListUnmanaged(protocol.Header) = .empty;
+    headers.appendSlice(alloc, static_headers) catch fatal("out of memory", .{});
+
+    const shape = "want {\"key\":..,\"value\":..,\"headers\":{..}}";
+    const is_obj = sc.beginObject() catch jsonFatal(lineno, shape);
+    if (!is_obj) fatal("line {d}: expected a JSON object ({s})", .{ lineno, shape });
+    var first = true;
+    while (sc.nextMember(first) catch jsonFatal(lineno, shape)) |m| : (first = false) {
+        if (std.mem.eql(u8, m.key, "value")) {
+            value = m.value.bytes() orelse fatal("line {d}: \"value\" must not be null", .{lineno});
+        } else if (std.mem.eql(u8, m.key, "key")) {
+            key = switch (m.value) {
+                .null => null,
+                .string => |v| v,
+                else => fatal("line {d}: \"key\" must be a string or null", .{lineno}),
+            };
+        } else if (std.mem.eql(u8, m.key, "headers")) {
+            switch (m.value) {
+                .null => {},
+                .object => |raw| {
+                    var hs = json.Scanner{ .src = raw, .alloc = alloc };
+                    _ = hs.beginObject() catch unreachable;
+                    var hfirst = true;
+                    while (hs.nextMember(hfirst) catch jsonFatal(lineno, shape)) |h| : (hfirst = false) {
+                        headers.append(alloc, .{ .key = h.key, .value = jsonHeaderValue(h.value, lineno) }) catch
+                            fatal("out of memory", .{});
+                    }
+                },
+                .array => |raw| {
+                    var hs = json.Scanner{ .src = raw, .alloc = alloc };
+                    _ = hs.beginArray() catch unreachable;
+                    var hfirst = true;
+                    while (hs.nextElement(hfirst) catch jsonFatal(lineno, shape)) : (hfirst = false) {
+                        const is_entry = hs.beginObject() catch jsonFatal(lineno, shape);
+                        if (!is_entry) fatal("line {d}: header entries must be {{\"key\",\"value\"}} objects", .{lineno});
+                        var hk: ?[]const u8 = null;
+                        var hv: ?[]const u8 = null;
+                        var efirst = true;
+                        while (hs.nextMember(efirst) catch jsonFatal(lineno, shape)) |e| : (efirst = false) {
+                            if (std.mem.eql(u8, e.key, "key")) {
+                                hk = switch (e.value) {
+                                    .string => |v| v,
+                                    else => fatal("line {d}: header \"key\" must be a string", .{lineno}),
+                                };
+                            } else if (std.mem.eql(u8, e.key, "value")) {
+                                hv = jsonHeaderValue(e.value, lineno);
+                            }
+                        }
+                        headers.append(alloc, .{
+                            .key = hk orelse fatal("line {d}: header entry has no \"key\"", .{lineno}),
+                            .value = hv,
+                        }) catch fatal("out of memory", .{});
+                    }
+                },
+                else => fatal("line {d}: \"headers\" must be an object or array", .{lineno}),
+            }
+        }
+    }
+    if (!sc.atEnd()) jsonFatal(lineno, shape);
+    return .{
+        .key = key,
+        .value = value orelse fatal("line {d}: JSON object has no \"value\" field", .{lineno}),
+        .headers = headers.items,
+    };
+}
+
+fn jsonFatal(lineno: u64, shape: []const u8) noreturn {
+    fatal("line {d}: invalid JSON ({s})", .{ lineno, shape });
+}
+
+fn jsonHeaderValue(v: json.Value, lineno: u64) ?[]const u8 {
+    return switch (v) {
+        .null => null,
+        .string, .object, .array => v.bytes(),
+        .other => fatal("line {d}: header values must be strings or null", .{lineno}),
+    };
+}
+
+fn note(comptime fmt: []const u8, args: anytype) void {
+    if (term.color.enabled)
+        out(term.dim ++ "kite: " ++ fmt ++ term.reset ++ "\n", args)
+    else
+        out("kite: " ++ fmt ++ "\n", args);
+}
+
+const search_path_hint = "./kite.properties, $XDG_CONFIG_HOME/kite/kite.properties, ~/.config/kite/kite.properties";
+
+/// Resolve configuration from flags, KITE_* environment and properties file.
+fn loadConfig(init: std.process.Init, alloc: std.mem.Allocator, common: cli_args.Common) config.Config {
+    var source: config.Source = .{};
+    var cfg = config.load(init.io, alloc, init.environ_map, .{
+        .bootstrap = common.bootstrap,
+        .config_path = common.config_path,
+    }, &source) catch |err| switch (err) {
+        error.ConfigNotFound => fatal(
+            "no broker configured. Pass -b HOST:PORT, set KITE_BOOTSTRAP_SERVERS, or create kite.properties (searched {s}); see 'kite --help' for the file format",
+            .{search_path_hint},
+        ),
+        error.ConfigFileNotFound => fatal("config file '{s}' not found", .{source.requested.?}),
+        error.ConfigFileUnreadable => fatal("cannot read config file '{s}'", .{source.requested.?}),
+        error.MissingBootstrapServers => fatal(
+            "'{s}' has no bootstrap.servers; add it, or pass -b HOST:PORT / set KITE_BOOTSTRAP_SERVERS",
+            .{source.file.?},
+        ),
+        error.InvalidSecurityProtocol => fatal("invalid security.protocol (want PLAINTEXT, SSL, SASL_SSL, or SASL_PLAINTEXT)", .{}),
+        error.InvalidSaslMechanism => fatal("invalid sasl.mechanism (want PLAIN, SCRAM-SHA-256, or SCRAM-SHA-512)", .{}),
+        error.MissingSaslMechanism => fatal("security.protocol=SASL_* requires sasl.mechanism", .{}),
+        error.MissingSaslCredentials => fatal("sasl.mechanism set but sasl.username/sasl.password missing", .{}),
+        error.OutOfMemory => fatal("out of memory", .{}),
+    };
+    cfg.verbose = common.verbose;
+    if (common.verbose) {
+        std.debug.print("kite: config from {s}{s}{s}{s}\n", .{
+            if (source.flags) "flags" else "",
+            if (source.flags and (source.env or source.file != null)) " > " else "",
+            if (source.env) "KITE_* env" else "",
+            if (source.file) |f| f else if (!source.env and !source.flags) "(nothing)" else "",
+        });
+        if (source.env and source.file != null) std.debug.print("kite: (env overrides file)\n", .{});
+    }
+    return cfg;
+}
+
+/// Bootstrap and fetch topic metadata, exiting with a mode-aware message.
+fn connectAndResolve(cli: *client.Client, topic: []const u8, access: []const u8) void {
+    cli.bootstrap() catch fatalErr(cli, "could not reach any bootstrap server");
+    cli.refreshMetadata(topic) catch |err| switch (err) {
+        error.TopicNotFound => fatal("topic '{s}' does not exist (create it first, or check the name)", .{topic}),
+        error.TopicAuthorizationFailed => fatal(
+            "not authorized to {s} topic '{s}' (check ACLs for this principal; on managed clusters this is also what a missing topic looks like)",
+            .{ access, topic },
+        ),
+        else => fatalErr(cli, "metadata lookup failed"),
+    };
 }
 
 fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.Allocator) noreturn {
@@ -301,52 +467,123 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
         .ok => |value| value,
     };
     const topic_name = consume.topic;
-    const verbose = consume.verbose;
+    const verbose = consume.common.verbose;
 
-    var cfg = config.load(init.io, alloc, init.environ_map) catch |err| switch (err) {
-        error.ConfigNotFound => fatal(
-            "no kite.properties found (searched ./kite.properties, $XDG_CONFIG_HOME/kite/kite.properties, ~/.config/kite/kite.properties)",
-            .{},
-        ),
-        error.MissingBootstrapServers => fatal("kite.properties is missing required key bootstrap.servers", .{}),
-        error.InvalidSecurityProtocol => fatal("invalid security.protocol (want PLAINTEXT, SSL, SASL_SSL, or SASL_PLAINTEXT)", .{}),
-        error.InvalidSaslMechanism => fatal("invalid sasl.mechanism (want PLAIN, SCRAM-SHA-256, or SCRAM-SHA-512)", .{}),
-        error.MissingSaslMechanism => fatal("security.protocol=SASL_* requires sasl.mechanism", .{}),
-        error.MissingSaslCredentials => fatal("sasl.mechanism set but sasl.username/sasl.password missing", .{}),
-        else => fatal("failed to load kite.properties: {s}", .{@errorName(err)}),
-    };
-    cfg.verbose = verbose;
+    var cfg = loadConfig(init, alloc, consume.common);
     var cli = client.Client.init(alloc, init.io, init.environ_map, &cfg);
-    cli.bootstrap() catch fatalErr(&cli, "could not reach any bootstrap server");
-    cli.refreshMetadata(topic_name) catch |err| switch (err) {
-        error.TopicNotFound => fatal("topic '{s}' does not exist", .{topic_name}),
-        error.TopicAuthorizationFailed => fatal("not authorized to read topic '{s}'", .{topic_name}),
-        else => fatalErr(&cli, "metadata lookup failed"),
-    };
+    connectAndResolve(&cli, topic_name, "read");
+
+    const stdout_tty = std.Io.File.stdout().isTty(init.io) catch false;
+    const stderr_tty = std.Io.File.stderr().isTty(init.io) catch false;
+    // Unbounded reads only make sense on a terminal (or with --follow); a
+    // pipe/file consumer without a bound stops after a short idle so scripts
+    // and agents never hang.
+    const idle_ms: ?u64 = if (consume.follow)
+        null
+    else if (consume.idle_ms) |ms|
+        ms
+    else if (consume.max_records == null and !stdout_tty)
+        default_idle_ms
+    else
+        null;
 
     var stdout_buf: [64 * 1024]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(init.io, &stdout_buf);
-    var stats = stats_mod.Stats.init(init.io, topic_name, (std.Io.File.stderr().isTty(init.io) catch false) and
-        !(std.Io.File.stdout().isTty(init.io) catch false) and !verbose);
+    var stats = stats_mod.Stats.init(init.io, topic_name, stderr_tty and !verbose);
+    defer stats.deinit();
+    live_stats = &stats;
+    stats.clear_before_output = stdout_tty;
+    stats.waiting_hint = switch (consume.start) {
+        .latest => " (new records only; use -B for history)",
+        .earliest => " from the beginning",
+        .offset => " from the given offset",
+    };
+    if (verbose) {
+        if (idle_ms) |ms|
+            std.debug.print("kite: consuming '{s}', stop after {d} idle ms{s}\n", .{
+                topic_name, ms, if (consume.idle_ms == null) " (default for non-terminal stdout)" else "",
+            })
+        else
+            std.debug.print("kite: consuming '{s}' until Ctrl-C\n", .{topic_name});
+    }
+    installSignalHandlers();
     const consumed = consumer.run(&cli, .{
         .topic = topic_name,
         .start = consume.start,
         .offset = consume.offset,
         .partition = consume.partition,
         .max_records = consume.max_records,
-        .idle_ms = consume.idle_ms,
+        .idle_ms = idle_ms,
+        .json = consume.common.json,
         .stats = &stats,
+        .stop = &interrupted,
+        .sink_closed = stdoutClosed,
     }, &stdout.interface) catch |err| switch (err) {
         error.PartitionNotFound => fatal("partition {d} not found in topic '{s}'", .{ consume.partition orelse -1, topic_name }),
+        error.OffsetOutOfRange => fatalErr(&cli, "cannot start consuming"),
+        error.WriteFailed => {
+            // Downstream closed the pipe (e.g. `| head`): stop quietly.
+            std.process.exit(0);
+        },
         error.FetchFailed => fatalErr(&cli, "consume failed"),
         else => fatalErr(&cli, "consume failed"),
     };
-    stdout.interface.flush() catch {};
-    if (consume.max_records != null or consume.idle_ms != null)
-        std.debug.print("{d} record(s) consumed from '{s}'\n", .{ consumed, topic_name });
-    if (consume.max_records != null or consume.idle_ms != null) stats.finish();
+    stdout.interface.flush() catch std.process.exit(0);
+    const stopped_by_signal = interrupted.load(.acquire);
+    const reason: []const u8 = if (stopped_by_signal)
+        " (interrupted)"
+    else if (consume.max_records != null and consumed >= consume.max_records.?)
+        ""
+    else if (idle_ms != null)
+        " (idle timeout)"
+    else
+        "";
+    stats.clearLine();
+    if (term.color.enabled)
+        std.debug.print("{s}{d}{s} record(s) consumed from '{s}{s}{s}'{s}\n", .{
+            term.bold, consumed, term.reset, term.cyan, topic_name, term.reset, reason,
+        })
+    else
+        std.debug.print("{d} record(s) consumed from '{s}'{s}\n", .{ consumed, topic_name, reason });
+    stats.finish();
     cli.deinit();
-    std.process.exit(0);
+    std.process.exit(if (stopped_by_signal) 130 else 0);
+}
+
+/// Idle bound applied to `kite -c` when stdout is not a terminal and no
+/// --max/--idle/--follow was given.
+const default_idle_ms: u64 = 5000;
+
+var interrupted = std.atomic.Value(bool).init(false);
+
+/// True once the reader of stdout has gone away (e.g. `| head` exited).
+fn stdoutClosed() bool {
+    var fds = [_]std.posix.pollfd{.{ .fd = std.posix.STDOUT_FILENO, .events = 0, .revents = 0 }};
+    const n = std.posix.poll(&fds, 0) catch return false;
+    return n > 0 and (fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0;
+}
+
+fn onInterrupt(_: std.posix.SIG) callconv(.c) void {
+    interrupted.store(true, .release);
+}
+
+/// SIGINT/SIGTERM request a graceful stop (summary still printed); SIGPIPE
+/// is ignored so a closed downstream surfaces as a write error instead of
+/// killing the process with status 141.
+fn installSignalHandlers() void {
+    const stop: std.posix.Sigaction = .{
+        .handler = .{ .handler = onInterrupt },
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.RESTART,
+    };
+    std.posix.sigaction(.INT, &stop, null);
+    std.posix.sigaction(.TERM, &stop, null);
+    const ignore: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.PIPE, &ignore, null);
 }
 
 /// Lap timer over the monotonic `Io` clock (replaces std.time.Timer).

@@ -2,6 +2,7 @@ const std = @import("std");
 const client = @import("client.zig");
 const protocol = @import("protocol.zig");
 const stats = @import("stats.zig");
+const json = @import("json.zig");
 
 const Encoder = protocol.Encoder;
 const Decoder = protocol.Decoder;
@@ -14,7 +15,23 @@ pub const Options = struct {
     partition: ?i32 = null,
     max_records: ?u64 = null,
     idle_ms: ?u64 = null,
+    /// Emit one JSON object per record instead of TAB-separated text.
+    json: bool = false,
     stats: ?*stats.Stats = null,
+    /// Set asynchronously (e.g. by a SIGINT handler) to stop after the
+    /// current fetch round.
+    stop: ?*const std.atomic.Value(bool) = null,
+    /// Polled between fetch rounds so a closed downstream pipe stops the
+    /// consumer even when no new records arrive to trigger a write error.
+    sink_closed: ?*const fn () bool = null,
+};
+
+pub const Error = error{
+    PartitionNotFound,
+    FetchFailed,
+    /// `--offset` outside the partition's [earliest, latest] range; detail in
+    /// `Client.errDetail()`.
+    OffsetOutOfRange,
 };
 
 const Cursor = struct {
@@ -62,7 +79,9 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
     var last_record = std.Io.Timestamp.now(c.io, .awake);
     var retry_attempts: u8 = 0;
     while (true) {
+        if (opts.stop) |flag| if (flag.load(.acquire)) break;
         if (opts.max_records) |max| if (count >= max) break;
+        if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
         if (opts.idle_ms) |idle| {
             const elapsed = last_record.durationTo(std.Io.Timestamp.now(c.io, .awake));
             if (elapsed.toMilliseconds() >= idle) break;
@@ -277,6 +296,10 @@ fn fetchLeader(
             try d.tagBuffer();
             const part = findPart(parts, pidx) orelse continue;
             if (code == .offset_out_of_range) {
+                if (opts.start == .offset) {
+                    try reportOffsetRange(c, alloc, opts, part.cursor);
+                    return error.OffsetOutOfRange;
+                }
                 try resetOffset(c, alloc, opts, part.cursor);
                 continue;
             }
@@ -288,7 +311,16 @@ fn fetchLeader(
             var range = Range{};
             var next_from_batches: ?i64 = null;
             if (records) |blob| {
-                var ctx = RecordSink{ .out = out, .count = count, .max = opts.max_records, .range = &range, .stats = opts.stats };
+                var ctx = RecordSink{
+                    .out = out,
+                    .count = count,
+                    .max = opts.max_records,
+                    .range = &range,
+                    .stats = opts.stats,
+                    .json = opts.json,
+                    .topic = opts.topic,
+                    .pidx = pidx,
+                };
                 next_from_batches = protocol.decodeBatches(alloc, blob, &ctx, onRecord) catch |err| {
                     c.setErr("decode fetch partition {d}: {s}", .{ pidx, @errorName(err) });
                     return error.FetchFailed;
@@ -327,11 +359,36 @@ const RecordSink = struct {
     max: ?u64,
     range: *Range,
     stats: ?*stats.Stats,
+    json: bool,
+    topic: []const u8,
+    pidx: i32,
 };
 
-fn onRecord(ctx: *RecordSink, offset: i64, _: i64, rec: protocol.Record) !void {
+fn writeJsonRecord(w: *std.Io.Writer, topic: []const u8, pidx: i32, offset: i64, ts: i64, rec: protocol.Record) !void {
+    try w.writeAll("{\"topic\":");
+    try json.writeString(w, topic);
+    try w.print(",\"partition\":{d},\"offset\":{d},\"timestamp\":{d},\"key\":", .{ pidx, offset, ts });
+    if (rec.key) |key| try json.writeString(w, key) else try w.writeAll("null");
+    try w.writeAll(",\"headers\":[");
+    for (rec.headers, 0..) |header, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll("{\"key\":");
+        try json.writeString(w, header.key);
+        try w.writeAll(",\"value\":");
+        if (header.value) |value| try json.writeString(w, value) else try w.writeAll("null");
+        try w.writeByte('}');
+    }
+    try w.writeAll("],\"value\":");
+    try json.writeString(w, rec.value);
+    try w.writeByte('}');
+}
+
+fn onRecord(ctx: *RecordSink, offset: i64, timestamp_ms: i64, rec: protocol.Record) !void {
     if (ctx.max) |max| if (ctx.count.* >= max) return;
-    if (rec.key == null and rec.headers.len == 0) {
+    if (ctx.stats) |s| s.beforeOutput();
+    if (ctx.json) {
+        try writeJsonRecord(ctx.out, ctx.topic, ctx.pidx, offset, timestamp_ms, rec);
+    } else if (rec.key == null and rec.headers.len == 0) {
         try ctx.out.writeAll(rec.value);
     } else {
         if (rec.key) |key| try ctx.out.writeAll(key);
@@ -348,7 +405,7 @@ fn onRecord(ctx: *RecordSink, offset: i64, _: i64, rec: protocol.Record) !void {
     ctx.count.* += 1;
     if (ctx.stats) |s| {
         s.add(1, rec.value.len + if (rec.key) |key| key.len else 0);
-        s.noteOffset(offset);
+        s.noteOffset(ctx.pidx, offset);
     }
     ctx.range.first = ctx.range.first orelse offset;
     ctx.range.last = offset;
@@ -364,4 +421,51 @@ fn resetOffset(c: *client.Client, alloc: std.mem.Allocator, opts: Options, curso
     const part = [_]ListPart{.{ .pidx = cursor.pidx, .cursor = cursor }};
     try listOffsetsLeader(c, alloc, opts.topic, &part, start);
     c.vlog("partition {d}: offset out of range; reset to {d}", .{ cursor.pidx, cursor.offset });
+}
+
+/// Fill `Client.errDetail()` with the partition's valid offset range so the
+/// user can pick an offset that exists instead of silently replaying.
+fn reportOffsetRange(c: *client.Client, alloc: std.mem.Allocator, opts: Options, cursor: *Cursor) !void {
+    const requested = cursor.offset;
+    var probe = cursor.*;
+    const part = [_]ListPart{.{ .pidx = probe.pidx, .cursor = &probe }};
+    listOffsetsLeader(c, alloc, opts.topic, &part, .earliest) catch {
+        c.setErr("offset {d} is out of range for partition {d}", .{ requested, cursor.pidx });
+        return;
+    };
+    const earliest = probe.offset;
+    listOffsetsLeader(c, alloc, opts.topic, &part, .latest) catch {
+        c.setErr("offset {d} is out of range for partition {d}", .{ requested, cursor.pidx });
+        return;
+    };
+    const latest = probe.offset;
+    if (earliest == latest)
+        c.setErr("offset {d} is out of range for partition {d}: partition is empty (next offset {d})", .{
+            requested, cursor.pidx, latest,
+        })
+    else
+        c.setErr("offset {d} is out of range for partition {d}: valid offsets are {d}..{d} (next offset {d})", .{
+            requested, cursor.pidx, earliest, latest - 1, latest,
+        });
+}
+
+test "json record output escapes and includes metadata" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const headers = [_]protocol.Header{ .{ .key = "h", .value = "v" }, .{ .key = "n", .value = null } };
+    try writeJsonRecord(&w, "t", 2, 41, 1700000000000, .{ .key = "k\"q", .value = "line\nbreak\ttab", .headers = &headers });
+    try std.testing.expectEqualStrings(
+        "{\"topic\":\"t\",\"partition\":2,\"offset\":41,\"timestamp\":1700000000000,\"key\":\"k\\\"q\",\"headers\":[{\"key\":\"h\",\"value\":\"v\"},{\"key\":\"n\",\"value\":null}],\"value\":\"line\\nbreak\\ttab\"}",
+        w.buffered(),
+    );
+}
+
+test "json record output without key or headers" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeJsonRecord(&w, "t", 0, 0, -1, .{ .value = "x" });
+    try std.testing.expectEqualStrings(
+        "{\"topic\":\"t\",\"partition\":0,\"offset\":0,\"timestamp\":-1,\"key\":null,\"headers\":[],\"value\":\"x\"}",
+        w.buffered(),
+    );
 }
