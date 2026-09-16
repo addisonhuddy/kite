@@ -24,7 +24,7 @@ echo "== produce =="
 "$K" "$TOPIC" <"$TMP/in"
 
 echo "== consume roundtrip =="
-"$K" consume --from-beginning -t 5000 "$TOPIC" | grep "^$M" | sort >"$TMP/out"
+"$K" -c --from-beginning -t 5000 "$TOPIC" | grep "^$M" | sort >"$TMP/out"
 sort "$TMP/in" >"$TMP/expected"
 diff -u "$TMP/expected" "$TMP/out"
 

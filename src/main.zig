@@ -116,15 +116,30 @@ pub fn main(init: std.process.Init) !void {
     term.color = .{ .enabled = term.detect(io, std.Io.File.stderr(), init.environ_map) };
 
     const args = init.minimal.args.toSlice(alloc) catch fatal("out of memory", .{});
-    if (args.len > 1 and std.mem.eql(u8, args[1], "consume")) {
-        runConsume(init, args[2..], alloc);
-        return;
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) {
+            writeText(init, std.Io.File.stdout(), "kite " ++ cli_args.version ++ "\n");
+            return;
+        }
     }
-    if (args.len > 1 and std.mem.eql(u8, args[1], "install")) {
-        install.run(init, args[2..], alloc);
-        return;
+    const split = cli_args.splitMode(alloc, args[1..]);
+    const mode_args = switch (split) {
+        .err => |message| parseFatal(init, message, cli_args.produce_usage),
+        .ok => |value| value,
+        .help => unreachable,
+    };
+    switch (mode_args.mode) {
+        .consume => {
+            runConsume(init, mode_args.rest, alloc);
+            return;
+        },
+        .install => {
+            install.run(init, mode_args.rest, alloc);
+            return;
+        },
+        .produce => {},
     }
-    const parsed = cli_args.parseProduce(alloc, args[1..]);
+    const parsed = cli_args.parseProduce(alloc, mode_args.rest);
     const produce = switch (parsed) {
         .help => {
             if (term.detect(io, std.Io.File.stdout(), init.environ_map)) {

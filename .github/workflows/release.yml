@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: zig build test
+      - name: Build release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          for target in x86_64-linux aarch64-linux x86_64-macos aarch64-macos; do
+            zig build -Dtarget="$target" -p "dist/$target"
+            case "$target" in
+              x86_64-linux) asset=kite-linux-x86_64 ;;
+              aarch64-linux) asset=kite-linux-aarch64 ;;
+              x86_64-macos) asset=kite-macos-x86_64 ;;
+              aarch64-macos) asset=kite-macos-aarch64 ;;
+            esac
+            cp "dist/$target/bin/kite" "release/$asset"
+          done
+      - run: scripts/check-size.sh release/kite-linux-x86_64
+      - run: sha256sum release/* > release/SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
