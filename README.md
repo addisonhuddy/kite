@@ -1,75 +1,113 @@
 # kite
 
-Kite is a small Kafka command-line producer and consumer written in Zig.
-`kite TOPIC` reads stdin, one record per line, while `kite consume TOPIC`
-writes records to stdout.
+**The Kafka CLI for agents and shell pipelines.** One ~560 KB binary,
+no JVM, no runtime, no daemon. stdin in, stdout out, non-zero exit on failure.
 
 ```sh
-printf 'hello\n' | kite events
-kite consume --from-beginning -t 3000 events
+curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh
+printf 'hello\n' | kite events                 # produce
+kite -c --from-beginning -t 3000 events        # consume, stop after 3 s idle
 ```
 
 ## Contents
 
-- [Prerequisites](#prerequisites)
+- [Why kite](#why-kite)
 - [Install](#install)
 - [Quickstart](#quickstart)
+- [Command reference](#command-reference)
 - [Common recipes](#common-recipes)
 - [Consuming](#consuming)
 - [Input/output format and CSV](#inputoutput-format-and-csv)
 - [Configuration](#configuration)
-- [Output streams](#output-streams)
+- [Output streams and exit codes](#output-streams-and-exit-codes)
 - [Troubleshooting](#troubleshooting)
 - [Development and testing](#development-and-testing)
 - [License](#license)
 
-## Prerequisites
+## Why kite
 
-- Zig 0.16.x.
-- A reachable Kafka 4.0+ KRaft broker.
-- Permission to read and write the topic.
-- The topic must already exist; kite never creates topics.
+If you are an agent (or a human writing scripts for one) and need to read or
+write Kafka, kite is the shortest path:
+
+| | kite | `kafka-console-*.sh` | kcat | Python/Node client |
+| --- | --- | --- | --- | --- |
+| Install | one `curl \| sh`, ~560 KB binary | JDK + 100 MB distribution | package manager + librdkafka | interpreter + package + native lib |
+| Startup | milliseconds, no VM warm-up | seconds (JVM) | fast | interpreter start |
+| Interface | stdin/stdout lines, flags, exit codes | verbose Java flags, log noise on stdout | flags | write code first |
+| Dependencies | none (Zig, no shared libraries) | Java | librdkafka, OpenSSL | many |
+| Surface area | produce, consume, install. That's it. | dozens of tools | large flag set | full API |
+
+- **Small.** The stripped binary is about 560 KB on Linux and 535 KB on macOS
+  arm64, gated in CI below 600,000 bytes. It fits in a container layer, a
+  sandbox, or a tool call without anyone noticing.
+- **Unix philosophy.** kite does one thing per invocation and composes with
+  everything else: `tail -f app.log | kite logs`, `kite -c src | jq | kite dst`.
+  Records are lines. Diagnostics go to stderr, data goes to stdout.
+- **Fast.** Written in Zig: native code, no garbage collector, no JVM
+  startup, starts and exits in milliseconds. Produce runs are batched and
+  idempotent by default; consume runs are bounded with `-n`/`-t` so a script
+  always terminates.
+- **Easy install.** `curl | sh`, or `zig build && zig-out/bin/kite -i`. No
+  root, no package manager, no `JAVA_HOME`.
+- **Predictable for automation.** Every error is a one-line `kite: ...` on
+  stderr with exit code 1 and a `Try 'kite --help'` hint. Help pages are
+  plain text, ≤ 80 columns, no ANSI unless stderr is a terminal.
+- **Speaks modern Kafka.** Kafka 4.0+ KRaft brokers, PLAINTEXT / SSL /
+  SASL_SSL / SASL_PLAINTEXT, PLAIN and SCRAM-SHA-256/512, gzip/Snappy/LZ4
+  consumer decompression.
+
+kite is not a Kafka admin tool: it never creates topics, manages consumer
+groups, or commits offsets. Point it at an existing topic and move data.
 
 ## Install
 
-Build `kite`, then use the built-in installer to copy it to `~/.local/bin`
-(override with `--dir` or `KITE_INSTALL_DIR`) and offer to add that directory
-to your `PATH` (`--yes` skips the prompt):
+### curl (Linux x86_64/aarch64, macOS x86_64/arm64)
 
 ```sh
-zig build
-zig-out/bin/kite install
+curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh
 ```
 
-### Manual
+The script downloads the `v0.1.0` release binary for your platform, copies it
+to `~/.local/bin` (override with `KITE_INSTALL_DIR`), and offers to add that
+directory to your `PATH`. Pass `-s -- --yes` to skip the prompt in
+non-interactive shells:
 
-Build from source and install the executable yourself:
+```sh
+curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh -s -- --yes
+```
+
+Prebuilt binaries and `SHA256SUMS` are on the
+[releases page](https://github.com/addisonhuddy/kite/releases).
+
+### From source
+
+Requires Zig 0.16.x.
 
 ```sh
 zig build
+zig-out/bin/kite -i          # copies to ~/.local/bin and offers a PATH line
+```
+
+`kite -i` accepts `--dir DIR` and `-y`/`--yes`. To install manually instead:
+
+```sh
 install -m755 zig-out/bin/kite ~/.local/bin/kite
 ```
 
-Put `~/.local/bin` on `PATH` if it is not there already. Cross-compile with,
-for example:
-
-```sh
-zig build -Dtarget=aarch64-macos
-zig build -Dtarget=x86_64-linux
-```
-
-The source build is the supported installation method.
+Cross-compile with, for example, `zig build -Dtarget=aarch64-macos` or
+`zig build -Dtarget=x86_64-linux`.
 
 ## Quickstart
 
-Choose an existing topic, copy a configuration template, and edit the broker
-address (and credentials if needed):
+Prerequisites: a reachable Kafka 4.0+ KRaft broker, an existing topic, and
+permission to read and write it.
+
+Copy a configuration template and edit the broker address (and credentials if
+needed):
 
 ```sh
 cp examples/config/plaintext.properties kite.properties
 ```
-
-Examples assume `kite` is installed on your `PATH`; see [Install](#install).
 
 Produce the checked-in sample data:
 
@@ -84,7 +122,7 @@ kite events < examples/data/lines.txt
 Read from the beginning and stop after 3 seconds without a record:
 
 ```sh
-kite consume --from-beginning -t 3000 events
+kite -c --from-beginning -t 3000 events
 ```
 
 ```text
@@ -92,6 +130,36 @@ line one
 line two
 ...
 ```
+
+## Command reference
+
+Produce is the default mode. `-c`/`--consume` switches to consume,
+`-i`/`--install` to install. Mode flags may appear anywhere on the command
+line; there are no reserved topic names.
+
+```text
+kite [OPTIONS] TOPIC          Produce stdin lines to TOPIC (default).
+kite -c [OPTIONS] TOPIC       Consume TOPIC to stdout.
+kite -i [OPTIONS]             Install this executable.
+kite --version                Print the version.
+```
+
+| Mode | Option | Meaning |
+| --- | --- | --- |
+| produce | `-H 'name: value'` | Add a header to every record (repeatable). |
+| produce | `--csv` | Read RFC 4180 CSV; each row becomes a JSON object value. |
+| produce | `--key COL` | Use CSV column `COL` as the record key (requires `--csv`). |
+| consume | `--from-beginning` | Start at the earliest offset. |
+| consume | `--offset N` | Start at offset N in every selected partition. |
+| consume | `--partition P` | Read one partition only. |
+| consume | `-n MAX` | Stop after MAX records. |
+| consume | `-t IDLE_MS` | Stop after IDLE_MS without a record. |
+| install | `--dir DIR` | Install to DIR (default `$KITE_INSTALL_DIR` or `~/.local/bin`). |
+| install | `-y`, `--yes` | Add the install directory to `PATH` without prompting. |
+| produce, consume | `-v`, `--verbose` | Connection, retry, and fetch diagnostics on stderr. |
+| all | `-h`, `--help` | Plain-text help for the selected mode. |
+
+`kite --help`, `kite -c --help`, and `kite -i --help` print the full pages.
 
 ## Common recipes
 
@@ -112,11 +180,15 @@ kite --csv --key user_id events < examples/data/events.csv
 # stream a log as it grows
 tail -f app.log | kite logs
 # follow new records (Ctrl-C to stop)
-kite consume events
+kite -c events
 # read one partition from an offset, at most 10 records
-kite consume --partition 0 --offset 42 -n 10 -t 3000 events
+kite -c --partition 0 --offset 42 -n 10 -t 3000 events
+# snapshot a topic into a file for an agent to read
+kite -c --from-beginning -t 5000 events > events.txt
 # copy a topic
-kite consume --from-beginning -t 5000 src | kite dst
+kite -c --from-beginning -t 5000 src | kite dst
+# transform in flight
+kite -c --from-beginning -t 5000 raw | jq -c '{id, ts}' | kite clean
 ```
 
 The consumer output is in the same textual shape accepted by the producer,
@@ -124,15 +196,16 @@ subject to the format boundaries described below.
 
 ## Consuming
 
-By default, `kite consume` starts at the latest offset, selects all partitions,
-and follows new records indefinitely. `--from-beginning` starts at the earliest
+By default, `kite -c` starts at the latest offset, selects all partitions, and
+follows new records indefinitely. `--from-beginning` starts at the earliest
 available offset; `--offset N` starts at offset N in every selected partition.
 `--partition P` selects one partition.
 
 `-n MAX` stops after MAX records. Without `-t`, a count-limited read may wait
 indefinitely for enough records. `-t IDLE_MS` stops after that many
 milliseconds without a record. An idle-bounded read is not a guarantee of a
-complete topic snapshot.
+complete topic snapshot. For scripted use, always pass `-t` (and usually
+`-n`) so the process terminates.
 
 ## Input/output format and CSV
 
@@ -186,18 +259,22 @@ Templates are in [`examples/config/`](examples/config). Idempotence means
 broker deduplication of retried batches, not end-to-end exactly-once
 processing.
 
-## Output streams
+## Output streams and exit codes
 
-The producer writes its success summary to stdout and diagnostics to stderr.
-The consumer writes records to stdout and diagnostics, including a bounded-run
-summary, to stderr.
+- Producer: success summary on stdout, diagnostics on stderr.
+- Consumer: records on stdout; diagnostics, including a bounded-run summary,
+  on stderr.
+- Exit 0 on success, 1 on any error (usage, configuration, connection,
+  broker). Usage errors print `kite: MESSAGE` followed by a one-line
+  `Try 'kite --help'` hint.
 
 While stderr is a terminal, producer and bounded consumer runs also show a
 live one-line rate and byte statistic on stderr. The live line is disabled by
 `-v` / `--verbose`; final summaries include a second detail line with elapsed
 time, message rate, byte rate, and the last offset when available. Terminal
 colors can be disabled with a non-empty `NO_COLOR`, forced with
-`KITE_COLOR=always`, or disabled explicitly with `KITE_COLOR=never`.
+`KITE_COLOR=always`, or disabled explicitly with `KITE_COLOR=never`. Nothing
+is colored when the stream is a pipe.
 
 - `-v` / `--verbose` enables connection, retry, and fetch diagnostics.
 - `KITE_DEBUG=1` enables frame and TLS diagnostics.
@@ -219,6 +296,8 @@ arm64) and must remain below 600,000 bytes.
   use `KITE_DEBUG=1` for handshake details.
 - **Consumer is waiting:** the default starts at latest. Use
   `--from-beginning`, `--offset`, or a bounded `-t` as appropriate.
+- **`kite consume` produced to a topic named `consume`:** modes are flags, not
+  subcommands. Use `kite -c TOPIC`.
 
 ## Development and testing
 
@@ -232,6 +311,8 @@ scripts/smoke.sh EXISTING_TOPIC
 ```
 
 See [TESTING.md](TESTING.md) for broker-agnostic and broker-backed checks.
+Releases are cut by pushing a `v*` tag; the release workflow cross-compiles
+Linux and macOS binaries and attaches them with `SHA256SUMS`.
 
 Internals:
 
@@ -244,6 +325,7 @@ Internals:
 - `src/scram.zig` — SCRAM-SHA-256/512 client
 - `src/config.zig` — `kite.properties` loader
 - `src/csv.zig` — CSV reader and JSON conversion
+- `src/cli.zig` — argument parsing, mode selection, help text
 
 ## License
 
