@@ -51,7 +51,7 @@ pub const Overrides = struct {
 pub const Source = struct {
     /// Properties file that was read, if any.
     file: ?[]const u8 = null,
-    /// Explicit path (--config or KITE_CONFIG) that was requested.
+    /// Explicit path (--config or KAFKA_PROPERTIES) that was requested.
     requested: ?[]const u8 = null,
     env: bool = false,
     flags: bool = false,
@@ -107,16 +107,16 @@ fn configPaths(alloc: std.mem.Allocator, env: *std.process.Environ.Map, list: *s
 }
 
 const env_keys = [_][2][]const u8{
-    .{ "KITE_BOOTSTRAP_SERVERS", "bootstrap.servers" },
-    .{ "KITE_SECURITY_PROTOCOL", "security.protocol" },
-    .{ "KITE_SASL_MECHANISM", "sasl.mechanism" },
-    .{ "KITE_SASL_USERNAME", "sasl.username" },
-    .{ "KITE_SASL_PASSWORD", "sasl.password" },
-    .{ "KITE_SSL_TRUSTSTORE_LOCATION", "ssl.truststore.location" },
+    .{ "BOOTSTRAP_SERVERS", "bootstrap.servers" },
+    .{ "SECURITY_PROTOCOL", "security.protocol" },
+    .{ "SASL_MECHANISM", "sasl.mechanism" },
+    .{ "SASL_USERNAME", "sasl.username" },
+    .{ "SASL_PASSWORD", "sasl.password" },
+    .{ "SSL_TRUSTSTORE_LOCATION", "ssl.truststore.location" },
 };
 
-/// Build the effective Config. Precedence: command-line flags, then KITE_*
-/// environment variables, then the properties file (`--config`/`KITE_CONFIG`
+/// Build the effective Config. Precedence: command-line flags, then
+/// environment variables, then the properties file (`--config`/`KAFKA_PROPERTIES`
 /// or the first file on the search path). A file is optional as soon as the
 /// environment or flags supply bootstrap.servers.
 pub fn load(
@@ -129,7 +129,7 @@ pub fn load(
     var cfg: Config = .{ .bootstrap_servers = &.{} };
 
     const explicit: ?[]const u8 = overrides.config_path orelse blk: {
-        const from_env = env.get("KITE_CONFIG") orelse break :blk null;
+        const from_env = env.get("KAFKA_PROPERTIES") orelse break :blk null;
         break :blk if (from_env.len > 0) from_env else null;
     };
     source.requested = explicit;
