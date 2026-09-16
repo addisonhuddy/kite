@@ -90,7 +90,15 @@ run_case offset-negative 1 empty "kite: --offset: '-1' is not a non-negative int
 run_case offset-overflow 1 empty "kite: --offset: '99999999999999999999' is not a non-negative integer" -c --offset 99999999999999999999 demo
 run_case partition-text 1 empty "kite: --partition: 'x' is not a non-negative integer" -c --partition x demo
 run_case count-text 1 empty "kite: -n: 'x' is not a non-negative integer" -c -n x demo
-run_case timeout-negative 1 empty "kite: -t: '-5' is not a non-negative integer" -c -t -5 demo
+run_case timeout-negative 1 empty "kite: -t: '-5' is not a duration (want e.g. 3000, 3s, 500ms, 1m)" -c -t -5 demo
+run_case idle-text 1 empty "kite: --idle: 'abc' is not a duration" -c --idle abc demo
+run_case follow-idle 1 empty "kite: --follow cannot be combined with --idle" -c -f --idle 1s demo
+run_case max-text 1 empty "kite: --max: 'x' is not a non-negative integer" -c --max x demo
+run_case produce-only-in-consume 1 empty "kite: '-H' is a produce option and is not valid with -c" -c -H 'a: b' demo
+run_case consume-only-in-produce 1 empty "kite: '--offset' is a consume option; use 'kite -c [OPTIONS] TOPIC'" --offset 1 demo
+run_case csv-json 1 empty "kite: --csv cannot be combined with --json" --csv --json demo
+run_case bootstrap-missing 1 empty "kite: -b requires a value" -b
+run_case config-missing 1 empty "kite: --config requires a value" --config
 run_case conflict-first 1 empty "kite: --offset cannot be combined with --from-beginning" -c --from-beginning --offset 1 demo
 run_case conflict-second 1 empty "kite: --offset cannot be combined with --from-beginning" -c --offset 1 --from-beginning demo
 run_case consume-unknown 1 empty "kite: unknown option '--bogus'" -c --bogus demo
@@ -125,12 +133,32 @@ grep -Fq "export PATH=\"$TMP/bin:\$PATH\"" "$TMP/home2/real.bashrc" || {
 }
 echo "PASS install-symlink"
 
-run_case produce-no-config 1 empty "no kite.properties found" demo
-run_case consume-no-config 1 empty "no kite.properties found" -c demo
+run_case produce-no-config 1 empty "no broker configured. Pass -b HOST:PORT, set KITE_BOOTSTRAP_SERVERS, or create kite.properties" demo
+run_case consume-no-config 1 empty "no broker configured" -c demo
+run_case config-file-missing 1 empty "kite: config file 'nope.properties' not found" --config nope.properties demo
 run_case version 0 nonempty empty --version
 run_case mode-conflict 1 empty "cannot be combined" -c -i demo
-run_case topic-named-consume 1 empty "no kite.properties found" consume
-run_case flag-after-topic 1 empty "no kite.properties found" events -c
+run_case topic-named-consume 1 empty "no broker configured" consume
+run_case flag-after-topic 1 empty "no broker configured" events -c
+
+# -b / KITE_BOOTSTRAP_SERVERS bypass the properties-file search entirely and
+# reach the connect step (which fails fast against a closed port).
+run_case bootstrap-flag 1 empty "connection refused by 127.0.0.1:1" -b 127.0.0.1:1 demo
+set +e
+(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" KITE_BOOTSTRAP_SERVERS=127.0.0.1:1 "$BIN" -c demo >"$TMP/bootstrap-env.out" 2>"$TMP/bootstrap-env.err")
+status=$?
+set -e
+[ "$status" -eq 1 ] || { echo "FAIL bootstrap-env: exit $status"; exit 1; }
+grep -Fq "connection refused by 127.0.0.1:1" "$TMP/bootstrap-env.err" || {
+    echo "FAIL bootstrap-env: stderr lacks connect error"; cat "$TMP/bootstrap-env.err"; exit 1;
+}
+echo "PASS bootstrap-env"
+printf 'bootstrap.servers=127.0.0.1:2\n' >"$TMP/work/kite.properties"
+run_case flag-over-file 1 empty "connection refused by 127.0.0.1:1" -b 127.0.0.1:1 demo
+run_case file-used 1 empty "connection refused by 127.0.0.1:2" demo
+printf 'security.protocol=PLAINTEXT\n' >"$TMP/work/kite.properties"
+run_case file-without-bootstrap 1 empty "has no bootstrap.servers; add it, or pass -b HOST:PORT / set KITE_BOOTSTRAP_SERVERS" demo
+rm "$TMP/work/kite.properties"
 
 grep -Fq "Try 'kite --help' for examples." "$TMP/unknown-option.err"
 grep -Fq "Try 'kite -c --help' for examples." "$TMP/consume-unknown.err"
