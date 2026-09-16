@@ -38,7 +38,11 @@ fn out(comptime fmt: []const u8, args: anytype) void {
     std.debug.print(fmt, args);
 }
 
+/// Live stderr status line to erase before printing a fatal error.
+var live_stats: ?*stats_mod.Stats = null;
+
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
+    if (live_stats) |s| s.clearLine();
     if (term.color.enabled)
         out(term.red ++ "kite:" ++ term.reset ++ " " ++ fmt ++ "\n", args)
     else
@@ -201,6 +205,7 @@ pub fn main(init: std.process.Init) !void {
     var timer = Lap.init(io);
     var stats = stats_mod.Stats.init(io, topic, stderr_tty and !verbose);
     defer stats.deinit();
+    live_stats = &stats;
     read_loop: while (true) {
         // Linger: with pending records and no stdin data within linger_ms,
         // flush rather than block indefinitely on a slow producer. Skip the
@@ -486,6 +491,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     var stdout = std.Io.File.stdout().writer(init.io, &stdout_buf);
     var stats = stats_mod.Stats.init(init.io, topic_name, stderr_tty and !verbose);
     defer stats.deinit();
+    live_stats = &stats;
     stats.clear_before_output = stdout_tty;
     stats.waiting_hint = switch (consume.start) {
         .latest => " (new records only; use -B for history)",
