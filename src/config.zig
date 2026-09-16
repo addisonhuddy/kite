@@ -31,12 +31,30 @@ pub const Config = struct {
 
 pub const LoadError = error{
     ConfigNotFound,
+    ConfigFileNotFound,
+    ConfigFileUnreadable,
     MissingBootstrapServers,
     InvalidSecurityProtocol,
     InvalidSaslMechanism,
     MissingSaslMechanism,
     MissingSaslCredentials,
     OutOfMemory,
+};
+
+/// Command-line settings that take precedence over the environment and file.
+pub const Overrides = struct {
+    bootstrap: ?[]const u8 = null,
+    config_path: ?[]const u8 = null,
+};
+
+/// Where the effective configuration came from, for `-v` and error messages.
+pub const Source = struct {
+    /// Properties file that was read, if any.
+    file: ?[]const u8 = null,
+    /// Explicit path (--config or KITE_CONFIG) that was requested.
+    requested: ?[]const u8 = null,
+    env: bool = false,
+    flags: bool = false,
 };
 
 fn warn(comptime fmt: []const u8, args: anytype) void {
@@ -88,96 +106,79 @@ fn configPaths(alloc: std.mem.Allocator, env: *std.process.Environ.Map, list: *s
     }
 }
 
-/// Find and parse the first kite.properties on the search path, then
-/// validate it into a Config.
-pub fn load(io: std.Io, alloc: std.mem.Allocator, env: *std.process.Environ.Map) LoadError!Config {
-    var paths: std.ArrayListUnmanaged([]const u8) = .empty;
-    try configPaths(alloc, env, &paths);
+const env_keys = [_][2][]const u8{
+    .{ "KITE_BOOTSTRAP_SERVERS", "bootstrap.servers" },
+    .{ "KITE_SECURITY_PROTOCOL", "security.protocol" },
+    .{ "KITE_SASL_MECHANISM", "sasl.mechanism" },
+    .{ "KITE_SASL_USERNAME", "sasl.username" },
+    .{ "KITE_SASL_PASSWORD", "sasl.password" },
+    .{ "KITE_SSL_TRUSTSTORE_LOCATION", "ssl.truststore.location" },
+};
 
-    var text: ?[]u8 = null;
-    for (paths.items) |p| {
-        const t = std.Io.Dir.cwd().readFileAlloc(io, p, alloc, .limited(1 << 20)) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            else => return error.ConfigNotFound,
-        };
-        text = t;
-        break;
-    }
-    const body = text orelse return error.ConfigNotFound;
-
-    const props = try parse(alloc, body);
-
+/// Build the effective Config. Precedence: command-line flags, then KITE_*
+/// environment variables, then the properties file (`--config`/`KITE_CONFIG`
+/// or the first file on the search path). A file is optional as soon as the
+/// environment or flags supply bootstrap.servers.
+pub fn load(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+    overrides: Overrides,
+    source: *Source,
+) LoadError!Config {
     var cfg: Config = .{ .bootstrap_servers = &.{} };
 
-    var it = props.iterator();
-    while (it.next()) |e| {
-        const key = e.key_ptr.*;
-        const val = e.value_ptr.*;
-        if (std.mem.eql(u8, key, "bootstrap.servers")) {
-            var servers: std.ArrayListUnmanaged([]const u8) = .empty;
-            var sit = std.mem.splitScalar(u8, val, ',');
-            while (sit.next()) |s| {
-                const sv = std.mem.trim(u8, s, " \t");
-                if (sv.len == 0) continue;
-                if (std.mem.lastIndexOfScalar(u8, sv, ':') == null)
-                    warn("bootstrap.servers entry '{s}' lacks a port; using 9092", .{sv});
-                try servers.append(alloc, sv);
-            }
-            cfg.bootstrap_servers = servers.items;
-        } else if (std.mem.eql(u8, key, "security.protocol")) {
-            const v = try lower(alloc, val);
-            cfg.security_protocol = std.meta.stringToEnum(SecurityProtocol, v) orelse
-                return error.InvalidSecurityProtocol;
-        } else if (std.mem.eql(u8, key, "sasl.mechanism")) {
-            cfg.sasl_mechanism = mechFromString(val) orelse return error.InvalidSaslMechanism;
-        } else if (std.mem.eql(u8, key, "sasl.username")) {
-            cfg.sasl_username = val;
-        } else if (std.mem.eql(u8, key, "sasl.password")) {
-            cfg.sasl_password = val;
-        } else if (std.mem.eql(u8, key, "ssl.truststore.location")) {
-            cfg.ssl_truststore_location = val;
-        } else if (std.mem.eql(u8, key, "linger.ms")) {
-            cfg.linger_ms = std.fmt.parseInt(u64, val, 10) catch {
-                warn("invalid linger.ms '{s}' ignored", .{val});
-                continue;
+    const explicit: ?[]const u8 = overrides.config_path orelse blk: {
+        const from_env = env.get("KITE_CONFIG") orelse break :blk null;
+        break :blk if (from_env.len > 0) from_env else null;
+    };
+    source.requested = explicit;
+
+    var text: ?[]u8 = null;
+    if (explicit) |path| {
+        text = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20)) catch |err| switch (err) {
+            error.FileNotFound => return error.ConfigFileNotFound,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.ConfigFileUnreadable,
+        };
+        source.file = path;
+    } else {
+        var paths: std.ArrayListUnmanaged([]const u8) = .empty;
+        try configPaths(alloc, env, &paths);
+        for (paths.items) |p| {
+            const t = std.Io.Dir.cwd().readFileAlloc(io, p, alloc, .limited(1 << 20)) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
             };
-        } else if (std.mem.eql(u8, key, "batch.size")) {
-            cfg.batch_size = std.fmt.parseInt(usize, val, 10) catch {
-                warn("invalid batch.size '{s}' ignored", .{val});
-                continue;
-            };
-        } else if (std.mem.eql(u8, key, "fetch.max.bytes")) {
-            cfg.fetch_max_bytes = std.fmt.parseInt(usize, val, 10) catch {
-                warn("invalid fetch.max.bytes '{s}' ignored", .{val});
-                continue;
-            };
-            if (cfg.fetch_max_bytes >= 16 << 20) {
-                warn("fetch.max.bytes '{s}' is >= transport maximum; using default", .{val});
-                cfg.fetch_max_bytes = 8 << 20;
-            }
-        } else if (std.mem.eql(u8, key, "fetch.max.wait.ms")) {
-            cfg.fetch_max_wait_ms = std.fmt.parseInt(u64, val, 10) catch {
-                warn("invalid fetch.max.wait.ms '{s}' ignored", .{val});
-                continue;
-            };
-            if (cfg.fetch_max_wait_ms >= 15_000) {
-                warn("fetch.max.wait.ms '{s}' is too close to socket timeout; using default", .{val});
-                cfg.fetch_max_wait_ms = 500;
-            }
-        } else if (std.mem.eql(u8, key, "enable.idempotence")) {
-            if (std.ascii.eqlIgnoreCase(val, "true")) {
-                cfg.enable_idempotence = true;
-            } else if (std.ascii.eqlIgnoreCase(val, "false")) {
-                cfg.enable_idempotence = false;
-            } else {
-                warn("invalid enable.idempotence '{s}' ignored", .{val});
-            }
-        } else {
-            warn("unknown config key '{s}' ignored", .{key});
+            text = t;
+            source.file = p;
+            break;
         }
     }
 
-    if (cfg.bootstrap_servers.len == 0) return error.MissingBootstrapServers;
+    if (text) |body| {
+        const props = try parse(alloc, body);
+        var it = props.iterator();
+        while (it.next()) |e| try applyKey(&cfg, alloc, e.key_ptr.*, e.value_ptr.*);
+    }
+
+    for (env_keys) |pair| {
+        const val = env.get(pair[0]) orelse continue;
+        if (val.len == 0) continue;
+        source.env = true;
+        try applyKey(&cfg, alloc, pair[1], val);
+    }
+
+    if (overrides.bootstrap) |b| {
+        source.flags = true;
+        try applyKey(&cfg, alloc, "bootstrap.servers", b);
+    }
+
+    if (cfg.bootstrap_servers.len == 0) {
+        if (source.file == null) return error.ConfigNotFound;
+        return error.MissingBootstrapServers;
+    }
 
     switch (cfg.security_protocol) {
         .sasl_ssl, .sasl_plaintext => {
@@ -190,6 +191,71 @@ pub fn load(io: std.Io, alloc: std.mem.Allocator, env: *std.process.Environ.Map)
             return error.MissingSaslCredentials;
     }
     return cfg;
+}
+
+fn applyKey(cfg: *Config, alloc: std.mem.Allocator, key: []const u8, val: []const u8) LoadError!void {
+    if (std.mem.eql(u8, key, "bootstrap.servers")) {
+        var servers: std.ArrayListUnmanaged([]const u8) = .empty;
+        var sit = std.mem.splitScalar(u8, val, ',');
+        while (sit.next()) |s| {
+            const sv = std.mem.trim(u8, s, " \t");
+            if (sv.len == 0) continue;
+            if (std.mem.lastIndexOfScalar(u8, sv, ':') == null)
+                warn("bootstrap.servers entry '{s}' lacks a port; using 9092", .{sv});
+            try servers.append(alloc, sv);
+        }
+        cfg.bootstrap_servers = servers.items;
+    } else if (std.mem.eql(u8, key, "security.protocol")) {
+        const v = try lower(alloc, val);
+        cfg.security_protocol = std.meta.stringToEnum(SecurityProtocol, v) orelse
+            return error.InvalidSecurityProtocol;
+    } else if (std.mem.eql(u8, key, "sasl.mechanism")) {
+        cfg.sasl_mechanism = mechFromString(val) orelse return error.InvalidSaslMechanism;
+    } else if (std.mem.eql(u8, key, "sasl.username")) {
+        cfg.sasl_username = val;
+    } else if (std.mem.eql(u8, key, "sasl.password")) {
+        cfg.sasl_password = val;
+    } else if (std.mem.eql(u8, key, "ssl.truststore.location")) {
+        cfg.ssl_truststore_location = val;
+    } else if (std.mem.eql(u8, key, "linger.ms")) {
+        cfg.linger_ms = std.fmt.parseInt(u64, val, 10) catch {
+            warn("invalid linger.ms '{s}' ignored", .{val});
+            return;
+        };
+    } else if (std.mem.eql(u8, key, "batch.size")) {
+        cfg.batch_size = std.fmt.parseInt(usize, val, 10) catch {
+            warn("invalid batch.size '{s}' ignored", .{val});
+            return;
+        };
+    } else if (std.mem.eql(u8, key, "fetch.max.bytes")) {
+        cfg.fetch_max_bytes = std.fmt.parseInt(usize, val, 10) catch {
+            warn("invalid fetch.max.bytes '{s}' ignored", .{val});
+            return;
+        };
+        if (cfg.fetch_max_bytes >= 16 << 20) {
+            warn("fetch.max.bytes '{s}' is >= transport maximum; using default", .{val});
+            cfg.fetch_max_bytes = 8 << 20;
+        }
+    } else if (std.mem.eql(u8, key, "fetch.max.wait.ms")) {
+        cfg.fetch_max_wait_ms = std.fmt.parseInt(u64, val, 10) catch {
+            warn("invalid fetch.max.wait.ms '{s}' ignored", .{val});
+            return;
+        };
+        if (cfg.fetch_max_wait_ms >= 15_000) {
+            warn("fetch.max.wait.ms '{s}' is too close to socket timeout; using default", .{val});
+            cfg.fetch_max_wait_ms = 500;
+        }
+    } else if (std.mem.eql(u8, key, "enable.idempotence")) {
+        if (std.ascii.eqlIgnoreCase(val, "true")) {
+            cfg.enable_idempotence = true;
+        } else if (std.ascii.eqlIgnoreCase(val, "false")) {
+            cfg.enable_idempotence = false;
+        } else {
+            warn("invalid enable.idempotence '{s}' ignored", .{val});
+        }
+    } else {
+        warn("unknown config key '{s}' ignored", .{key});
+    }
 }
 
 fn lower(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
@@ -235,4 +301,19 @@ test "parse empty file" {
     var m = try parse(std.testing.allocator, "");
     defer m.deinit();
     try std.testing.expectEqual(@as(usize, 0), m.count());
+}
+
+test "later applyKey calls override earlier values" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var cfg: Config = .{ .bootstrap_servers = &.{} };
+    try applyKey(&cfg, arena.allocator(), "bootstrap.servers", "a:1, b:2");
+    try std.testing.expectEqual(@as(usize, 2), cfg.bootstrap_servers.len);
+    try applyKey(&cfg, arena.allocator(), "bootstrap.servers", "c:3");
+    try std.testing.expectEqual(@as(usize, 1), cfg.bootstrap_servers.len);
+    try std.testing.expectEqualStrings("c:3", cfg.bootstrap_servers[0]);
+    try applyKey(&cfg, arena.allocator(), "security.protocol", "SASL_SSL");
+    try std.testing.expectEqual(SecurityProtocol.sasl_ssl, cfg.security_protocol);
+    try std.testing.expectError(error.InvalidSaslMechanism, applyKey(&cfg, arena.allocator(), "sasl.mechanism", "nope"));
 }
