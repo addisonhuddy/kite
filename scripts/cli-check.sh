@@ -45,10 +45,10 @@ cmp -s "$TMP/root-help.out" "$TMP/root-short-help.out" || {
     echo "FAIL root help differs between -h and --help"
     exit 1
 }
-run_case consume-help 0 nonempty empty consume --help
-run_case consume-short-help 0 nonempty empty consume -h
-run_case install-help 0 nonempty empty install --help
-run_case install-unknown 1 empty "unknown option" install --bogus
+run_case consume-help 0 nonempty empty -c --help
+run_case consume-short-help 0 nonempty empty -c -h
+run_case install-help 0 nonempty empty -i --help
+run_case install-unknown 1 empty "unknown option" -i --bogus
 cmp -s "$TMP/consume-help.out" "$TMP/consume-short-help.out" || {
     echo "FAIL consume help differs between -h and --help"
     exit 1
@@ -77,7 +77,7 @@ set -e
 [ ! -s "$TMP/no-args.out" ] || { echo "FAIL no-args: stdout is not empty"; exit 1; }
 echo "PASS no-args"
 
-run_case consume-no-args 1 empty "kite: missing TOPIC" consume
+run_case consume-no-args 1 empty "kite: missing TOPIC" -c
 run_case empty-topic 1 empty "kite: TOPIC must not be empty" ""
 run_case unknown-option 1 empty "kite: unknown option '--bogus'" --bogus
 run_case missing-header 1 empty "kite: -H requires a value" -H
@@ -85,24 +85,24 @@ run_case malformed-header 1 empty "kite: malformed header 'nocolon'" -H nocolon 
 run_case missing-key 1 empty "kite: --key requires a value" --key
 run_case key-without-csv 1 empty "kite: --key requires --csv" --key id demo
 run_case extra-topic 1 empty "kite: unexpected argument 'b'" a b
-run_case offset-text 1 empty "kite: --offset: 'abc' is not a non-negative integer" consume --offset abc demo
-run_case offset-negative 1 empty "kite: --offset: '-1' is not a non-negative integer" consume --offset -1 demo
-run_case offset-overflow 1 empty "kite: --offset: '99999999999999999999' is not a non-negative integer" consume --offset 99999999999999999999 demo
-run_case partition-text 1 empty "kite: --partition: 'x' is not a non-negative integer" consume --partition x demo
-run_case count-text 1 empty "kite: -n: 'x' is not a non-negative integer" consume -n x demo
-run_case timeout-negative 1 empty "kite: -t: '-5' is not a non-negative integer" consume -t -5 demo
-run_case conflict-first 1 empty "kite: --offset cannot be combined with --from-beginning" consume --from-beginning --offset 1 demo
-run_case conflict-second 1 empty "kite: --offset cannot be combined with --from-beginning" consume --offset 1 --from-beginning demo
-run_case consume-unknown 1 empty "kite: unknown option '--bogus'" consume --bogus demo
-run_case consume-extra 1 empty "kite: unexpected argument 'b'" consume a b
+run_case offset-text 1 empty "kite: --offset: 'abc' is not a non-negative integer" -c --offset abc demo
+run_case offset-negative 1 empty "kite: --offset: '-1' is not a non-negative integer" -c --offset -1 demo
+run_case offset-overflow 1 empty "kite: --offset: '99999999999999999999' is not a non-negative integer" -c --offset 99999999999999999999 demo
+run_case partition-text 1 empty "kite: --partition: 'x' is not a non-negative integer" -c --partition x demo
+run_case count-text 1 empty "kite: -n: 'x' is not a non-negative integer" -c -n x demo
+run_case timeout-negative 1 empty "kite: -t: '-5' is not a non-negative integer" -c -t -5 demo
+run_case conflict-first 1 empty "kite: --offset cannot be combined with --from-beginning" -c --from-beginning --offset 1 demo
+run_case conflict-second 1 empty "kite: --offset cannot be combined with --from-beginning" -c --offset 1 --from-beginning demo
+run_case consume-unknown 1 empty "kite: unknown option '--bogus'" -c --bogus demo
+run_case consume-extra 1 empty "kite: unexpected argument 'b'" -c a b
 
-run_case install-copy 0 nonempty "Add that line" install --dir "$TMP/bin"
+run_case install-copy 0 nonempty "Add that line" -i --dir "$TMP/bin"
 [ -x "$TMP/bin/kite" ] || { echo "FAIL install-copy: binary missing"; exit 1; }
-run_case install-relative 0 nonempty "$TMP/work/rel/bin" install --dir rel/bin
+run_case install-relative 0 nonempty "$TMP/work/rel/bin" -i --dir rel/bin
 [ -x "$TMP/work/rel/bin/kite" ] || { echo "FAIL install-relative: binary missing"; exit 1; }
 
 set +e
-(cd "$TMP/work" && SHELL=/bin/bash HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" install --dir "$TMP/bin" --yes >"$TMP/install-yes.out" 2>"$TMP/install-yes.err")
+(cd "$TMP/work" && SHELL=/bin/bash HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" -i --dir "$TMP/bin" --yes >"$TMP/install-yes.out" 2>"$TMP/install-yes.err")
 status=$?
 set -e
 [ "$status" -eq 0 ] || { echo "FAIL install-yes: exit $status"; exit 1; }
@@ -115,7 +115,7 @@ mkdir -p "$TMP/home2"
 printf '%s\n' '# managed by dotfiles' >"$TMP/home2/real.bashrc"
 ln -s real.bashrc "$TMP/home2/.bashrc"
 set +e
-(cd "$TMP/work" && SHELL=/bin/bash HOME="$TMP/home2" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" install --dir "$TMP/bin" --yes >"$TMP/install-symlink.out" 2>"$TMP/install-symlink.err")
+(cd "$TMP/work" && SHELL=/bin/bash HOME="$TMP/home2" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" -i --dir "$TMP/bin" --yes >"$TMP/install-symlink.out" 2>"$TMP/install-symlink.err")
 status=$?
 set -e
 [ "$status" -eq 0 ] || { echo "FAIL install-symlink: exit $status"; exit 1; }
@@ -126,17 +126,21 @@ grep -Fq "export PATH=\"$TMP/bin:\$PATH\"" "$TMP/home2/real.bashrc" || {
 echo "PASS install-symlink"
 
 run_case produce-no-config 1 empty "no kite.properties found" demo
-run_case consume-no-config 1 empty "no kite.properties found" consume demo
+run_case consume-no-config 1 empty "no kite.properties found" -c demo
+run_case version 0 nonempty empty --version
+run_case mode-conflict 1 empty "cannot be combined" -c -i demo
+run_case topic-named-consume 1 empty "no kite.properties found" consume
+run_case flag-after-topic 1 empty "no kite.properties found" events -c
 
 grep -Fq "Try 'kite --help' for examples." "$TMP/unknown-option.err"
-grep -Fq "Try 'kite consume --help' for examples." "$TMP/consume-unknown.err"
+grep -Fq "Try 'kite -c --help' for examples." "$TMP/consume-unknown.err"
 for name in empty-topic unknown-option missing-header malformed-header missing-key key-without-csv extra-topic; do
     grep -Fq "Try 'kite --help' for examples." "$TMP/$name.err" || {
         echo "FAIL $name: missing root help hint"; exit 1;
     }
 done
 for name in consume-no-args offset-text offset-negative offset-overflow partition-text count-text timeout-negative conflict-first conflict-second consume-unknown consume-extra; do
-    grep -Fq "Try 'kite consume --help' for examples." "$TMP/$name.err" || {
+    grep -Fq "Try 'kite -c --help' for examples." "$TMP/$name.err" || {
         echo "FAIL $name: missing consume help hint"; exit 1;
     }
 done

@@ -51,7 +51,7 @@ For consumer compression coverage, produce batches with another client using
 `UnsupportedCompression`), then compare:
 
 ```sh
-zig-out/bin/kite consume --from-beginning -t 3000 EXISTING_TOPIC | sort
+zig-out/bin/kite -c --from-beginning -t 3000 EXISTING_TOPIC | sort
 ```
 
 ## Debugging
