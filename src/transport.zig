@@ -6,6 +6,9 @@ const protocol = @import("protocol.zig");
 
 pub const TransportError = error{
     ConnectFailed,
+    ConnectionRefused,
+    ConnectTimedOut,
+    HostNotFound,
     TlsFailed,
     TlsHandshakeAuthFailed,
     IoFailed,
@@ -48,8 +51,13 @@ pub const Conn = struct {
 
 /// Connect TCP to host:port. host may be DNS or IP literal.
 fn tcpConnect(io: std.Io, host: []const u8, port: u16) !std.Io.net.Stream {
-    const hn = std.Io.net.HostName.init(host) catch return error.ConnectFailed;
-    const s = hn.connect(io, port, .{ .mode = .stream }) catch return error.ConnectFailed;
+    const hn = std.Io.net.HostName.init(host) catch return error.HostNotFound;
+    const s = hn.connect(io, port, .{ .mode = .stream }) catch |err| return switch (err) {
+        error.ConnectionRefused => error.ConnectionRefused,
+        error.Timeout, error.HostUnreachable, error.NetworkUnreachable => error.ConnectTimedOut,
+        error.UnknownHostName, error.NameServerFailure, error.NoAddressReturned => error.HostNotFound,
+        else => error.ConnectFailed,
+    };
     // 15s timeouts keep a hung broker from stalling the CLI forever.
     const tv = std.posix.timeval{ .sec = 15, .usec = 0 };
     std.posix.setsockopt(s.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
@@ -70,7 +78,10 @@ pub fn connect(
     port: u16,
     ca: ?*std.crypto.Certificate.Bundle,
 ) TransportError!*Conn {
-    const stream = tcpConnect(io, host, port) catch return error.ConnectFailed;
+    const stream = tcpConnect(io, host, port) catch |err| return switch (err) {
+        error.ConnectionRefused, error.ConnectTimedOut, error.HostNotFound => err,
+        else => error.ConnectFailed,
+    };
     errdefer stream.close(io);
 
     const c = try alloc.create(Conn);

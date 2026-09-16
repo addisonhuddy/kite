@@ -7,6 +7,7 @@ const protocol = @import("protocol.zig");
 const transport = @import("transport.zig");
 const scram = @import("scram.zig");
 const term = @import("term.zig");
+const stats = @import("stats.zig");
 
 const Encoder = protocol.Encoder;
 const Decoder = protocol.Decoder;
@@ -55,7 +56,11 @@ pub const Client = struct {
     producer_epoch: i16 = -1,
     producer_inited: bool = false,
     last_offset: ?i64 = null,
+    /// Highest acked offset per partition (sorted by pidx), for the summary.
+    last_offsets: std.ArrayListUnmanaged(PartOffset) = .empty,
     acked_records: u64 = 0,
+    produce_requests: u64 = 0,
+    produce_retries: u64 = 0,
     /// pidx -> next base sequence number (idempotent produce only).
     seqs: std.AutoHashMapUnmanaged(i32, i32),
 
@@ -101,6 +106,7 @@ pub const Client = struct {
         }
         c.outstanding.deinit(c.alloc);
         c.seqs.deinit(c.alloc);
+        c.last_offsets.deinit(c.alloc);
         if (c.ca) |*b| b.deinit(c.alloc);
     }
 
@@ -109,6 +115,33 @@ pub const Client = struct {
     }
     pub fn errDetail(c: *const Client) []const u8 {
         return std.mem.sliceTo(&c.err_ctx, 0);
+    }
+
+    pub const PartOffset = struct { pidx: i32, offset: i64 };
+
+    fn noteLastOffset(c: *Client, pidx: i32, off: i64) !void {
+        var i: usize = 0;
+        while (i < c.last_offsets.items.len and c.last_offsets.items[i].pidx < pidx) i += 1;
+        if (i < c.last_offsets.items.len and c.last_offsets.items[i].pidx == pidx) {
+            if (off > c.last_offsets.items[i].offset) c.last_offsets.items[i].offset = off;
+            return;
+        }
+        try c.last_offsets.insert(c.alloc, i, .{ .pidx = pidx, .offset = off });
+    }
+
+    fn produceErr(c: *Client, topic: []const u8, pidx: i32, code: protocol.ErrorCode, batch_len: usize) void {
+        var size_buf: [32]u8 = undefined;
+        switch (code) {
+            .message_too_large => c.setErr(
+                "produce to {s}[{d}]: batch of {s} exceeds the broker's max.message.bytes (split the input or raise the topic/broker limit)",
+                .{ topic, pidx, stats.fmtBytes(batch_len, &size_buf) },
+            ),
+            .topic_authorization_failed => c.setErr(
+                "produce to {s}: not authorized to write (check ACLs for this principal)",
+                .{topic},
+            ),
+            else => c.setErr("produce to {s}[{d}]: {s}", .{ topic, pidx, code.name() }),
+        }
     }
 
     /// Verbose diagnostic to stderr, gated on `cfg.verbose` (-v).
@@ -158,7 +191,16 @@ pub const Client = struct {
                     .{ host, port },
                 ),
                 error.TlsFailed => c.setErr("TLS handshake failed for {s}:{d}", .{ host, port }),
-                else => c.setErr("connect {s}:{d}: {s}", .{ host, port, @errorName(err) }),
+                error.ConnectionRefused => c.setErr(
+                    "connection refused by {s}:{d} (is a broker listening there?)",
+                    .{ host, port },
+                ),
+                error.ConnectTimedOut => c.setErr(
+                    "cannot reach {s}:{d} (timed out or unreachable; check network/firewall)",
+                    .{ host, port },
+                ),
+                error.HostNotFound => c.setErr("cannot resolve host '{s}'", .{host}),
+                else => c.setErr("cannot connect to {s}:{d}", .{ host, port }),
             }
             return error.AllBootstrapFailed;
         };
@@ -750,7 +792,7 @@ pub const Client = struct {
                             else => if (code.retriable()) {
                                 try retry.append(c.alloc, .{ .pidx = pi, .batch = b, .count = count });
                             } else {
-                                c.setErr("produce to {s}[{d}]: {s}", .{ topic, pi, code.name() });
+                                c.produceErr(topic, pi, code, b.len);
                                 return error.ProduceFailed;
                             },
                         }
@@ -769,6 +811,7 @@ pub const Client = struct {
         var attempt: usize = 0;
         var backoff_ms: u64 = 100;
         while (retry.items.len > 0 and attempt < max_attempts) : (attempt += 1) {
+            c.produce_retries += retry.items.len;
             c.vlog("retrying {d} partition(s) — attempt {d}/{d}, backoff {d}ms", .{ retry.items.len, attempt + 1, max_attempts, backoff_ms });
             c.sleep(backoff_ms);
             backoff_ms = @min(backoff_ms * 2, 3000);
@@ -807,7 +850,7 @@ pub const Client = struct {
                         c.releaseConn(pp.pidx);
                         try retry.append(c.alloc, pp);
                     } else {
-                        c.setErr("produce to {s}[{d}]: {s}", .{ topic, pp.pidx, code.name() });
+                        c.produceErr(topic, pp.pidx, code, pp.batch.len);
                         return error.ProduceFailed;
                     },
                 }
@@ -871,6 +914,7 @@ pub const Client = struct {
         pidx: []const i32,
         batches: []const []const u8,
     ) !i32 {
+        c.produce_requests += 1;
         var parts: std.ArrayListUnmanaged([]const u8) = .empty;
         defer parts.deinit(c.alloc);
         // Small per-partition prefix/tail encoders kept alive until the send
@@ -956,6 +1000,7 @@ pub const Client = struct {
                     if (count > 0) {
                         const last = base_offset + @as(i64, count) - 1;
                         if (c.last_offset == null or last > c.last_offset.?) c.last_offset = last;
+                        try c.noteLastOffset(pidx, last);
                         c.acked_records += count;
                     }
                 }

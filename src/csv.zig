@@ -2,6 +2,7 @@
 //! not end the row), `""` unescaping, and JSON object emission.
 
 const std = @import("std");
+const json = @import("json.zig");
 
 /// Read one logical record's raw bytes (no trailing newline). Returns null at
 /// EOF. The returned slice is arena-owned.
@@ -139,27 +140,11 @@ pub fn rowJson(w: *std.Io.Writer, cols: []const []const u8, fields: []const []co
     for (fields, 0..) |f, n| {
         if (n > 0) try w.writeByte(',');
         const name = if (n < cols.len) cols[n] else "";
-        try writeJsonString(w, name);
+        try json.writeString(w, name);
         try w.writeByte(':');
-        try writeJsonString(w, f);
+        try json.writeString(w, f);
     }
     try w.writeByte('}');
-}
-
-fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
-    try w.writeByte('"');
-    for (s) |c| {
-        switch (c) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            0...8, 11, 12, 14...31 => try w.print("\\u{x:0>4}", .{c}),
-            else => try w.writeByte(c),
-        }
-    }
-    try w.writeByte('"');
 }
 
 /// Strip a UTF-8 BOM from the first row if present.

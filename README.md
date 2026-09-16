@@ -1,12 +1,14 @@
 # kite
 
-**The Kafka CLI for agents and shell pipelines.** One ~560 KB binary,
+**The Kafka CLI for agents and shell pipelines.** One ~585 KB binary,
 no JVM, no runtime, no daemon. stdin in, stdout out, non-zero exit on failure.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh
+export KITE_BOOTSTRAP_SERVERS=localhost:9092
 printf 'hello\n' | kite events                 # produce
-kite -c --from-beginning -t 3000 events        # consume, stop after 3 s idle
+kite -c -B --idle 3s events                    # consume, stop after 3 s idle
+kite -c -B --json events | jq -c .value        # with partition/offset metadata
 ```
 
 ## Contents
@@ -31,13 +33,13 @@ write Kafka, kite is the shortest path:
 
 | | kite | `kafka-console-*.sh` | kcat | Python/Node client |
 | --- | --- | --- | --- | --- |
-| Install | one `curl \| sh`, ~560 KB binary | JDK + 100 MB distribution | package manager + librdkafka | interpreter + package + native lib |
+| Install | one `curl \| sh`, ~585 KB binary | JDK + 100 MB distribution | package manager + librdkafka | interpreter + package + native lib |
 | Startup | milliseconds, no VM warm-up | seconds (JVM) | fast | interpreter start |
 | Interface | stdin/stdout lines, flags, exit codes | verbose Java flags, log noise on stdout | flags | write code first |
 | Dependencies | none (Zig, no shared libraries) | Java | librdkafka, OpenSSL | many |
 | Surface area | produce, consume, install. That's it. | dozens of tools | large flag set | full API |
 
-- **Small.** The stripped binary is about 560 KB on Linux and 535 KB on macOS
+- **Small.** The stripped binary is about 585 KB on Linux and 560 KB on macOS
   arm64, gated in CI below 600,000 bytes. It fits in a container layer, a
   sandbox, or a tool call without anyone noticing.
 - **Unix philosophy.** kite does one thing per invocation and composes with
@@ -67,10 +69,12 @@ groups, or commits offsets. Point it at an existing topic and move data.
 curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh
 ```
 
-The script downloads the `v0.1.0` release binary for your platform, copies it
-to `~/.local/bin` (override with `KITE_INSTALL_DIR`), and offers to add that
-directory to your `PATH`. Pass `-s -- --yes` to skip the prompt in
-non-interactive shells:
+The script downloads the `v0.1.0` release binary for your platform (override
+with `KITE_VERSION=vX.Y.Z`), copies it to `~/.local/bin` (override with
+`KITE_INSTALL_DIR`), and offers to add that directory to your `PATH`. If the
+release asset is missing the script says so and points at the releases page;
+until a release is published, build from source instead. Pass `-s -- --yes`
+to skip the prompt in non-interactive shells:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh -s -- --yes
@@ -102,11 +106,11 @@ Cross-compile with, for example, `zig build -Dtarget=aarch64-macos` or
 Prerequisites: a reachable Kafka 4.0+ KRaft broker, an existing topic, and
 permission to read and write it.
 
-Copy a configuration template and edit the broker address (and credentials if
-needed):
+Point kite at a broker with a flag, an environment variable, or a properties
+file (see [Configuration](#configuration)):
 
 ```sh
-cp examples/config/plaintext.properties kite.properties
+export KITE_BOOTSTRAP_SERVERS=localhost:9092     # or: kite -b localhost:9092 ...
 ```
 
 Produce the checked-in sample data:
@@ -116,13 +120,17 @@ kite events < examples/data/lines.txt
 ```
 
 ```text
-5 record(s) produced to 'events'
+5 record(s) produced to 'events' across 3 of 3 partition(s)
+85 B in 0.01s (620 msg/s, 10.4 KiB/s), last offsets p0=1, p1=1, p2=0
+3 produce request(s), 0 retried batch(es), 2.1ms avg per request, 3 connection(s)
 ```
+
+The summary goes to stderr; stdout stays empty so `kite` can sit in a pipe.
 
 Read from the beginning and stop after 3 seconds without a record:
 
 ```sh
-kite -c --from-beginning -t 3000 events
+kite -c -B --idle 3s events
 ```
 
 ```text
@@ -130,6 +138,10 @@ line one
 line two
 ...
 ```
+
+While it runs on a terminal, a status line on stderr shows the topic, record
+count, rates, and elapsed time (or `waiting for records ... Ctrl-C to stop`
+when nothing has arrived yet); it is replaced by a final summary at exit.
 
 ## Command reference
 
@@ -146,14 +158,18 @@ kite --version                Print the version.
 
 | Mode | Option | Meaning |
 | --- | --- | --- |
+| produce, consume | `-b`, `--bootstrap HOSTS` | Comma-separated `host:port` brokers (overrides env and file). |
+| produce, consume | `--config FILE` | Read this properties file instead of searching. |
+| produce, consume | `--json` | Produce: read one JSON object per line. Consume: write one per record. |
 | produce | `-H 'name: value'` | Add a header to every record (repeatable). |
 | produce | `--csv` | Read RFC 4180 CSV; each row becomes a JSON object value. |
 | produce | `--key COL` | Use CSV column `COL` as the record key (requires `--csv`). |
-| consume | `--from-beginning` | Start at the earliest offset. |
-| consume | `--offset N` | Start at offset N in every selected partition. |
+| consume | `-B`, `--from-beginning` | Start at the earliest offset. |
+| consume | `--offset N` | Start at offset N in every selected partition; errors if N is out of range. |
 | consume | `--partition P` | Read one partition only. |
-| consume | `-n MAX` | Stop after MAX records. |
-| consume | `-t IDLE_MS` | Stop after IDLE_MS without a record. |
+| consume | `-n`, `--max MAX` | Stop after MAX records. |
+| consume | `-t`, `--idle DUR` | Stop after DUR without a record (`3s`, `500ms`, `1m`; bare number = ms). |
+| consume | `-f`, `--follow` | Never stop on idle, even when stdout is a pipe. |
 | install | `--dir DIR` | Install to DIR (default `$KITE_INSTALL_DIR` or `~/.local/bin`). |
 | install | `-y`, `--yes` | Add the install directory to `PATH` without prompting. |
 | produce, consume | `-v`, `--verbose` | Connection, retry, and fetch diagnostics on stderr. |
@@ -179,16 +195,22 @@ kite --csv events < examples/data/users.csv
 kite --csv --key user_id events < examples/data/events.csv
 # stream a log as it grows
 tail -f app.log | kite logs
-# follow new records (Ctrl-C to stop)
+# follow new records on a terminal (Ctrl-C to stop; summary printed)
 kite -c events
+# follow into a pipe (without -f a piped read stops after 5 s idle)
+kite -c -f events | grep ERROR
 # read one partition from an offset, at most 10 records
-kite -c --partition 0 --offset 42 -n 10 -t 3000 events
-# snapshot a topic into a file for an agent to read
-kite -c --from-beginning -t 5000 events > events.txt
-# copy a topic
-kite -c --from-beginning -t 5000 src | kite dst
+kite -c --partition 0 --offset 42 -n 10 --idle 3s events
+# snapshot a topic into a file for an agent to read (stops after 5 s idle)
+kite -c -B events > events.txt
+# structured records with partition/offset/timestamp/headers
+kite -c -B --json events | jq -c 'select(.partition == 0) | .value'
+# copy a topic, preserving keys and headers
+kite -c -B --json src | kite --json dst
 # transform in flight
-kite -c --from-beginning -t 5000 raw | jq -c '{id, ts}' | kite clean
+kite -c -B raw | jq -c '{id, ts}' | kite clean
+# one-off broker without a config file
+kite -b broker1:9092,broker2:9092 -c -B -n 5 events
 ```
 
 The consumer output is in the same textual shape accepted by the producer,
@@ -196,16 +218,28 @@ subject to the format boundaries described below.
 
 ## Consuming
 
-By default, `kite -c` starts at the latest offset, selects all partitions, and
-follows new records indefinitely. `--from-beginning` starts at the earliest
-available offset; `--offset N` starts at offset N in every selected partition.
-`--partition P` selects one partition.
+By default, `kite -c` starts at the latest offset and selects all partitions.
+`-B`/`--from-beginning` starts at the earliest available offset; `--offset N`
+starts at offset N in every selected partition and fails with the valid range
+(`valid offsets are 0..334 (next offset 335)`) if N is outside it, rather
+than silently replaying from the beginning. `--partition P` selects one
+partition.
 
-`-n MAX` stops after MAX records. Without `-t`, a count-limited read may wait
-indefinitely for enough records. `-t IDLE_MS` stops after that many
-milliseconds without a record. An idle-bounded read is not a guarantee of a
-complete topic snapshot. For scripted use, always pass `-t` (and usually
-`-n`) so the process terminates.
+When the read stops depends on stdout:
+
+- **Terminal:** follow new records until Ctrl-C. Ctrl-C stops cleanly, prints
+  the summary, and exits 130.
+- **Pipe or file, no bound given:** stop after 5 s without a record, so
+  scripts and agents never hang by accident. The reason is stated in the
+  summary (`... (idle timeout)`).
+- `-n`/`--max MAX` stops after MAX records; `-t`/`--idle DUR` stops after DUR
+  without a record (`3s`, `500ms`, `1m`, or a bare number of milliseconds);
+  `-f`/`--follow` never stops on idle. `--follow` and `--idle` are mutually
+  exclusive.
+
+An idle-bounded read is not a guarantee of a complete topic snapshot. If the
+downstream process closes the pipe (`kite -c -f events | head`), kite exits
+quietly with status 0 instead of dying from SIGPIPE.
 
 ## Input/output format and CSV
 
@@ -230,25 +264,53 @@ record key while retaining it in the JSON value. Quoted commas, escaped
 quotes, embedded newlines, CRLF endings, and a UTF-8 BOM are supported; all
 JSON fields are strings.
 
+### JSON records (`--json`)
+
+`kite -c --json` writes one object per record with full metadata, so bytes
+containing TABs or newlines and null-vs-empty distinctions survive:
+
+```json
+{"topic":"events","partition":1,"offset":7,"timestamp":1789579403024,"key":null,"headers":[{"key":"h","value":"v"}],"value":"line one"}
+```
+
+`kite --json TOPIC` reads the same shape (only `value` is required):
+
+```json
+{"key":"user-1","value":{"a":1},"headers":{"source":"import"}}
+```
+
+A string `value` is sent as its decoded bytes; any other JSON value (object,
+array, number, boolean) is sent verbatim, so JSON payloads can be embedded
+without double encoding. `headers` may be an object or an array of
+`{"key","value"}`; `-H` headers are added to every record. Malformed lines
+fail with `kite: line N: ...`. `--json` and `--csv` are mutually exclusive.
+
 ## Configuration
 
-Kite reads the first `kite.properties` found in this order:
+Settings are resolved in this order, highest precedence first:
 
-1. `./kite.properties`
-2. `$XDG_CONFIG_HOME/kite/kite.properties`
-3. `~/.config/kite/kite.properties`
+1. Flags: `-b`/`--bootstrap HOSTS`.
+2. `KITE_*` environment variables (below).
+3. A properties file: `--config FILE`, else `$KITE_CONFIG`, else the first of
+   `./kite.properties`, `$XDG_CONFIG_HOME/kite/kite.properties`,
+   `~/.config/kite/kite.properties`.
+
+A file is optional when `-b` or `KITE_BOOTSTRAP_SERVERS` supplies the
+brokers. With none of these, kite fails with a message listing all three
+ways to configure it. A `--config`/`KITE_CONFIG` path that does not exist is
+an error rather than a silent fallback. `-v` prints which sources were used.
 
 The parser supports a `key=value` subset of Java properties. Blank lines and
 `#`/`!` comments are accepted; unknown keys are ignored with a warning.
 
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `bootstrap.servers` | required | Comma-separated `host:port` brokers. |
-| `security.protocol` | `PLAINTEXT` | `PLAINTEXT`, `SSL`, `SASL_SSL`, or `SASL_PLAINTEXT`. |
-| `sasl.mechanism` | none | `PLAIN`, `SCRAM-SHA-256`, or `SCRAM-SHA-512`. |
-| `sasl.username` | none | Required for SASL. |
-| `sasl.password` | none | Required for SASL. |
-| `ssl.truststore.location` | system trust store | Optional PEM CA bundle for TLS. |
+| Key | Environment variable | Default | Meaning |
+| --- | --- | --- | --- |
+| `bootstrap.servers` | `KITE_BOOTSTRAP_SERVERS` | required | Comma-separated `host:port` brokers. |
+| `security.protocol` | `KITE_SECURITY_PROTOCOL` | `PLAINTEXT` | `PLAINTEXT`, `SSL`, `SASL_SSL`, or `SASL_PLAINTEXT`. |
+| `sasl.mechanism` | `KITE_SASL_MECHANISM` | none | `PLAIN`, `SCRAM-SHA-256`, or `SCRAM-SHA-512`. |
+| `sasl.username` | `KITE_SASL_USERNAME` | none | Required for SASL. |
+| `sasl.password` | `KITE_SASL_PASSWORD` | none | Required for SASL. |
+| `ssl.truststore.location` | `KITE_SSL_TRUSTSTORE_LOCATION` | system trust store | Optional PEM CA bundle for TLS. |
 | `batch.size` | `1048576` | Per-partition producer buffer cap in bytes. |
 | `linger.ms` | `50` | Producer flush delay when stdin stalls. |
 | `fetch.max.bytes` | `8388608` | Maximum bytes requested per fetch. |
@@ -261,41 +323,59 @@ processing.
 
 ## Output streams and exit codes
 
-- Producer: success summary on stdout, diagnostics on stderr.
-- Consumer: records on stdout; diagnostics, including a bounded-run summary,
-  on stderr.
+- Producer: stdout is never written; the summary and diagnostics go to
+  stderr.
+- Consumer: records on stdout; diagnostics and the end-of-run summary on
+  stderr.
 - Exit 0 on success, 1 on any error (usage, configuration, connection,
-  broker). Usage errors print `kite: MESSAGE` followed by a one-line
-  `Try 'kite --help'` hint.
+  broker), 130 when a consume is stopped with Ctrl-C. Usage errors print
+  `kite: MESSAGE` followed by a one-line `Try 'kite --help'` hint.
 
-While stderr is a terminal, producer and bounded consumer runs also show a
-live one-line rate and byte statistic on stderr. The live line is disabled by
-`-v` / `--verbose`; final summaries include a second detail line with elapsed
-time, message rate, byte rate, and the last offset when available. Terminal
-colors can be disabled with a non-empty `NO_COLOR`, forced with
-`KITE_COLOR=always`, or disabled explicitly with `KITE_COLOR=never`. Nothing
-is colored when the stream is a pipe.
+Every run ends with a summary on stderr. Produce reports the record count,
+partitions used, bytes, elapsed time, message and byte rates, the last
+acknowledged offset per partition (`p0=333, p1=332`), the number of produce
+requests and retried batches, average time per request, and connections
+used. Consume reports the record count and why it stopped (`(idle timeout)`,
+`(interrupted)`), plus the same throughput line and per-partition offsets.
+
+While stderr is a terminal, a live one-line status on stderr shows the topic,
+count, message rate, byte rate, current offset, and elapsed time; a consumer
+that has not yet received anything shows `waiting for records ... Ctrl-C to
+stop` with a hint such as `new records only; use -B for history`. The live
+line is disabled by `-v` / `--verbose`. Terminal colors can be disabled with
+a non-empty `NO_COLOR`, forced with `KITE_COLOR=always`, or disabled
+explicitly with `KITE_COLOR=never`. Nothing is colored when the stream is a
+pipe.
 
 - `-v` / `--verbose` enables connection, retry, and fetch diagnostics.
 - `KITE_DEBUG=1` enables frame and TLS diagnostics.
 - `KITE_TIME=1` prints producer timing totals and connection count.
 
-The default stripped binary is about 560 KB on Linux (about 535 KB on macOS
+The default stripped binary is about 585 KB on Linux (about 560 KB on macOS
 arm64) and must remain below 600,000 bytes.
 `scripts/pack.sh` can produce an optional UPX/LZMA artifact of about 200 KiB.
 
 ## Troubleshooting
 
-- **No configuration:** copy a template to one of the search-path locations,
-  edit `bootstrap.servers`, and retry with `-v`.
+- **`no broker configured`:** pass `-b HOST:PORT`, set
+  `KITE_BOOTSTRAP_SERVERS`, or copy a template to one of the search-path
+  locations and edit `bootstrap.servers`. `-v` prints which sources were
+  used.
 - **Topic does not exist:** create the topic with your Kafka administration
-  tooling; kite never creates topics.
-- **Bootstrap unreachable:** check DNS, firewall rules, host/port, and run
-  with `-v` for connection diagnostics.
+  tooling; kite never creates topics. On some hosted clusters a missing topic
+  surfaces as an authorization error instead.
+- **`connection refused by HOST:PORT` / `cannot resolve host`:** check the
+  address, DNS, and firewall rules; run with `-v` for connection diagnostics.
 - **Authentication or TLS failure:** check the SASL settings and CA bundle;
   use `KITE_DEBUG=1` for handshake details.
-- **Consumer is waiting:** the default starts at latest. Use
-  `--from-beginning`, `--offset`, or a bounded `-t` as appropriate.
+- **`not authorized to write/read`:** the principal lacks ACLs for that
+  operation on the topic.
+- **`batch of N exceeds the broker's max.message.bytes`:** split the input or
+  raise the topic/broker limit.
+- **`offset N is out of range`:** the message shows the valid range and the
+  next offset; use `-B` for the earliest or omit `--offset` for the latest.
+- **Consumer shows `waiting for records`:** the default starts at latest. Use
+  `-B`, `--offset`, or a bounded `--idle` as appropriate.
 - **`kite consume` produced to a topic named `consume`:** modes are flags, not
   subcommands. Use `kite -c TOPIC`.
 
