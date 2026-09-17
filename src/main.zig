@@ -160,8 +160,9 @@ pub fn main(init: std.process.Init) !void {
     const static_headers = produce.headers;
     const verbose = produce.common.verbose;
     const quiet = produce.common.quiet;
-    const csv_mode = produce.csv;
-    const json_mode = produce.common.json;
+    const csv_mode = produce.isCsv();
+    const json_mode = produce.common.format == .json;
+    const value_mode = produce.common.format == .value;
     const csv_key_col = produce.key_col;
 
     var cfg = loadConfig(init, alloc, produce.common);
@@ -234,6 +235,8 @@ pub fn main(init: std.process.Init) !void {
                 if (std.mem.trim(u8, owned, " \t").len == 0) continue;
                 break :blk jsonRecord(alloc, owned, static_headers, total + 1);
             }
+            if (value_mode)
+                break :blk protocol.Record{ .value = owned, .headers = static_headers };
             break :blk parseLine(alloc, owned, static_headers, total + 1);
         };
         t_read += timer.lap();
@@ -516,7 +519,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
         .partition = consume.partition,
         .max_records = consume.max_records,
         .idle_ms = idle_ms,
-        .json = consume.common.json,
+        .format = consume.common.format,
         .stats = &stats,
         .stop = &interrupted,
         .sink_closed = stdoutClosed,
