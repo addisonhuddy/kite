@@ -324,7 +324,8 @@ kite --show-config --json | jq -r '.settings["bootstrap.servers"].value'
 Every run ends with a summary on stderr. Produce reports the record count,
 partitions used, bytes, elapsed time, message and byte rates, the last
 acknowledged offset per partition (`p0=333, p1=332`), the number of produce
-requests and retried batches, average time per request, and connections
+requests and retried batches, average send-to-ack latency per request
+attempt (excludes waiting on stdin and connection setup), and connections
 used. Consume reports the record count and why it stopped (`(idle timeout)`,
 `(interrupted)`), plus the same throughput line and per-partition offsets.
 

@@ -72,6 +72,12 @@ pub const Client = struct {
     acked_records: u64 = 0,
     produce_requests: u64 = 0,
     produce_retries: u64 = 0,
+    /// Send-complete→response-received time for ProduceRequests. Per-attempt:
+    /// each retried request is timed separately; failed sends/receives are
+    /// excluded; pipelined requests include time queued behind earlier
+    /// responses on the same connection.
+    produce_ack_ns: u64 = 0,
+    produce_acked: u64 = 0,
     /// pidx -> next base sequence number (idempotent produce only).
     seqs: std.AutoHashMapUnmanaged(i32, i32),
 
@@ -621,6 +627,8 @@ pub const Client = struct {
         batches: [][]const u8,
         counts: []u32,
         bytes: usize,
+        /// When the send completed; valid only when corr >= 0.
+        sent: std.Io.Timestamp = undefined,
         encoders: std.ArrayListUnmanaged(Encoder) = .empty,
     };
 
@@ -732,6 +740,7 @@ pub const Client = struct {
                     try c.outstanding.append(c.alloc, o);
                     continue;
                 };
+                o.sent = std.Io.Timestamp.now(c.io, .awake);
             } else |_| {}
             try c.outstanding.append(c.alloc, o);
         }
@@ -796,6 +805,7 @@ pub const Client = struct {
                 var codes = std.AutoHashMapUnmanaged(i32, protocol.ErrorCode).empty;
                 defer codes.deinit(c.alloc);
                 if (c.produceRecv(o.conn, o.corr, &codes, o, null)) |_| {
+                    c.recordAck(o.sent);
                     for (o.pidx, o.batches, o.counts) |pi, b, count| {
                         const code = codes.get(pi) orelse .none;
                         switch (code) {
@@ -848,6 +858,7 @@ pub const Client = struct {
                     try retry.append(c.alloc, pp);
                     continue;
                 };
+                const sent = std.Io.Timestamp.now(c.io, .awake);
                 var codes = std.AutoHashMapUnmanaged(i32, protocol.ErrorCode).empty;
                 defer codes.deinit(c.alloc);
                 c.produceRecv(conn, corr, &codes, null, pp.count) catch {
@@ -856,6 +867,7 @@ pub const Client = struct {
                     try retry.append(c.alloc, pp);
                     continue;
                 };
+                c.recordAck(sent);
                 const code = codes.get(pp.pidx) orelse .none;
                 switch (code) {
                     .none, .duplicate_sequence_number => c.releaseConn(pp.pidx),
@@ -873,6 +885,19 @@ pub const Client = struct {
             c.setErr("produce to {s}: giving up after {d} attempts", .{ topic, max_attempts });
             return error.ProduceFailed;
         }
+    }
+
+    /// Mean send-complete→response time across acked ProduceRequests, or
+    /// null when nothing received a response.
+    pub fn avgAckMs(c: *const Client) ?f64 {
+        if (c.produce_acked == 0) return null;
+        return @as(f64, @floatFromInt(c.produce_ack_ns)) /
+            @as(f64, @floatFromInt(c.produce_acked)) / 1e6;
+    }
+
+    fn recordAck(c: *Client, sent: std.Io.Timestamp) void {
+        c.produce_ack_ns += ackNanos(sent, std.Io.Timestamp.now(c.io, .awake));
+        c.produce_acked += 1;
     }
 
     pub fn partitionLeader(c: *Client, pidx: i32) ?i32 {
@@ -1030,6 +1055,25 @@ pub const Client = struct {
         try d.tagBuffer();
     }
 };
+
+fn ackNanos(sent: std.Io.Timestamp, now: std.Io.Timestamp) u64 {
+    return @intCast(@max(0, sent.durationTo(now).toNanoseconds()));
+}
+
+test "avgAckMs averages send-to-ack nanoseconds" {
+    var c: Client = undefined;
+    c.produce_acked = 0;
+    c.produce_ack_ns = 0;
+    try std.testing.expectEqual(@as(?f64, null), c.avgAckMs());
+    c.produce_acked = 2;
+    c.produce_ack_ns = 3_000_000;
+    try std.testing.expectEqual(@as(?f64, 1.5), c.avgAckMs());
+
+    const sent: std.Io.Timestamp = .{ .nanoseconds = 1_000 };
+    const now: std.Io.Timestamp = .{ .nanoseconds = 2_500 };
+    try std.testing.expectEqual(@as(u64, 1_500), ackNanos(sent, now));
+    try std.testing.expectEqual(@as(u64, 0), ackNanos(now, sent));
+}
 
 test "bootstrap server parser rejects invalid explicit ports" {
     const defaulted = try parseBootstrapServer("localhost");
