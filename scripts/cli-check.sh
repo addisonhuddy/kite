@@ -137,6 +137,8 @@ run_case produce-no-config 1 empty "no broker configured. Pass -b HOST:PORT, set
 run_case consume-no-config 1 empty "no broker configured" -c demo
 run_case config-file-missing 1 empty "kite: config file 'nope.properties' not found" --config nope.properties demo
 run_case version 0 nonempty empty --version
+run_case version-extra 1 empty "unknown option '--version'" --version --bogus
+run_case mode-looking-option-value 1 empty "requires --csv" --key -c demo
 run_case mode-conflict 1 empty "cannot be combined" -c -i demo
 run_case topic-named-consume 1 empty "no broker configured" consume
 run_case flag-after-topic 1 empty "no broker configured" events -c
@@ -144,6 +146,7 @@ run_case flag-after-topic 1 empty "no broker configured" events -c
 # -b / BOOTSTRAP_SERVERS bypass the properties-file search entirely and
 # reach the connect step (which fails fast against a closed port).
 run_case bootstrap-flag 1 empty "connection refused by 127.0.0.1:1" -b 127.0.0.1:1 demo
+run_case bootstrap-invalid-port 1 empty "invalid bootstrap server '127.0.0.1:notaport'" -b 127.0.0.1:notaport demo
 set +e
 (cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" BOOTSTRAP_SERVERS=127.0.0.1:1 "$BIN" -c demo >"$TMP/bootstrap-env.out" 2>"$TMP/bootstrap-env.err")
 status=$?
@@ -156,6 +159,15 @@ echo "PASS bootstrap-env"
 printf 'bootstrap.servers=127.0.0.1:2\n' >"$TMP/work/kite.properties"
 run_case flag-over-file 1 empty "connection refused by 127.0.0.1:1" -b 127.0.0.1:1 demo
 run_case file-used 1 empty "connection refused by 127.0.0.1:2" demo
+printf 'security.protocol=BAD\nbootstrap.servers=127.0.0.1:2\n' >"$TMP/work/kite.properties"
+set +e
+(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" SECURITY_PROTOCOL=PLAINTEXT "$BIN" demo >"$TMP/env-over-invalid-file.out" 2>"$TMP/env-over-invalid-file.err")
+status=$?
+set -e
+[ "$status" -eq 1 ] && grep -Fq "connection refused by 127.0.0.1:2" "$TMP/env-over-invalid-file.err" || {
+    echo "FAIL env-over-invalid-file"; cat "$TMP/env-over-invalid-file.err"; exit 1;
+}
+echo "PASS env-over-invalid-file"
 printf 'security.protocol=PLAINTEXT\n' >"$TMP/work/kite.properties"
 run_case file-without-bootstrap 1 empty "has no bootstrap.servers; add it, or pass -b HOST:PORT / set BOOTSTRAP_SERVERS" demo
 rm "$TMP/work/kite.properties"
