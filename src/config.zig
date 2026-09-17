@@ -55,7 +55,86 @@ pub const Source = struct {
     requested: ?[]const u8 = null,
     env: bool = false,
     flags: bool = false,
+    /// Per-key provenance for --show-config.
+    origins: std.EnumArray(Key, Origin) = .initFill(.default),
 };
+
+pub const Key = enum {
+    bootstrap_servers,
+    security_protocol,
+    sasl_mechanism,
+    sasl_username,
+    sasl_password,
+    ssl_truststore_location,
+    linger_ms,
+    batch_size,
+    fetch_max_bytes,
+    fetch_max_wait_ms,
+    enable_idempotence,
+};
+
+pub const Origin = enum { default, file, env, flag };
+
+pub const key_names = std.EnumArray(Key, []const u8).init(.{
+    .bootstrap_servers = "bootstrap.servers",
+    .security_protocol = "security.protocol",
+    .sasl_mechanism = "sasl.mechanism",
+    .sasl_username = "sasl.username",
+    .sasl_password = "sasl.password",
+    .ssl_truststore_location = "ssl.truststore.location",
+    .linger_ms = "linger.ms",
+    .batch_size = "batch.size",
+    .fetch_max_bytes = "fetch.max.bytes",
+    .fetch_max_wait_ms = "fetch.max.wait.ms",
+    .enable_idempotence = "enable.idempotence",
+});
+
+fn keyFromName(name: []const u8) ?Key {
+    for (std.enums.values(Key)) |k|
+        if (std.mem.eql(u8, name, key_names.get(k))) return k;
+    return null;
+}
+
+/// Effective value of `key` as display text; empty when an optional is unset.
+pub fn valueString(cfg: *const Config, alloc: std.mem.Allocator, key: Key) ![]const u8 {
+    switch (key) {
+        .bootstrap_servers => {
+            var aw = std.Io.Writer.Allocating.init(alloc);
+            for (cfg.bootstrap_servers, 0..) |s, i| {
+                if (i > 0) try aw.writer.writeByte(',');
+                try aw.writer.writeAll(s);
+            }
+            return aw.toOwnedSlice();
+        },
+        .security_protocol => return protoName(cfg.security_protocol),
+        .sasl_mechanism => return if (cfg.sasl_mechanism) |m| mechName(m) else "",
+        .sasl_username => return cfg.sasl_username orelse "",
+        .sasl_password => return if (cfg.sasl_password != null) "********" else "",
+        .ssl_truststore_location => return cfg.ssl_truststore_location orelse "",
+        .linger_ms => return fmtInt(alloc, cfg.linger_ms),
+        .batch_size => return fmtInt(alloc, cfg.batch_size),
+        .fetch_max_bytes => return fmtInt(alloc, cfg.fetch_max_bytes),
+        .fetch_max_wait_ms => return fmtInt(alloc, cfg.fetch_max_wait_ms),
+        .enable_idempotence => return if (cfg.enable_idempotence) "true" else "false",
+    }
+}
+
+fn fmtInt(alloc: std.mem.Allocator, v: u64) ![]const u8 {
+    return std.fmt.allocPrint(alloc, "{d}", .{v});
+}
+
+pub fn isSecret(key: Key) bool {
+    return key == .sasl_password;
+}
+
+fn protoName(p: SecurityProtocol) []const u8 {
+    return switch (p) {
+        .plaintext => "PLAINTEXT",
+        .ssl => "SSL",
+        .sasl_ssl => "SASL_SSL",
+        .sasl_plaintext => "SASL_PLAINTEXT",
+    };
+}
 
 fn warn(comptime fmt: []const u8, args: anytype) void {
     if (@import("builtin").is_test) return; // stderr writes corrupt the 0.16 test-runner IPC
@@ -173,7 +252,7 @@ pub fn load(
             const key = e.key_ptr.*;
             if (overrides.bootstrap != null and std.mem.eql(u8, key, "bootstrap.servers")) continue;
             if (overriddenByEnv(env, key)) continue;
-            try applyKey(&cfg, alloc, key, e.value_ptr.*);
+            try applyKey(&cfg, alloc, source, .file, key, e.value_ptr.*);
         }
     }
 
@@ -181,12 +260,12 @@ pub fn load(
         const val = env.get(pair[0]) orelse continue;
         if (val.len == 0) continue;
         source.env = true;
-        try applyKey(&cfg, alloc, pair[1], val);
+        try applyKey(&cfg, alloc, source, .env, pair[1], val);
     }
 
     if (overrides.bootstrap) |b| {
         source.flags = true;
-        try applyKey(&cfg, alloc, "bootstrap.servers", b);
+        try applyKey(&cfg, alloc, source, .flag, "bootstrap.servers", b);
     }
 
     if (cfg.bootstrap_servers.len == 0) {
@@ -207,69 +286,72 @@ pub fn load(
     return cfg;
 }
 
-fn applyKey(cfg: *Config, alloc: std.mem.Allocator, key: []const u8, val: []const u8) LoadError!void {
-    if (std.mem.eql(u8, key, "bootstrap.servers")) {
-        var servers: std.ArrayListUnmanaged([]const u8) = .empty;
-        var sit = std.mem.splitScalar(u8, val, ',');
-        while (sit.next()) |s| {
-            const sv = std.mem.trim(u8, s, " \t");
-            if (sv.len == 0) continue;
-            if (std.mem.lastIndexOfScalar(u8, sv, ':') == null)
-                warn("bootstrap.servers entry '{s}' lacks a port; using 9092", .{sv});
-            try servers.append(alloc, sv);
-        }
-        cfg.bootstrap_servers = servers.items;
-    } else if (std.mem.eql(u8, key, "security.protocol")) {
-        const v = try lower(alloc, val);
-        cfg.security_protocol = std.meta.stringToEnum(SecurityProtocol, v) orelse
-            return error.InvalidSecurityProtocol;
-    } else if (std.mem.eql(u8, key, "sasl.mechanism")) {
-        cfg.sasl_mechanism = mechFromString(val) orelse return error.InvalidSaslMechanism;
-    } else if (std.mem.eql(u8, key, "sasl.username")) {
-        cfg.sasl_username = val;
-    } else if (std.mem.eql(u8, key, "sasl.password")) {
-        cfg.sasl_password = val;
-    } else if (std.mem.eql(u8, key, "ssl.truststore.location")) {
-        cfg.ssl_truststore_location = val;
-    } else if (std.mem.eql(u8, key, "linger.ms")) {
-        cfg.linger_ms = std.fmt.parseInt(u64, val, 10) catch {
+fn applyKey(cfg: *Config, alloc: std.mem.Allocator, source: *Source, origin: Origin, key: []const u8, val: []const u8) LoadError!void {
+    const k = keyFromName(key) orelse {
+        warn("unknown config key '{s}' ignored", .{key});
+        return;
+    };
+    switch (k) {
+        .bootstrap_servers => {
+            var servers: std.ArrayListUnmanaged([]const u8) = .empty;
+            var sit = std.mem.splitScalar(u8, val, ',');
+            while (sit.next()) |s| {
+                const sv = std.mem.trim(u8, s, " \t");
+                if (sv.len == 0) continue;
+                if (std.mem.lastIndexOfScalar(u8, sv, ':') == null)
+                    warn("bootstrap.servers entry '{s}' lacks a port; using 9092", .{sv});
+                try servers.append(alloc, sv);
+            }
+            cfg.bootstrap_servers = servers.items;
+        },
+        .security_protocol => {
+            const v = try lower(alloc, val);
+            cfg.security_protocol = std.meta.stringToEnum(SecurityProtocol, v) orelse
+                return error.InvalidSecurityProtocol;
+        },
+        .sasl_mechanism => cfg.sasl_mechanism = mechFromString(val) orelse
+            return error.InvalidSaslMechanism,
+        .sasl_username => cfg.sasl_username = val,
+        .sasl_password => cfg.sasl_password = val,
+        .ssl_truststore_location => cfg.ssl_truststore_location = val,
+        .linger_ms => cfg.linger_ms = std.fmt.parseInt(u64, val, 10) catch {
             warn("invalid linger.ms '{s}' ignored", .{val});
             return;
-        };
-    } else if (std.mem.eql(u8, key, "batch.size")) {
-        cfg.batch_size = std.fmt.parseInt(usize, val, 10) catch {
+        },
+        .batch_size => cfg.batch_size = std.fmt.parseInt(usize, val, 10) catch {
             warn("invalid batch.size '{s}' ignored", .{val});
             return;
-        };
-    } else if (std.mem.eql(u8, key, "fetch.max.bytes")) {
-        cfg.fetch_max_bytes = std.fmt.parseInt(usize, val, 10) catch {
-            warn("invalid fetch.max.bytes '{s}' ignored", .{val});
-            return;
-        };
-        if (cfg.fetch_max_bytes >= 16 << 20) {
-            warn("fetch.max.bytes '{s}' is >= transport maximum; using default", .{val});
-            cfg.fetch_max_bytes = 8 << 20;
-        }
-    } else if (std.mem.eql(u8, key, "fetch.max.wait.ms")) {
-        cfg.fetch_max_wait_ms = std.fmt.parseInt(u64, val, 10) catch {
-            warn("invalid fetch.max.wait.ms '{s}' ignored", .{val});
-            return;
-        };
-        if (cfg.fetch_max_wait_ms >= 15_000) {
-            warn("fetch.max.wait.ms '{s}' is too close to socket timeout; using default", .{val});
-            cfg.fetch_max_wait_ms = 500;
-        }
-    } else if (std.mem.eql(u8, key, "enable.idempotence")) {
-        if (std.ascii.eqlIgnoreCase(val, "true")) {
+        },
+        .fetch_max_bytes => {
+            cfg.fetch_max_bytes = std.fmt.parseInt(usize, val, 10) catch {
+                warn("invalid fetch.max.bytes '{s}' ignored", .{val});
+                return;
+            };
+            if (cfg.fetch_max_bytes >= 16 << 20) {
+                warn("fetch.max.bytes '{s}' is >= transport maximum; using default", .{val});
+                cfg.fetch_max_bytes = 8 << 20;
+            }
+        },
+        .fetch_max_wait_ms => {
+            cfg.fetch_max_wait_ms = std.fmt.parseInt(u64, val, 10) catch {
+                warn("invalid fetch.max.wait.ms '{s}' ignored", .{val});
+                return;
+            };
+            if (cfg.fetch_max_wait_ms >= 15_000) {
+                warn("fetch.max.wait.ms '{s}' is too close to socket timeout; using default", .{val});
+                cfg.fetch_max_wait_ms = 500;
+            }
+        },
+        .enable_idempotence => if (std.ascii.eqlIgnoreCase(val, "true")) {
             cfg.enable_idempotence = true;
         } else if (std.ascii.eqlIgnoreCase(val, "false")) {
             cfg.enable_idempotence = false;
         } else {
             warn("invalid enable.idempotence '{s}' ignored", .{val});
-        }
-    } else {
-        warn("unknown config key '{s}' ignored", .{key});
+            return;
+        },
     }
+    source.origins.set(k, origin);
 }
 
 fn lower(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
@@ -322,12 +404,29 @@ test "later applyKey calls override earlier values" {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     var cfg: Config = .{ .bootstrap_servers = &.{} };
-    try applyKey(&cfg, arena.allocator(), "bootstrap.servers", "a:1, b:2");
+    var src: Source = .{};
+    try applyKey(&cfg, arena.allocator(), &src, .file, "bootstrap.servers", "a:1, b:2");
     try std.testing.expectEqual(@as(usize, 2), cfg.bootstrap_servers.len);
-    try applyKey(&cfg, arena.allocator(), "bootstrap.servers", "c:3");
+    try std.testing.expectEqual(Origin.file, src.origins.get(.bootstrap_servers));
+    try applyKey(&cfg, arena.allocator(), &src, .file, "bootstrap.servers", "c:3");
     try std.testing.expectEqual(@as(usize, 1), cfg.bootstrap_servers.len);
     try std.testing.expectEqualStrings("c:3", cfg.bootstrap_servers[0]);
-    try applyKey(&cfg, arena.allocator(), "security.protocol", "SASL_SSL");
+    try applyKey(&cfg, arena.allocator(), &src, .file, "security.protocol", "SASL_SSL");
     try std.testing.expectEqual(SecurityProtocol.sasl_ssl, cfg.security_protocol);
-    try std.testing.expectError(error.InvalidSaslMechanism, applyKey(&cfg, arena.allocator(), "sasl.mechanism", "nope"));
+    try std.testing.expectError(error.InvalidSaslMechanism, applyKey(&cfg, arena.allocator(), &src, .file, "sasl.mechanism", "nope"));
+    try std.testing.expectEqual(Origin.default, src.origins.get(.sasl_mechanism));
+}
+
+test "origins track the highest-precedence writer" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var cfg: Config = .{ .bootstrap_servers = &.{} };
+    var src: Source = .{};
+    try applyKey(&cfg, arena.allocator(), &src, .file, "sasl.username", "from-file");
+    try applyKey(&cfg, arena.allocator(), &src, .env, "sasl.username", "from-env");
+    try std.testing.expectEqual(Origin.env, src.origins.get(.sasl_username));
+    try std.testing.expectEqualStrings("from-env", cfg.sasl_username.?);
+    try applyKey(&cfg, arena.allocator(), &src, .flag, "bootstrap.servers", "h:1");
+    try std.testing.expectEqual(Origin.flag, src.origins.get(.bootstrap_servers));
 }
