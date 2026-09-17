@@ -103,6 +103,11 @@ run_case conflict-first 1 empty "kite: --offset cannot be combined with --from-b
 run_case conflict-second 1 empty "kite: --offset cannot be combined with --from-beginning" -c --offset 1 --from-beginning demo
 run_case consume-unknown 1 empty "kite: unknown option '--bogus'" -c --bogus demo
 run_case consume-extra 1 empty "kite: unexpected argument 'b'" -c a b
+run_case quiet-verbose 1 empty "kite: --quiet cannot be combined with --verbose" -q -v demo
+run_case format-bad 1 empty "kite: --format: 'x' is not a format (want value, tsv, json, or csv)" --format x demo
+run_case format-conflict 1 empty "kite: --json cannot be combined with --format tsv" --json --format tsv demo
+run_case consume-format-csv 1 empty "kite: --format csv is only valid when producing" -c --format csv demo
+run_case typo-suggest 1 empty "did you mean '--from-beginning'?" -c --from-begining demo
 
 run_case install-copy 0 nonempty "Add that line" -i --dir "$TMP/bin"
 [ -x "$TMP/bin/kite" ] || { echo "FAIL install-copy: binary missing"; exit 1; }

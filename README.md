@@ -77,6 +77,17 @@ install -m755 zig-out/bin/kite ~/.local/bin/kite
 Cross-compile with, for example, `zig build -Dtarget=aarch64-macos` or
 `zig build -Dtarget=x86_64-linux`.
 
+### Shell completions
+
+Static completion scripts for bash, zsh, and fish are in
+[`completions/`](completions):
+
+```sh
+source completions/kite.bash                                   # bash (or copy to /etc/bash_completion.d/)
+fpath=(/path/to/kite/completions $fpath)                       # zsh: file must be named _kite
+cp completions/kite.fish ~/.config/fish/completions/           # fish
+```
+
 ## Command reference
 
 Produce is the default mode. `-c`/`--consume` switches to consume,
@@ -94,7 +105,8 @@ kite --version                Print the version.
 | --- | --- | --- |
 | produce, consume | `-b`, `--bootstrap HOSTS` | Comma-separated `host:port` brokers (overrides env and file). |
 | produce, consume | `--config FILE` | Read this properties file instead of searching. |
-| produce, consume | `--json` | Produce: read one JSON object per line. Consume: write one per record. |
+| produce, consume | `--format FMT` | Record shape: `value`, `tsv`, `json`, `csv` (default `auto`). |
+| produce, consume | `--json` | Alias for `--format json`. |
 | produce | `-H 'name: value'` | Add a header to every record (repeatable). |
 | produce | `--csv` | Read RFC 4180 CSV; each row becomes a JSON object value. |
 | produce | `--key COL` | Use CSV column `COL` as the record key (requires `--csv`). |
@@ -106,6 +118,7 @@ kite --version                Print the version.
 | consume | `-f`, `--follow` | Never stop on idle, even when stdout is a pipe. |
 | install | `--dir DIR` | Install to DIR (default `$KITE_INSTALL_DIR` or `~/.local/bin`). |
 | install | `-y`, `--yes` | Add the install directory to `PATH` without prompting. |
+| produce, consume | `-q`, `--quiet` | Suppress the summary and progress lines on stderr. |
 | produce, consume | `-v`, `--verbose` | Connection, retry, and fetch diagnostics on stderr. |
 | all | `-h`, `--help` | Plain-text help for the selected mode. |
 
@@ -177,7 +190,20 @@ quietly with status 0 instead of dying from SIGPIPE.
 
 ## Input/output format and CSV
 
-Plain input is one value per line. TAB-separated input has these shapes:
+`--format FMT` selects the record shape for both directions:
+
+- `auto` (default): produce sniffs TAB-separated fields on each input line;
+  consume writes the value alone when the record has no key or headers,
+  otherwise the TAB shape below.
+- `value`: produce sends the whole line as the value (TAB is not special);
+  consume writes only the value. Keys and headers are dropped on output.
+- `tsv`: produce parses the TAB shapes below (same as `auto`); consume
+  always writes `key<TAB>[h: v<TAB>]value`, with an empty key field for
+  null keys and header fields only when present.
+- `json`: one JSON object per line/record; aliases `--json`.
+- `csv` (produce only): RFC 4180 input; alias `--csv`.
+
+TAB-separated input has these shapes:
 
 ```text
 value
@@ -189,8 +215,11 @@ The TAB and newline delimiters are not escaped. Binary data or records
 containing delimiters are therefore not generally safe to roundtrip. Null and
 empty keys, values, and header values may not remain distinct: a null key is
 printed as an empty field, and a null header value as `name: `. Compatible
-textual keys and headers can roundtrip. A consume-to-produce pipe does not
-preserve ordering across partitions, offsets, or timestamps.
+textual keys and headers can roundtrip: `kite -c --format tsv src |
+kite --format tsv dst` preserves keys and headers, while `--format json`
+preserves key, headers, and value exactly and `value` drops keys and
+headers. A consume-to-produce pipe does not preserve ordering across
+partitions, offsets, or timestamps.
 
 `--csv` reads RFC 4180 CSV. The first row supplies column names and each later
 row becomes a JSON object value. `--key COL` uses a CSV column as the Kafka
@@ -198,7 +227,7 @@ record key while retaining it in the JSON value. Quoted commas, escaped
 quotes, embedded newlines, CRLF endings, and a UTF-8 BOM are supported; all
 JSON fields are strings.
 
-### JSON records (`--json`)
+### JSON records (`--json`, i.e. `--format json`)
 
 `kite -c --json` writes one object per record with full metadata, so bytes
 containing TABs or newlines and null-vs-empty distinctions survive:
@@ -284,6 +313,8 @@ a non-empty `NO_COLOR`, forced with `KITE_COLOR=always`, or disabled
 explicitly with `KITE_COLOR=never`. Nothing is colored when the stream is a
 pipe.
 
+- `-q` / `--quiet` suppresses the live status line and the end-of-run
+  summaries; data, warnings, and errors are unchanged.
 - `-v` / `--verbose` enables connection, retry, and fetch diagnostics.
 - `KITE_DEBUG=1` enables frame and TLS diagnostics.
 - `KITE_TIME=1` prints producer timing totals and connection count.
