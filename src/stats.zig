@@ -90,10 +90,7 @@ pub const Stats = struct {
     /// print its own summary lines before `finish`.
     pub fn clearLine(s: *Stats) void {
         if (!s.shown) return;
-        var buf: [16]u8 = undefined;
-        var w = std.Io.File.stderr().writer(s.io, &buf);
-        w.interface.writeAll("\r\x1b[K") catch {};
-        w.interface.flush() catch {};
+        std.debug.print("\r\x1b[K", .{});
         s.shown = false;
     }
 
@@ -141,10 +138,7 @@ pub const Stats = struct {
             std.fmt.bufPrint(&line, "\r\x1b[K{s}{s}{s}  {s}{s}{s} msgs  {s}{s}{s} msg/s  {s}{s}{s}/s{s}  {d:.1}s", .{
                 cyan, s.topic, reset, bold, count, reset, bold, msg_rate, reset, bold, byte_rate, reset, offset, secs,
             }) catch return;
-        var buf: [512]u8 = undefined;
-        var w = std.Io.File.stderr().writer(s.io, &buf);
-        w.interface.writeAll(text) catch {};
-        w.interface.flush() catch {};
+        std.debug.print("{s}", .{text});
         s.shown = true;
     }
 
@@ -169,16 +163,16 @@ pub const Stats = struct {
         const total = fmtBytes(s.bytes, &bytes_buf);
         const msg_rate = fmtCount(@intFromFloat(@max(0, rate)), &rate_buf);
         const bytes_rate = fmtBytes(@intFromFloat(@max(0, byte_rate)), &brate_buf);
-        var out_buf: [1024]u8 = undefined;
-        var out = std.Io.File.stderr().writer(s.io, &out_buf);
+        var line: [1024]u8 = undefined;
+        var out: std.Io.Writer = .fixed(&line);
         const bold = if (term.color.enabled) term.bold else "";
         const reset = if (term.color.enabled) term.reset else "";
-        out.interface.print("{s}{s}{s} in {d:.2}s ({s}{s}{s} msg/s, {s}{s}{s}/s)", .{
+        out.print("{s}{s}{s} in {d:.2}s ({s}{s}{s} msg/s, {s}{s}{s}/s)", .{
             bold, total, reset, secs, bold, msg_rate, reset, bold, bytes_rate, reset,
-        }) catch {};
-        s.writeOffsets(&out.interface);
-        out.interface.writeByte('\n') catch {};
-        out.interface.flush() catch {};
+        }) catch return;
+        s.writeOffsets(&out);
+        out.writeByte('\n') catch return;
+        std.debug.print("{s}", .{out.buffered()});
     }
 
     fn writeOffsets(s: *Stats, w: *std.Io.Writer) void {

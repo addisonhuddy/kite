@@ -115,6 +115,15 @@ const env_keys = [_][2][]const u8{
     .{ "KITE_SSL_TRUSTSTORE_LOCATION", "ssl.truststore.location" },
 };
 
+fn overriddenByEnv(env: *std.process.Environ.Map, key: []const u8) bool {
+    for (env_keys) |pair| {
+        if (!std.mem.eql(u8, key, pair[1])) continue;
+        const value = env.get(pair[0]) orelse return false;
+        return value.len > 0;
+    }
+    return false;
+}
+
 /// Build the effective Config. Precedence: command-line flags, then KITE_*
 /// environment variables, then the properties file (`--config`/`KITE_CONFIG`
 /// or the first file on the search path). A file is optional as soon as the
@@ -160,7 +169,12 @@ pub fn load(
     if (text) |body| {
         const props = try parse(alloc, body);
         var it = props.iterator();
-        while (it.next()) |e| try applyKey(&cfg, alloc, e.key_ptr.*, e.value_ptr.*);
+        while (it.next()) |e| {
+            const key = e.key_ptr.*;
+            if (overrides.bootstrap != null and std.mem.eql(u8, key, "bootstrap.servers")) continue;
+            if (overriddenByEnv(env, key)) continue;
+            try applyKey(&cfg, alloc, key, e.value_ptr.*);
+        }
     }
 
     for (env_keys) |pair| {

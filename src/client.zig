@@ -15,6 +15,17 @@ const Conn = transport.Conn;
 
 const BrokerAddr = struct { host: []const u8, port: u16 };
 
+fn parseBootstrapServer(server: []const u8) !BrokerAddr {
+    const colon = std.mem.lastIndexOfScalar(u8, server, ':') orelse
+        return .{ .host = server, .port = 9092 };
+    const host = server[0..colon];
+    const port_text = server[colon + 1 ..];
+    if (host.len == 0 or port_text.len == 0) return error.InvalidBootstrapServer;
+    const port = std.fmt.parseInt(u16, port_text, 10) catch return error.InvalidBootstrapServer;
+    if (port == 0) return error.InvalidBootstrapServer;
+    return .{ .host = host, .port = port };
+}
+
 pub const Partition = struct { index: i32, leader: i32 };
 
 const ApiRange = struct { min: i16, max: i16 };
@@ -226,13 +237,15 @@ pub const Client = struct {
         var first_err_ctx: [512]u8 = undefined;
         var have_err = false;
         for (c.cfg.bootstrap_servers) |server| {
-            const colon = std.mem.lastIndexOfScalar(u8, server, ':');
-            const host = if (colon) |i| server[0..i] else server;
-            const port: u16 = if (colon) |i|
-                std.fmt.parseInt(u16, server[i + 1 ..], 10) catch 9092
-            else
-                9092;
-            const conn = c.connectOne(host, port) catch {
+            const addr = parseBootstrapServer(server) catch {
+                c.setErr("invalid bootstrap server '{s}' (want HOST or HOST:PORT with port 1..65535)", .{server});
+                if (!have_err) {
+                    @memcpy(&first_err_ctx, &c.err_ctx);
+                    have_err = true;
+                }
+                continue;
+            };
+            const conn = c.connectOne(addr.host, addr.port) catch {
                 if (!have_err) {
                     @memcpy(&first_err_ctx, &c.err_ctx);
                     have_err = true;
@@ -240,7 +253,7 @@ pub const Client = struct {
                 continue;
             };
             c.control = conn;
-            c.vlog("bootstrap connected {s}:{d}", .{ host, port });
+            c.vlog("bootstrap connected {s}:{d}", .{ addr.host, addr.port });
             return;
         }
         if (have_err) @memcpy(&c.err_ctx, &first_err_ctx);
@@ -1017,3 +1030,18 @@ pub const Client = struct {
         try d.tagBuffer();
     }
 };
+
+test "bootstrap server parser rejects invalid explicit ports" {
+    const defaulted = try parseBootstrapServer("localhost");
+    try std.testing.expectEqualStrings("localhost", defaulted.host);
+    try std.testing.expectEqual(@as(u16, 9092), defaulted.port);
+
+    const explicit = try parseBootstrapServer("broker.example:19092");
+    try std.testing.expectEqualStrings("broker.example", explicit.host);
+    try std.testing.expectEqual(@as(u16, 19092), explicit.port);
+
+    try std.testing.expectError(error.InvalidBootstrapServer, parseBootstrapServer("localhost:"));
+    try std.testing.expectError(error.InvalidBootstrapServer, parseBootstrapServer("localhost:nope"));
+    try std.testing.expectError(error.InvalidBootstrapServer, parseBootstrapServer("localhost:0"));
+    try std.testing.expectError(error.InvalidBootstrapServer, parseBootstrapServer("localhost:65536"));
+}
