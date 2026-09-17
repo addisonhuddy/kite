@@ -12,5 +12,4 @@
 - [ ] `zig build test`
 - [ ] `scripts/cli-check.sh`
 - [ ] `scripts/check-size.sh`
-- [ ] `CHANGELOG.md` updated
 - [ ] README/TESTING updated if behavior changed

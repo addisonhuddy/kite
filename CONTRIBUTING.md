@@ -26,4 +26,4 @@ Docker. See [TESTING.md](TESTING.md) for details.
 - Keep PRs small and focused.
 - Add tests for behavior changes.
 - Keep the binary under the size gate.
-- Add an entry under `Unreleased` in [CHANGELOG.md](CHANGELOG.md).
+- Write a clear PR title; release notes are generated from merged PR titles.
