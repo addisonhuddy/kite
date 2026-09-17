@@ -31,6 +31,7 @@ pub fn run(init: std.process.Init, args: []const []const u8, alloc: std.mem.Allo
         break :blk std.fs.path.resolve(alloc, &.{ cwd, raw_dest }) catch
             fatal(init, "out of memory", .{});
     };
+    if (validateDest(dest)) |message| fatal(init, "{s}", .{message});
     const installed = std.fs.path.join(alloc, &.{ dest, "kite" }) catch
         fatal(init, "out of memory", .{});
     const executable = std.process.executablePathAlloc(init.io, alloc) catch |err|
@@ -56,12 +57,22 @@ pub fn run(init: std.process.Init, args: []const []const u8, alloc: std.mem.Allo
     const line = makePathLine(alloc, dest, home, std.mem.eql(u8, shell_name, "fish")) catch
         fatal(init, "out of memory", .{});
 
-    const interactive = std.Io.File.stdin().isTty(init.io) catch false;
-    if (rc != null and (options.yes or interactive)) {
+    // Interactive iff /dev/tty opens and stdin or stdout is a terminal, so
+    // `curl … | sh` still prompts on the real terminal rather than reading
+    // the answer out of the script's own stdin.
+    const stdin_tty = std.Io.File.stdin().isTty(init.io) catch false;
+    const stdout_tty = std.Io.File.stdout().isTty(init.io) catch false;
+    const tty: ?std.Io.File = if (stdin_tty or stdout_tty)
+        std.Io.Dir.openFileAbsolute(init.io, "/dev/tty", .{ .mode = .read_write }) catch null
+    else
+        null;
+    defer if (tty) |t| t.close(init.io);
+    if (rc != null and (options.yes or tty != null)) {
         if (!options.yes) {
-            writeFmt(init, std.Io.File.stdout(), "Add {s} to your PATH in {s}? [Y/n] ", .{ dest, rc.? });
+            const t = tty.?;
+            writeFmt(init, t, "Add {s} to your PATH in {s}? [Y/n] ", .{ dest, rc.? });
             var input_buf: [4096]u8 = undefined;
-            var reader = std.Io.File.stdin().reader(init.io, &input_buf);
+            var reader = t.reader(init.io, &input_buf);
             const answer = reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
                 error.EndOfStream => "",
                 else => fatal(init, "could not read response: {s}", .{@errorName(err)}),
@@ -129,17 +140,51 @@ fn withoutTrailingSlashes(path: []const u8) []const u8 {
     return path[0..end];
 }
 
-pub fn makePathLine(alloc: std.mem.Allocator, dest: []const u8, home: []const u8, fish: bool) ![]u8 {
-    if (fish) return std.fmt.allocPrint(alloc, "fish_add_path \"{s}\"", .{dest});
+/// A dest is written into a shell rc PATH line: reject control bytes,
+/// newlines, and ':' (PATH is colon-separated).
+pub fn validateDest(dest: []const u8) ?[]const u8 {
+    for (dest) |b|
+        if (b < 0x20 or b == 0x7f)
+            return "install directory contains unsupported characters (control bytes or newlines)";
+    if (std.mem.indexOfScalar(u8, dest, ':') != null)
+        return "install directory must not contain ':' (PATH is colon-separated)";
+    return null;
+}
 
+/// Backslash-escape the bytes that are special inside shell double quotes.
+/// fish differs only in that a backtick is not special there.
+fn escapeDoubleQuoted(w: *std.Io.Writer, s: []const u8, fish: bool) !void {
+    for (s) |b| {
+        switch (b) {
+            '\\', '"', '$' => try w.writeAll(&.{ '\\', b }),
+            '`' => if (fish) try w.writeByte(b) else try w.writeAll("\\`"),
+            else => try w.writeByte(b),
+        }
+    }
+}
+
+pub fn makePathLine(alloc: std.mem.Allocator, dest: []const u8, home: []const u8, fish: bool) ![]u8 {
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    const w = &aw.writer;
+    if (fish) {
+        try w.writeAll("fish_add_path \"");
+        try escapeDoubleQuoted(w, dest, true);
+        try w.writeByte('"');
+        return aw.toOwnedSlice();
+    }
+    try w.writeAll("export PATH=\"");
     if (std.mem.eql(u8, dest, home)) {
-        return std.fmt.allocPrint(alloc, "export PATH=\"$HOME:$PATH\"", .{});
+        try w.writeAll("$HOME");
     } else if (home.len > 0 and std.mem.startsWith(u8, dest, home) and
         dest.len > home.len and dest[home.len] == '/')
     {
-        return std.fmt.allocPrint(alloc, "export PATH=\"$HOME{s}:$PATH\"", .{dest[home.len..]});
+        try w.writeAll("$HOME");
+        try escapeDoubleQuoted(w, dest[home.len..], false);
+    } else {
+        try escapeDoubleQuoted(w, dest, false);
     }
-    return std.fmt.allocPrint(alloc, "export PATH=\"{s}:$PATH\"", .{dest});
+    try w.writeAll(":$PATH\"");
+    return aw.toOwnedSlice();
 }
 
 fn rcPath(alloc: std.mem.Allocator, home: []const u8, shell: []const u8) !?[]u8 {
@@ -227,6 +272,34 @@ test "path lines substitute HOME and support fish" {
     const fish_line = try makePathLine(alloc, "/tmp/bin", "/home/test", true);
     defer alloc.free(fish_line);
     try std.testing.expectEqualStrings("fish_add_path \"/tmp/bin\"", fish_line);
+
+    const spaced = try makePathLine(alloc, "/home/t/my bin", "/home/t", false);
+    defer alloc.free(spaced);
+    try std.testing.expectEqualStrings("export PATH=\"$HOME/my bin:$PATH\"", spaced);
+
+    const tricky = try makePathLine(alloc, "/opt/a\"b$c\\d", "/home/t", false);
+    defer alloc.free(tricky);
+    try std.testing.expectEqualStrings("export PATH=\"/opt/a\\\"b\\$c\\\\d:$PATH\"", tricky);
+
+    const tick_bash = try makePathLine(alloc, "/opt/a`b", "/h", false);
+    defer alloc.free(tick_bash);
+    try std.testing.expectEqualStrings("export PATH=\"/opt/a\\`b:$PATH\"", tick_bash);
+
+    const tick_fish = try makePathLine(alloc, "/opt/a`b", "/h", true);
+    defer alloc.free(tick_fish);
+    try std.testing.expectEqualStrings("fish_add_path \"/opt/a`b\"", tick_fish);
+}
+
+test "validateDest rejects control bytes and colons" {
+    try std.testing.expectEqual(@as(?[]const u8, null), validateDest("/home/t/.local/bin"));
+    try std.testing.expectEqualStrings(
+        "install directory contains unsupported characters (control bytes or newlines)",
+        validateDest("/a\nb").?,
+    );
+    try std.testing.expectEqualStrings(
+        "install directory must not contain ':' (PATH is colon-separated)",
+        validateDest("/a:b").?,
+    );
 }
 
 test "PATH contains exact entries and trailing slash variants" {
