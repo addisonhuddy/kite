@@ -57,12 +57,22 @@ pub fn run(init: std.process.Init, args: []const []const u8, alloc: std.mem.Allo
     const line = makePathLine(alloc, dest, home, std.mem.eql(u8, shell_name, "fish")) catch
         fatal(init, "out of memory", .{});
 
-    const interactive = std.Io.File.stdin().isTty(init.io) catch false;
-    if (rc != null and (options.yes or interactive)) {
+    // Interactive iff /dev/tty opens and stdin or stdout is a terminal, so
+    // `curl … | sh` still prompts on the real terminal rather than reading
+    // the answer out of the script's own stdin.
+    const stdin_tty = std.Io.File.stdin().isTty(init.io) catch false;
+    const stdout_tty = std.Io.File.stdout().isTty(init.io) catch false;
+    const tty: ?std.Io.File = if (stdin_tty or stdout_tty)
+        std.Io.Dir.openFileAbsolute(init.io, "/dev/tty", .{ .mode = .read_write }) catch null
+    else
+        null;
+    defer if (tty) |t| t.close(init.io);
+    if (rc != null and (options.yes or tty != null)) {
         if (!options.yes) {
-            writeFmt(init, std.Io.File.stdout(), "Add {s} to your PATH in {s}? [Y/n] ", .{ dest, rc.? });
+            const t = tty.?;
+            writeFmt(init, t, "Add {s} to your PATH in {s}? [Y/n] ", .{ dest, rc.? });
             var input_buf: [4096]u8 = undefined;
-            var reader = std.Io.File.stdin().reader(init.io, &input_buf);
+            var reader = t.reader(init.io, &input_buf);
             const answer = reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
                 error.EndOfStream => "",
                 else => fatal(init, "could not read response: {s}", .{@errorName(err)}),

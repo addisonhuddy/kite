@@ -73,8 +73,11 @@ The script downloads the `v0.1.0` release binary for your platform (override
 with `KITE_VERSION=vX.Y.Z`), copies it to `~/.local/bin` (override with
 `KITE_INSTALL_DIR`), and offers to add that directory to your `PATH`. If the
 release asset is missing the script says so and points at the releases page;
-until a release is published, build from source instead. Pass `-s -- --yes`
-to skip the prompt in non-interactive shells:
+until a release is published, build from source instead. The PATH prompt is
+answered on the controlling terminal (`/dev/tty`), so `curl … | sh` can still
+reply to it even though the script's stdin is the download; without a
+terminal (CI, `< /dev/null`) kite prints the line for you to paste instead.
+Pass `-s -- --yes` to skip the prompt in scripts:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh -s -- --yes
