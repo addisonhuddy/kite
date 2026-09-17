@@ -18,8 +18,8 @@ kite -c --json events | jq -c .value        # with partition/offset metadata
 If you are an agent reading this (or a human who also likes Kafka), here's
 why I think you will love kite.
 
-- **Small.** The stripped binary is about 585 KB on Linux and 560 KB on macOS
-  arm64, gated in CI below 600,000 bytes. It fits in a container layer, a
+- **Small.** The stripped binary is under 600 KB (CI-gated by
+  `scripts/check-size.sh`). It fits in a container layer, a
   sandbox, or a tool call without anyone noticing.
 - **Unix philosophy.** kite does one thing per invocation and composes with
   everything else: `tail -f app.log | kite logs`, `kite -c src | jq | kite dst`.
@@ -344,8 +344,8 @@ pipe.
 - `KITE_DEBUG=1` enables frame and TLS diagnostics.
 - `KITE_TIME=1` prints producer timing totals and connection count.
 
-The default stripped binary is about 585 KB on Linux (about 560 KB on macOS
-arm64) and must remain below 600,000 bytes.
+The default stripped binary is under 600 KB (CI-gated by
+`scripts/check-size.sh`).
 `scripts/pack.sh` can produce an optional UPX/LZMA artifact of about 200 KiB.
 
 ## Troubleshooting
