@@ -105,12 +105,12 @@ pub const install_usage =
 
 const config_help =
     "Configuration:\n" ++
-    "  Flags override KITE_* environment variables, which override the first\n" ++
+    "  Flags override environment variables, which override the first\n" ++
     "  kite.properties found in: ./kite.properties,\n" ++
     "  $XDG_CONFIG_HOME/kite/kite.properties, ~/.config/kite/kite.properties.\n" ++
-    "  Environment: KITE_BOOTSTRAP_SERVERS, KITE_SECURITY_PROTOCOL,\n" ++
-    "  KITE_SASL_MECHANISM, KITE_SASL_USERNAME, KITE_SASL_PASSWORD,\n" ++
-    "  KITE_SSL_TRUSTSTORE_LOCATION, KITE_CONFIG (path to a properties file).\n" ++
+    "  Environment: BOOTSTRAP_SERVERS, SECURITY_PROTOCOL,\n" ++
+    "  SASL_MECHANISM, SASL_USERNAME, SASL_PASSWORD,\n" ++
+    "  SSL_TRUSTSTORE_LOCATION, KAFKA_PROPERTIES (path to a properties file).\n" ++
     "  Templates are in examples/config/.\n";
 
 pub const produce_help =

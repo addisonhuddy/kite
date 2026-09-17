@@ -5,7 +5,7 @@ no JVM, no runtime, no daemon. stdin in, stdout out, non-zero exit on failure.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh
-export KITE_BOOTSTRAP_SERVERS=localhost:9092
+export BOOTSTRAP_SERVERS=localhost:9092
 printf 'hello\n' | kite events                 # produce
 kite -c -B --idle 3s events                    # consume, stop after 3 s idle
 kite -c -B --json events | jq -c .value        # with partition/offset metadata
@@ -110,7 +110,7 @@ Point kite at a broker with a flag, an environment variable, or a properties
 file (see [Configuration](#configuration)):
 
 ```sh
-export KITE_BOOTSTRAP_SERVERS=localhost:9092     # or: kite -b localhost:9092 ...
+export BOOTSTRAP_SERVERS=localhost:9092     # or: kite -b localhost:9092 ...
 ```
 
 Produce the checked-in sample data:
@@ -290,32 +290,35 @@ fail with `kite: line N: ...`. `--json` and `--csv` are mutually exclusive.
 Settings are resolved in this order, highest precedence first:
 
 1. Flags: `-b`/`--bootstrap HOSTS`.
-2. `KITE_*` environment variables (below).
-3. A properties file: `--config FILE`, else `$KITE_CONFIG`, else the first of
+2. Environment variables (below).
+3. A properties file: `--config FILE`, else `$KAFKA_PROPERTIES`, else the first of
    `./kite.properties`, `$XDG_CONFIG_HOME/kite/kite.properties`,
    `~/.config/kite/kite.properties`.
 
-A file is optional when `-b` or `KITE_BOOTSTRAP_SERVERS` supplies the
+A file is optional when `-b` or `BOOTSTRAP_SERVERS` supplies the
 brokers. With none of these, kite fails with a message listing all three
-ways to configure it. A `--config`/`KITE_CONFIG` path that does not exist is
+ways to configure it. A `--config`/`KAFKA_PROPERTIES` path that does not exist is
 an error rather than a silent fallback. `-v` prints which sources were used.
 
 The parser supports a `key=value` subset of Java properties. Blank lines and
 `#`/`!` comments are accepted; unknown keys are ignored with a warning.
 
+Environment variable names are the Kafka property names upper-cased with `.`
+replaced by `_`, so `bootstrap.servers` becomes `BOOTSTRAP_SERVERS`.
+
 | Key | Environment variable | Default | Meaning |
 | --- | --- | --- | --- |
-| `bootstrap.servers` | `KITE_BOOTSTRAP_SERVERS` | required | Comma-separated `host:port` brokers. |
-| `security.protocol` | `KITE_SECURITY_PROTOCOL` | `PLAINTEXT` | `PLAINTEXT`, `SSL`, `SASL_SSL`, or `SASL_PLAINTEXT`. |
-| `sasl.mechanism` | `KITE_SASL_MECHANISM` | none | `PLAIN`, `SCRAM-SHA-256`, or `SCRAM-SHA-512`. |
-| `sasl.username` | `KITE_SASL_USERNAME` | none | Required for SASL. |
-| `sasl.password` | `KITE_SASL_PASSWORD` | none | Required for SASL. |
-| `ssl.truststore.location` | `KITE_SSL_TRUSTSTORE_LOCATION` | system trust store | Optional PEM CA bundle for TLS. |
-| `batch.size` | `1048576` | Per-partition producer buffer cap in bytes. |
-| `linger.ms` | `50` | Producer flush delay when stdin stalls. |
-| `fetch.max.bytes` | `8388608` | Maximum bytes requested per fetch. |
-| `fetch.max.wait.ms` | `500` | Maximum broker wait for a fetch. |
-| `enable.idempotence` | `true` | Broker deduplicates retried producer batches. |
+| `bootstrap.servers` | `BOOTSTRAP_SERVERS` | required | Comma-separated `host:port` brokers. |
+| `security.protocol` | `SECURITY_PROTOCOL` | `PLAINTEXT` | `PLAINTEXT`, `SSL`, `SASL_SSL`, or `SASL_PLAINTEXT`. |
+| `sasl.mechanism` | `SASL_MECHANISM` | none | `PLAIN`, `SCRAM-SHA-256`, or `SCRAM-SHA-512`. |
+| `sasl.username` | `SASL_USERNAME` | none | Required for SASL. |
+| `sasl.password` | `SASL_PASSWORD` | none | Required for SASL. |
+| `ssl.truststore.location` | `SSL_TRUSTSTORE_LOCATION` | system trust store | Optional PEM CA bundle for TLS. |
+| `batch.size` | — | `1048576` | Per-partition producer buffer cap in bytes. |
+| `linger.ms` | — | `50` | Producer flush delay when stdin stalls. |
+| `fetch.max.bytes` | — | `8388608` | Maximum bytes requested per fetch. |
+| `fetch.max.wait.ms` | — | `500` | Maximum broker wait for a fetch. |
+| `enable.idempotence` | — | `true` | Broker deduplicates retried producer batches. |
 
 Templates are in [`examples/config/`](examples/config). Idempotence means
 broker deduplication of retried batches, not end-to-end exactly-once
@@ -358,7 +361,7 @@ arm64) and must remain below 600,000 bytes.
 ## Troubleshooting
 
 - **`no broker configured`:** pass `-b HOST:PORT`, set
-  `KITE_BOOTSTRAP_SERVERS`, or copy a template to one of the search-path
+  `BOOTSTRAP_SERVERS`, or copy a template to one of the search-path
   locations and edit `bootstrap.servers`. `-v` prints which sources were
   used.
 - **Topic does not exist:** create the topic with your Kafka administration

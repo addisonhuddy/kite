@@ -33,12 +33,12 @@ optional UPX/LZMA packaging step.
 ## End-to-end: any Kafka 4.0+ broker
 
 There is no bundled broker harness. Point kite at a broker with
-`KITE_BOOTSTRAP_SERVERS` (or copy an [`examples/config/`](examples/config)
+`BOOTSTRAP_SERVERS` (or copy an [`examples/config/`](examples/config)
 template to `./kite.properties` and set `bootstrap.servers` plus any
 authentication), build, and run:
 
 ```sh
-export KITE_BOOTSTRAP_SERVERS=localhost:9092
+export BOOTSTRAP_SERVERS=localhost:9092
 zig build
 scripts/smoke.sh EXISTING_TOPIC
 ```
