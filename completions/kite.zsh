@@ -36,16 +36,16 @@ _kite() {
             '(-q --quiet)'{-q,--quiet}'[suppress progress lines]' \
             '(-v --verbose)'{-v,--verbose}'[diagnostics]' \
             '(-h --help)'{-h,--help}'[show help]'
-    elif (( ${words[(I)(-i|--install)]} )); then
+    elif (( ${words[(I)--add-to-path]} )); then
         _arguments -s \
-            '(-i --install)'{-i,--install}'[install mode]' \
+            '--add-to-path[install mode]' \
             '--dir[install to DIR]:directory:_files -/' \
             '(-y --yes)'{-y,--yes}'[add to PATH without prompting]' \
             '(-h --help)'{-h,--help}'[show help]'
     else
         _arguments -s $shared \
             '(-c --consume)'{-c,--consume}'[consume mode]' \
-            '(-i --install)'{-i,--install}'[install mode]' \
+            '--add-to-path[install mode]' \
             '--show-config[show effective configuration]' \
             '-H[add a name: value header]:header:' \
             '--csv[read RFC 4180 CSV (same as --format csv)]' \

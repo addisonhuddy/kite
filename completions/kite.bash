@@ -9,7 +9,7 @@ _kite() {
     for w in "${COMP_WORDS[@]:1:COMP_CWORD-1}"; do
         case "$w" in
             -c | --consume) mode=consume ;;
-            -i | --install) mode=install ;;
+            --add-to-path) mode=install ;;
             --show-config) mode=show-config ;;
         esac
     done
@@ -36,13 +36,13 @@ _kite() {
                 -f --follow -q --quiet -v --verbose -h --help"
             ;;
         install)
-            opts="-i --install --dir -y --yes -h --help"
+            opts="--add-to-path --dir -y --yes -h --help"
             ;;
         show-config)
             opts="--show-config -b --bootstrap --config --format --json -q --quiet -v --verbose -h --help"
             ;;
         *)
-            opts="-c --consume -i --install -V --version --show-config \
+            opts="-c --consume --add-to-path -V --version --show-config \
                 -b --bootstrap --config --format --json -H --csv --key \
                 -q --quiet -v --verbose -h --help"
             ;;
