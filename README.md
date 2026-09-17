@@ -9,9 +9,8 @@ non-zero exit on failure.
 ```sh
 curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh
 export BOOTSTRAP_SERVERS=localhost:9092
-printf 'hello\n' | kite events                 # produce
-kite -c -B --idle 3s events                    # consume, stop after 3 s idle
-kite -c -B --json events | jq -c .value        # with partition/offset metadata
+printf 'hello\n' | kite events              # produce
+kite -c --json events | jq -c .value        # with partition/offset metadata
 ```
 
 ## Why kite
