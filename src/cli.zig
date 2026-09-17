@@ -52,6 +52,11 @@ pub const Mode = enum {
     produce,
     consume,
     install,
+    show_config,
+};
+
+pub const ShowConfigArgs = struct {
+    common: Common = .{},
 };
 
 pub const ModeSplit = struct {
@@ -88,11 +93,21 @@ pub fn splitMode(alloc: std.mem.Allocator, args: []const []const u8) Result(Mode
         if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--consume")) {
             if (mode == .install)
                 return .{ .err = "--consume cannot be combined with --install" };
+            if (mode == .show_config)
+                return .{ .err = "--show-config cannot be combined with --consume" };
             mode = .consume;
         } else if (std.mem.eql(u8, arg, "-i") or std.mem.eql(u8, arg, "--install")) {
             if (mode == .consume)
                 return .{ .err = "--consume cannot be combined with --install" };
+            if (mode == .show_config)
+                return .{ .err = "--show-config cannot be combined with --install" };
             mode = .install;
+        } else if (std.mem.eql(u8, arg, "--show-config")) {
+            if (mode == .consume)
+                return .{ .err = "--show-config cannot be combined with --consume" };
+            if (mode == .install)
+                return .{ .err = "--show-config cannot be combined with --install" };
+            mode = .show_config;
         } else {
             rest.append(alloc, arg) catch return .{ .err = "out of memory" };
             value_follows = takesSeparateValue(arg);
@@ -130,6 +145,7 @@ pub const produce_help =
     "  kite [OPTIONS] TOPIC          Produce stdin lines to TOPIC (default).\n" ++
     "  kite -c [OPTIONS] TOPIC       Consume TOPIC to stdout. See 'kite -c --help'.\n" ++
     "  kite -i [OPTIONS]             Install this executable. See 'kite -i --help'.\n" ++
+    "  kite --show-config  Show the effective configuration; never connects.\n" ++
     "\n" ++
     "Options:\n" ++
     "  -c, --consume         Consume instead of produce.\n" ++
@@ -198,6 +214,36 @@ pub const consume_help =
     "  kite -c -B --idle 3s events\n" ++
     "  kite -c --partition 0 --offset 42 -n 10 --idle 3s events\n" ++
     "  kite -c -B --json events | jq -c .value\n" ++
+    "\n" ++
+    config_help;
+
+pub const show_config_usage =
+    "Usage: kite --show-config [OPTIONS]\n" ++
+    "Try 'kite --show-config --help' for details.\n";
+
+pub const show_config_help =
+    "kite --show-config - Print the effective configuration\n" ++
+    "\n" ++
+    "Usage:\n" ++
+    "  kite --show-config [OPTIONS]\n" ++
+    "\n" ++
+    "Options:\n" ++
+    "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
+    "  --config FILE         Read this properties file instead of searching.\n" ++
+    "  --format FMT          Output shape: json (default: text). --json is\n" ++
+    "                        short for --format json.\n" ++
+    "  -q, --quiet           Suppress the config-source note on stderr.\n" ++
+    "  -v, --verbose         Write diagnostics to stderr.\n" ++
+    "  -h, --help            Show this help and exit.\n" ++
+    "\n" ++
+    "Each setting prints with its origin: default, file, env, or flag\n" ++
+    "(flags override the environment, which overrides the file).\n" ++
+    "sasl.password is always redacted. kite never connects to a broker;\n" ++
+    "invalid or incomplete configuration exits 1 with a message.\n" ++
+    "\n" ++
+    "Examples:\n" ++
+    "  kite --show-config\n" ++
+    "  kite --show-config --json | jq '.settings[\"bootstrap.servers\"]'\n" ++
     "\n" ++
     config_help;
 
@@ -274,9 +320,10 @@ pub fn parseHeaderArg(s: []const u8) !protocol.Header {
 const produce_only = [_][]const u8{ "-H", "--csv", "--key" };
 const consume_only = [_][]const u8{ "-B", "--from-beginning", "--offset", "--partition", "-n", "--max", "-t", "--idle", "-f", "--follow" };
 
-const produce_options = [_][]const u8{ "--consume", "--install", "--version", "--bootstrap", "--config", "--format", "--json", "--csv", "--key", "--quiet", "--verbose", "--help" };
+const produce_options = [_][]const u8{ "--consume", "--install", "--version", "--bootstrap", "--config", "--format", "--json", "--csv", "--key", "--quiet", "--verbose", "--help", "--show-config" };
 const consume_options = [_][]const u8{ "--consume", "--install", "--bootstrap", "--config", "--from-beginning", "--offset", "--partition", "--max", "--idle", "--follow", "--format", "--json", "--quiet", "--verbose", "--help" };
 const install_options = [_][]const u8{ "--install", "--dir", "--yes", "--help" };
+const show_config_options = [_][]const u8{ "--show-config", "--bootstrap", "--config", "--json", "--format", "--quiet", "--verbose", "--help" };
 
 /// Damerau-Levenshtein distance (adjacent transposition counts as one edit).
 /// Inputs are capped so the DP matrix lives on the stack.
@@ -304,6 +351,7 @@ fn suggestOption(mode: Mode, name: []const u8) ?[]const u8 {
         .produce => &produce_options,
         .consume => &consume_options,
         .install => &install_options,
+        .show_config => &show_config_options,
     };
     var best: ?[]const u8 = null;
     var best_dist: usize = 3;
@@ -334,40 +382,47 @@ fn isOneOf(name: []const u8, list: []const []const u8) bool {
     return false;
 }
 
-fn unknownOption(comptime T: type, alloc: std.mem.Allocator, mode: Mode, arg: []const u8) Result(T) {
+fn errMsg(alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) []const u8 {
+    return std.fmt.allocPrint(alloc, fmt, args) catch "out of memory";
+}
+
+fn unknownOption(alloc: std.mem.Allocator, mode: Mode, arg: []const u8) []const u8 {
     const name = optionName(arg);
     switch (mode) {
         .produce => if (isOneOf(name, &consume_only))
-            return errorResult(T, alloc, "'{s}' is a consume option; use 'kite -c [OPTIONS] TOPIC'", .{name}),
+            return errMsg(alloc, "'{s}' is a consume option; use 'kite -c [OPTIONS] TOPIC'", .{name}),
         .consume => if (isOneOf(name, &produce_only))
-            return errorResult(T, alloc, "'{s}' is a produce option and is not valid with -c", .{name}),
-        .install => {},
+            return errMsg(alloc, "'{s}' is a produce option and is not valid with -c", .{name}),
+        .install, .show_config => {},
     }
     if (suggestOption(mode, name)) |candidate|
-        return errorResult(T, alloc, "unknown option '{s}' (did you mean '{s}'?)", .{ arg, candidate });
-    return errorResult(T, alloc, "unknown option '{s}'", .{arg});
+        return errMsg(alloc, "unknown option '{s}' (did you mean '{s}'?)", .{ arg, candidate });
+    return errMsg(alloc, "unknown option '{s}'", .{arg});
 }
 
-/// Handle options shared by produce and consume. Returns true when `arg`
-/// was consumed; `i` is advanced past any separate value.
-fn parseCommon(comptime T: type, alloc: std.mem.Allocator, common: *Common, args: []const []const u8, i: *usize) ?Result(T) {
+const CommonStep = union(enum) { ok, err: []const u8 };
+
+/// Handle options shared by produce and consume. Returns null when `arg`
+/// is not a shared option; `i` is advanced past any separate value.
+fn parseCommon(alloc: std.mem.Allocator, common: *Common, args: []const []const u8, i: *usize) ?CommonStep {
     const arg = args[i.*];
     if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
         common.verbose = true;
     } else if (std.mem.eql(u8, arg, "-q") or std.mem.eql(u8, arg, "--quiet")) {
         common.quiet = true;
     } else if (std.mem.eql(u8, arg, "--json")) {
-        if (setFormat(T, alloc, common, .json, "--json")) |r| return r;
+        if (setFormat(alloc, common, .json, "--json")) |m| return .{ .err = m };
     } else if (std.mem.eql(u8, arg, "--format")) {
         i.* += 1;
-        if (i.* >= args.len) return errorResult(T, alloc, "--format requires a value", .{});
+        if (i.* >= args.len) return .{ .err = "--format requires a value" };
         const value = args[i.*];
-        if (parseFormatArg(T, alloc, common, value, std.fmt.allocPrint(alloc, "--format {s}", .{value}) catch return .{ .err = "out of memory" })) |r| return r;
+        const spelling = std.fmt.allocPrint(alloc, "--format {s}", .{value}) catch return .{ .err = "out of memory" };
+        if (parseFormatArg(alloc, common, value, spelling)) |m| return .{ .err = m };
     } else if (std.mem.startsWith(u8, arg, "--format=")) {
-        if (parseFormatArg(T, alloc, common, arg["--format=".len..], arg)) |r| return r;
+        if (parseFormatArg(alloc, common, arg["--format=".len..], arg)) |m| return .{ .err = m };
     } else if (std.mem.eql(u8, arg, "-b") or std.mem.eql(u8, arg, "--bootstrap")) {
         i.* += 1;
-        if (i.* >= args.len) return errorResult(T, alloc, "{s} requires a value", .{arg});
+        if (i.* >= args.len) return .{ .err = errMsg(alloc, "{s} requires a value", .{arg}) };
         common.bootstrap = args[i.*];
     } else if (std.mem.startsWith(u8, arg, "--bootstrap=")) {
         common.bootstrap = arg["--bootstrap=".len..];
@@ -375,36 +430,36 @@ fn parseCommon(comptime T: type, alloc: std.mem.Allocator, common: *Common, args
         common.bootstrap = arg[2..];
     } else if (std.mem.eql(u8, arg, "--config")) {
         i.* += 1;
-        if (i.* >= args.len) return errorResult(T, alloc, "--config requires a value", .{});
+        if (i.* >= args.len) return .{ .err = "--config requires a value" };
         common.config_path = args[i.*];
     } else if (std.mem.startsWith(u8, arg, "--config=")) {
         common.config_path = arg["--config=".len..];
     } else {
         return null;
     }
-    return .{ .ok = undefined };
+    return .ok;
 }
 
 /// Record a format choice; a different non-auto format already set is a
 /// conflict reported with the user's own spellings.
-fn setFormat(comptime T: type, alloc: std.mem.Allocator, common: *Common, format: Format, spelling: []const u8) ?Result(T) {
+fn setFormat(alloc: std.mem.Allocator, common: *Common, format: Format, spelling: []const u8) ?[]const u8 {
     if (common.format != .auto and common.format != format)
-        return errorResult(T, alloc, "{s} cannot be combined with {s}", .{ common.format_spelling.?, spelling });
+        return errMsg(alloc, "{s} cannot be combined with {s}", .{ common.format_spelling.?, spelling });
     common.format = format;
     if (common.format_spelling == null) common.format_spelling = spelling;
     return null;
 }
 
-fn parseFormatArg(comptime T: type, alloc: std.mem.Allocator, common: *Common, value: []const u8, spelling: []const u8) ?Result(T) {
+fn parseFormatArg(alloc: std.mem.Allocator, common: *Common, value: []const u8, spelling: []const u8) ?[]const u8 {
     const format = format_mod.parse(value) orelse
-        return errorResult(T, alloc, "--format: '{s}' is not a format (want value, tsv, json, or csv)", .{value});
-    return setFormat(T, alloc, common, format, spelling);
+        return errMsg(alloc, "--format: '{s}' is not a format (want value, tsv, json, or csv)", .{value});
+    return setFormat(alloc, common, format, spelling);
 }
 
-fn finishCommon(comptime T: type, alloc: std.mem.Allocator, common: Common) ?Result(T) {
-    if (common.quiet and common.verbose) return errorResult(T, alloc, "--quiet cannot be combined with --verbose", .{});
-    if (common.bootstrap) |b| if (b.len == 0) return errorResult(T, alloc, "--bootstrap must not be empty", .{});
-    if (common.config_path) |p| if (p.len == 0) return errorResult(T, alloc, "--config must not be empty", .{});
+fn finishCommon(common: Common) ?[]const u8 {
+    if (common.quiet and common.verbose) return "--quiet cannot be combined with --verbose";
+    if (common.bootstrap) |b| if (b.len == 0) return "--bootstrap must not be empty";
+    if (common.config_path) |p| if (p.len == 0) return "--config must not be empty";
     return null;
 }
 
@@ -417,10 +472,10 @@ pub fn parseProduce(alloc: std.mem.Allocator, args: []const []const u8) Result(P
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return .help;
-        if (parseCommon(ProduceArgs, alloc, &common, args, &i)) |r| {
-            switch (r) {
-                .err => return r,
-                else => continue,
+        if (parseCommon(alloc, &common, args, &i)) |step| {
+            switch (step) {
+                .err => |m| return .{ .err = m },
+                .ok => continue,
             }
         }
         if (std.mem.eql(u8, arg, "-H")) {
@@ -434,7 +489,7 @@ pub fn parseProduce(alloc: std.mem.Allocator, args: []const []const u8) Result(P
                 return errorResult(ProduceArgs, alloc, "malformed header '{s}' (want 'name: value')", .{arg[2..]})) catch
                 return .{ .err = "out of memory" };
         } else if (std.mem.eql(u8, arg, "--csv")) {
-            if (setFormat(ProduceArgs, alloc, &common, .csv, "--csv")) |r| return r;
+            if (setFormat(alloc, &common, .csv, "--csv")) |m| return .{ .err = m };
         } else if (std.mem.eql(u8, arg, "--key")) {
             i += 1;
             if (i >= args.len) return errorResult(ProduceArgs, alloc, "--key requires a value", .{});
@@ -442,7 +497,7 @@ pub fn parseProduce(alloc: std.mem.Allocator, args: []const []const u8) Result(P
         } else if (std.mem.startsWith(u8, arg, "--key=")) {
             key_col = arg["--key=".len..];
         } else if (arg.len > 0 and arg[0] == '-') {
-            return unknownOption(ProduceArgs, alloc, .produce, arg);
+            return .{ .err = unknownOption(alloc, .produce, arg) };
         } else if (topic == null) {
             topic = arg;
         } else {
@@ -453,7 +508,7 @@ pub fn parseProduce(alloc: std.mem.Allocator, args: []const []const u8) Result(P
     const topic_name = topic orelse return errorResult(ProduceArgs, alloc, "missing TOPIC", .{});
     if (topic_name.len == 0) return errorResult(ProduceArgs, alloc, "TOPIC must not be empty", .{});
     if (key_col != null and common.format != .csv) return errorResult(ProduceArgs, alloc, "--key requires --csv", .{});
-    if (finishCommon(ProduceArgs, alloc, common)) |r| return r;
+    if (finishCommon(common)) |m| return .{ .err = m };
     return .{ .ok = .{
         .topic = topic_name,
         .common = common,
@@ -469,10 +524,10 @@ pub fn parseConsume(alloc: std.mem.Allocator, args: []const []const u8) Result(C
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return .help;
-        if (parseCommon(ConsumeArgs, alloc, &parsed.common, args, &i)) |r| {
-            switch (r) {
-                .err => return r,
-                else => continue,
+        if (parseCommon(alloc, &parsed.common, args, &i)) |step| {
+            switch (step) {
+                .err => |m| return .{ .err = m },
+                .ok => continue,
             }
         }
         if (std.mem.eql(u8, arg, "-B") or std.mem.eql(u8, arg, "--from-beginning")) {
@@ -570,7 +625,7 @@ pub fn parseConsume(alloc: std.mem.Allocator, args: []const []const u8) Result(C
         } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--follow")) {
             parsed.follow = true;
         } else if (arg.len > 0 and arg[0] == '-') {
-            return unknownOption(ConsumeArgs, alloc, .consume, arg);
+            return .{ .err = unknownOption(alloc, .consume, arg) };
         } else if (topic == null) {
             topic = arg;
         } else {
@@ -584,8 +639,30 @@ pub fn parseConsume(alloc: std.mem.Allocator, args: []const []const u8) Result(C
         return errorResult(ConsumeArgs, alloc, "--follow cannot be combined with --idle", .{});
     if (parsed.common.format == .csv)
         return errorResult(ConsumeArgs, alloc, "--format csv is only valid when producing", .{});
-    if (finishCommon(ConsumeArgs, alloc, parsed.common)) |r| return r;
+    if (finishCommon(parsed.common)) |m| return .{ .err = m };
     parsed.topic = topic_name;
+    return .{ .ok = parsed };
+}
+
+pub fn parseShowConfig(alloc: std.mem.Allocator, args: []const []const u8) Result(ShowConfigArgs) {
+    var parsed: ShowConfigArgs = .{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return .help;
+        if (parseCommon(alloc, &parsed.common, args, &i)) |step| {
+            switch (step) {
+                .err => |m| return .{ .err = m },
+                .ok => continue,
+            }
+        }
+        if (arg.len > 0 and arg[0] == '-')
+            return .{ .err = unknownOption(alloc, .show_config, arg) };
+        return errorResult(ShowConfigArgs, alloc, "unexpected argument '{s}'", .{arg});
+    }
+    if (parsed.common.format != .auto and parsed.common.format != .json)
+        return errorResult(ShowConfigArgs, alloc, "--format: only json is valid with --show-config", .{});
+    if (finishCommon(parsed.common)) |m| return .{ .err = m };
     return .{ .ok = parsed };
 }
 
@@ -691,6 +768,33 @@ test "misspelled long options get a suggestion" {
     try expectErr(ProduceArgs, parseProduce(alloc, &.{ "--bogus", "demo" }), "unknown option '--bogus'");
     try expectErr(ProduceArgs, parseProduce(alloc, &.{ "-x", "demo" }), "unknown option '-x'");
     try expectErr(ProduceArgs, parseProduce(alloc, &.{ "--version", "demo" }), "unknown option '--version'");
+}
+
+test "show-config mode split and parsing" {
+    const alloc = std.heap.page_allocator;
+    const split = splitMode(alloc, &.{"--show-config"});
+    switch (split) {
+        .ok => |result| {
+            try std.testing.expectEqual(Mode.show_config, result.mode);
+            try std.testing.expectEqualSlices([]const u8, &.{}, result.rest);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try expectErr(ModeSplit, splitMode(alloc, &.{ "-c", "--show-config", "demo" }), "--show-config cannot be combined with --consume");
+    try expectErr(ModeSplit, splitMode(alloc, &.{ "-i", "--show-config" }), "--show-config cannot be combined with --install");
+    try expectErr(ModeSplit, splitMode(alloc, &.{ "--show-config", "-c", "demo" }), "--show-config cannot be combined with --consume");
+
+    const ok = parseShowConfig(alloc, &.{ "-b", "h:1", "--config", "x.properties", "--json" });
+    switch (ok) {
+        .ok => |a| {
+            try std.testing.expectEqualStrings("h:1", a.common.bootstrap.?);
+            try std.testing.expectEqual(Format.json, a.common.format);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try expectErr(ShowConfigArgs, parseShowConfig(alloc, &.{ "--format", "tsv" }), "--format: only json is valid with --show-config");
+    try expectErr(ShowConfigArgs, parseShowConfig(alloc, &.{"demo"}), "unexpected argument 'demo'");
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{"--show-confg"}), "unknown option '--show-confg' (did you mean '--show-config'?)");
 }
 
 test "mode flags are split from arguments" {
