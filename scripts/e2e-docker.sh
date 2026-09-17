@@ -75,7 +75,7 @@ rm -f "$err"
 echo "PASS early-pipe"
 
 # /dev/full: a write error must surface as a nonzero exit with a kite: line.
-if [ -w /dev/full ] && ! : >/dev/full 2>/dev/null; then
+if [ -w /dev/full ] && ! echo probe >/dev/full 2>/dev/null; then
     err=$(mktemp)
     set +e
     zig-out/bin/kite -c -B -t 5s "$TOPIC" >/dev/full 2>"$err"
