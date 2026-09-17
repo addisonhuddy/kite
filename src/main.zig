@@ -122,11 +122,9 @@ pub fn main(init: std.process.Init) !void {
     term.color = .{ .enabled = term.detect(io, std.Io.File.stderr(), init.environ_map) };
 
     const args = init.minimal.args.toSlice(alloc) catch fatal("out of memory", .{});
-    for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) {
-            writeText(init, std.Io.File.stdout(), "kite " ++ cli_args.version ++ "\n");
-            return;
-        }
+    if (args.len == 2 and (std.mem.eql(u8, args[1], "-V") or std.mem.eql(u8, args[1], "--version"))) {
+        writeText(init, std.Io.File.stdout(), "kite " ++ cli_args.version ++ "\n");
+        return;
     }
     const split = cli_args.splitMode(alloc, args[1..]);
     const mode_args = switch (split) {
@@ -522,13 +520,17 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
         error.PartitionNotFound => fatal("partition {d} not found in topic '{s}'", .{ consume.partition orelse -1, topic_name }),
         error.OffsetOutOfRange => fatalErr(&cli, "cannot start consuming"),
         error.WriteFailed => {
-            // Downstream closed the pipe (e.g. `| head`): stop quietly.
-            std.process.exit(0);
+            const write_err = stdout.err orelse error.Unexpected;
+            if (write_err == error.BrokenPipe or stdoutClosed()) std.process.exit(0);
+            fatal("cannot write stdout: {s}", .{@errorName(write_err)});
         },
         error.FetchFailed => fatalErr(&cli, "consume failed"),
         else => fatalErr(&cli, "consume failed"),
     };
-    stdout.interface.flush() catch std.process.exit(0);
+    stdout.flush() catch |err| switch (err) {
+        error.BrokenPipe => std.process.exit(0),
+        else => fatal("cannot write stdout: {s}", .{@errorName(err)}),
+    };
     const stopped_by_signal = interrupted.load(.acquire);
     const reason: []const u8 = if (stopped_by_signal)
         " (interrupted)"
