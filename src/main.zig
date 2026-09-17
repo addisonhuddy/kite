@@ -159,6 +159,7 @@ pub fn main(init: std.process.Init) !void {
     const topic = produce.topic;
     const static_headers = produce.headers;
     const verbose = produce.common.verbose;
+    const quiet = produce.common.quiet;
     const csv_mode = produce.csv;
     const json_mode = produce.common.json;
     const csv_key_col = produce.key_col;
@@ -176,7 +177,7 @@ pub fn main(init: std.process.Init) !void {
     const r = &stdin_reader.interface;
     const stdin_fd = std.Io.File.stdin().handle;
     const stderr_tty = std.Io.File.stderr().isTty(io) catch false;
-    if (stderr_tty and (std.Io.File.stdin().isTty(io) catch false))
+    if (!quiet and stderr_tty and (std.Io.File.stdin().isTty(io) catch false))
         note("reading records from the terminal, one per line (Ctrl-D to finish)", .{});
 
     var cols: [][]const u8 = &.{};
@@ -201,7 +202,7 @@ pub fn main(init: std.process.Init) !void {
     var t_flush: u64 = 0;
     var t_drain: u64 = 0;
     var timer = Lap.init(io);
-    var stats = stats_mod.Stats.init(io, topic, stderr_tty and !verbose);
+    var stats = stats_mod.Stats.init(io, topic, stderr_tty and !verbose and !quiet);
     defer stats.deinit();
     live_stats = &stats;
     read_loop: while (true) {
@@ -270,24 +271,26 @@ pub fn main(init: std.process.Init) !void {
     for (cli.last_offsets.items) |po| stats.noteOffset(po.pidx, po.offset);
     if (timing) std.debug.print("read {d}ms send {d}ms drain {d}ms conns {d}\n", .{ t_read / 1_000_000, t_flush / 1_000_000, (t_drain + timer.lap()) / 1_000_000, cli.conns.count() });
 
-    produceSummary(&cli, &stats, total, nparts);
+    produceSummary(&cli, &stats, total, nparts, quiet);
     cli.deinit();
 }
 
 /// Post-produce report on stderr; stdout stays free for pipeline data.
-fn produceSummary(cli: *client.Client, stats: *stats_mod.Stats, total: u64, nparts: usize) void {
+fn produceSummary(cli: *client.Client, stats: *stats_mod.Stats, total: u64, nparts: usize, quiet: bool) void {
     const parts_used = cli.last_offsets.items.len;
     stats.clearLine();
-    if (term.color.enabled)
-        std.debug.print("{s}{d}{s} record(s) produced to '{s}{s}{s}' across {d} of {d} partition(s)\n", .{
-            term.bold, total, term.reset, term.cyan, stats.topic, term.reset, parts_used, nparts,
-        })
-    else
-        std.debug.print("{d} record(s) produced to '{s}' across {d} of {d} partition(s)\n", .{
-            total, stats.topic, parts_used, nparts,
-        });
-    stats.finish();
-    if (total > 0) {
+    if (!quiet) {
+        if (term.color.enabled)
+            std.debug.print("{s}{d}{s} record(s) produced to '{s}{s}{s}' across {d} of {d} partition(s)\n", .{
+                term.bold, total, term.reset, term.cyan, stats.topic, term.reset, parts_used, nparts,
+            })
+        else
+            std.debug.print("{d} record(s) produced to '{s}' across {d} of {d} partition(s)\n", .{
+                total, stats.topic, parts_used, nparts,
+            });
+        stats.finish();
+    }
+    if (total > 0 and !quiet) {
         var lat_buf: [32]u8 = undefined;
         const secs = stats.elapsedSecs();
         const per_req = if (cli.produce_requests > 0)
@@ -466,6 +469,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     };
     const topic_name = consume.topic;
     const verbose = consume.common.verbose;
+    const quiet = consume.common.quiet;
 
     var cfg = loadConfig(init, alloc, consume.common);
     var cli = client.Client.init(alloc, init.io, init.environ_map, &cfg);
@@ -487,7 +491,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
 
     var stdout_buf: [64 * 1024]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(init.io, &stdout_buf);
-    var stats = stats_mod.Stats.init(init.io, topic_name, stderr_tty and !verbose);
+    var stats = stats_mod.Stats.init(init.io, topic_name, stderr_tty and !verbose and !quiet);
     defer stats.deinit();
     live_stats = &stats;
     stats.clear_before_output = stdout_tty;
@@ -541,13 +545,15 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     else
         "";
     stats.clearLine();
-    if (term.color.enabled)
-        std.debug.print("{s}{d}{s} record(s) consumed from '{s}{s}{s}'{s}\n", .{
-            term.bold, consumed, term.reset, term.cyan, topic_name, term.reset, reason,
-        })
-    else
-        std.debug.print("{d} record(s) consumed from '{s}'{s}\n", .{ consumed, topic_name, reason });
-    stats.finish();
+    if (!quiet) {
+        if (term.color.enabled)
+            std.debug.print("{s}{d}{s} record(s) consumed from '{s}{s}{s}'{s}\n", .{
+                term.bold, consumed, term.reset, term.cyan, topic_name, term.reset, reason,
+            })
+        else
+            std.debug.print("{d} record(s) consumed from '{s}'{s}\n", .{ consumed, topic_name, reason });
+        stats.finish();
+    }
     cli.deinit();
     std.process.exit(if (stopped_by_signal) 130 else 0);
 }

@@ -5,6 +5,7 @@ const protocol = @import("protocol.zig");
 /// Options shared by produce and consume.
 pub const Common = struct {
     verbose: bool = false,
+    quiet: bool = false,
     json: bool = false,
     bootstrap: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
@@ -132,6 +133,7 @@ pub const produce_help =
     "  --key COL             Use CSV column COL as the record key; requires --csv.\n" ++
     "  --json                Read one JSON object per line:\n" ++
     "                        {\"key\":..,\"value\":..,\"headers\":{..}}\n" ++
+    "  -q, --quiet           Suppress the summary and progress lines on stderr.\n" ++
     "  -v, --verbose         Write connection and retry diagnostics to stderr.\n" ++
     "  -h, --help            Show this help and exit.\n" ++
     "\n" ++
@@ -170,6 +172,7 @@ pub const consume_help =
     "  --json                Write one JSON object per record:\n" ++
     "                        {\"topic\",\"partition\",\"offset\",\"timestamp\",\"key\",\n" ++
     "                        \"headers\",\"value\"}\n" ++
+    "  -q, --quiet           Suppress the summary and progress lines on stderr.\n" ++
     "  -v, --verbose         Write fetch diagnostics to stderr.\n" ++
     "  -h, --help            Show this help and exit.\n" ++
     "\n" ++
@@ -287,6 +290,8 @@ fn parseCommon(comptime T: type, alloc: std.mem.Allocator, common: *Common, args
     const arg = args[i.*];
     if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
         common.verbose = true;
+    } else if (std.mem.eql(u8, arg, "-q") or std.mem.eql(u8, arg, "--quiet")) {
+        common.quiet = true;
     } else if (std.mem.eql(u8, arg, "--json")) {
         common.json = true;
     } else if (std.mem.eql(u8, arg, "-b") or std.mem.eql(u8, arg, "--bootstrap")) {
@@ -310,6 +315,7 @@ fn parseCommon(comptime T: type, alloc: std.mem.Allocator, common: *Common, args
 }
 
 fn finishCommon(comptime T: type, alloc: std.mem.Allocator, common: Common) ?Result(T) {
+    if (common.quiet and common.verbose) return errorResult(T, alloc, "--quiet cannot be combined with --verbose", .{});
     if (common.bootstrap) |b| if (b.len == 0) return errorResult(T, alloc, "--bootstrap must not be empty", .{});
     if (common.config_path) |p| if (p.len == 0) return errorResult(T, alloc, "--config must not be empty", .{});
     return null;
@@ -522,6 +528,22 @@ test "produce parser accepts option spellings and zero-independent fields" {
     }
 }
 
+test "quiet flag parses and conflicts with verbose" {
+    const alloc = std.heap.page_allocator;
+    const result = parseProduce(alloc, &.{ "-q", "demo" });
+    switch (result) {
+        .ok => |args| try std.testing.expect(args.common.quiet),
+        else => return error.TestUnexpectedResult,
+    }
+    const long = parseConsume(alloc, &.{ "--quiet", "demo" });
+    switch (long) {
+        .ok => |args| try std.testing.expect(args.common.quiet),
+        else => return error.TestUnexpectedResult,
+    }
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{ "-q", "-v", "demo" }), "--quiet cannot be combined with --verbose");
+    try expectErr(ConsumeArgs, parseConsume(alloc, &.{ "-q", "-v", "demo" }), "--quiet cannot be combined with --verbose");
+}
+
 test "mode flags are split from arguments" {
     const alloc = std.heap.page_allocator;
     const before = splitMode(alloc, &.{ "-c", "events" });
@@ -660,6 +682,7 @@ test "parser reports exact argument errors" {
     try expectErr(ConsumeArgs, parseConsume(alloc, &.{ "-f", "--idle", "1s", "demo" }), "--follow cannot be combined with --idle");
     try expectErr(ConsumeArgs, parseConsume(alloc, &.{ "-H", "a: b", "demo" }), "'-H' is a produce option and is not valid with -c");
     try expectErr(ConsumeArgs, parseConsume(alloc, &.{ "--csv", "demo" }), "'--csv' is a produce option and is not valid with -c");
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{ "-q", "-v", "demo" }), "--quiet cannot be combined with --verbose");
 }
 
 test "help is detected in argument order" {

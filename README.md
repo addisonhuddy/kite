@@ -172,6 +172,7 @@ kite --version                Print the version.
 | consume | `-f`, `--follow` | Never stop on idle, even when stdout is a pipe. |
 | install | `--dir DIR` | Install to DIR (default `$KITE_INSTALL_DIR` or `~/.local/bin`). |
 | install | `-y`, `--yes` | Add the install directory to `PATH` without prompting. |
+| produce, consume | `-q`, `--quiet` | Suppress the summary and progress lines on stderr. |
 | produce, consume | `-v`, `--verbose` | Connection, retry, and fetch diagnostics on stderr. |
 | all | `-h`, `--help` | Plain-text help for the selected mode. |
 
@@ -350,6 +351,8 @@ a non-empty `NO_COLOR`, forced with `KITE_COLOR=always`, or disabled
 explicitly with `KITE_COLOR=never`. Nothing is colored when the stream is a
 pipe.
 
+- `-q` / `--quiet` suppresses the live status line and the end-of-run
+  summaries; data, warnings, and errors are unchanged.
 - `-v` / `--verbose` enables connection, retry, and fetch diagnostics.
 - `KITE_DEBUG=1` enables frame and TLS diagnostics.
 - `KITE_TIME=1` prints producer timing totals and connection count.
