@@ -141,6 +141,10 @@ pub fn main(init: std.process.Init) !void {
             install.run(init, mode_args.rest, alloc);
             return;
         },
+        .show_config => {
+            runShowConfig(init, mode_args.rest, alloc);
+            return;
+        },
         .produce => {},
     }
     const parsed = cli_args.parseProduce(alloc, mode_args.rest);
@@ -165,7 +169,7 @@ pub fn main(init: std.process.Init) !void {
     const value_mode = produce.common.format == .value;
     const csv_key_col = produce.key_col;
 
-    var cfg = loadConfig(init, alloc, produce.common);
+    var cfg = loadConfig(init, alloc, produce.common, &dummy_source);
     var cli = client.Client.init(alloc, io, init.environ_map, &cfg);
     connectAndResolve(&cli, topic, "write");
 
@@ -408,12 +412,13 @@ fn note(comptime fmt: []const u8, args: anytype) void {
 const search_path_hint = "./kite.properties, $XDG_CONFIG_HOME/kite/kite.properties, ~/.config/kite/kite.properties";
 
 /// Resolve configuration from flags, environment and properties file.
-fn loadConfig(init: std.process.Init, alloc: std.mem.Allocator, common: cli_args.Common) config.Config {
-    var source: config.Source = .{};
+var dummy_source: config.Source = .{};
+
+fn loadConfig(init: std.process.Init, alloc: std.mem.Allocator, common: cli_args.Common, source: *config.Source) config.Config {
     var cfg = config.load(init.io, alloc, init.environ_map, .{
         .bootstrap = common.bootstrap,
         .config_path = common.config_path,
-    }, &source) catch |err| switch (err) {
+    }, source) catch |err| switch (err) {
         error.ConfigNotFound => fatal(
             "no broker configured. Pass -b HOST:PORT, set BOOTSTRAP_SERVERS, or create kite.properties (searched {s}); see 'kite --help' for the file format",
             .{search_path_hint},
@@ -474,7 +479,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     const verbose = consume.common.verbose;
     const quiet = consume.common.quiet;
 
-    var cfg = loadConfig(init, alloc, consume.common);
+    var cfg = loadConfig(init, alloc, consume.common, &dummy_source);
     var cli = client.Client.init(alloc, init.io, init.environ_map, &cfg);
     connectAndResolve(&cli, topic_name, "read");
 
@@ -559,6 +564,67 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     }
     cli.deinit();
     std.process.exit(if (stopped_by_signal) 130 else 0);
+}
+
+fn runShowConfig(init: std.process.Init, args: []const []const u8, alloc: std.mem.Allocator) noreturn {
+    const parsed = cli_args.parseShowConfig(alloc, args);
+    const common = switch (parsed) {
+        .help => {
+            if (term.detect(init.io, std.Io.File.stdout(), init.environ_map)) {
+                term.color.enabled = true;
+                const page = term.renderHelp(alloc, cli_args.show_config_help) catch fatal("out of memory", .{});
+                writeText(init, std.Io.File.stdout(), page);
+            } else writeText(init, std.Io.File.stdout(), cli_args.show_config_help);
+            std.process.exit(0);
+        },
+        .err => |message| parseFatal(init, message, cli_args.show_config_usage),
+        .ok => |value| value.common,
+    };
+
+    var source: config.Source = .{};
+    const cfg = loadConfig(init, alloc, common, &source);
+
+    var stdout_buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writer(init.io, &stdout_buf);
+    const outw = &w.interface;
+    const json_mode = common.format == .json;
+    if (json_mode) {
+        outw.writeAll("{\"file\":") catch {};
+        if (source.file) |f| json.writeString(outw, f) catch {} else outw.writeAll("null") catch {};
+        outw.writeAll(",\"settings\":{") catch {};
+    } else {
+        outw.writeAll("config file: ") catch {};
+        outw.writeAll(source.file orelse "(none)") catch {};
+        outw.writeByte('\n') catch {};
+    }
+    var first = true;
+    for (std.enums.values(config.Key)) |key| {
+        const name = config.key_names.get(key);
+        const value = config.valueString(&cfg, alloc, key) catch fatal("out of memory", .{});
+        if (json_mode) {
+            if (!first) outw.writeByte(',') catch {};
+            first = false;
+            json.writeString(outw, name) catch {};
+            outw.writeAll(":{\"value\":") catch {};
+            if (value.len == 0) outw.writeAll("null") catch {} else json.writeString(outw, value) catch {};
+            outw.writeAll(",\"source\":\"") catch {};
+            outw.writeAll(@tagName(source.origins.get(key))) catch {};
+            outw.writeByte('"') catch {};
+            if (config.isSecret(key)) outw.writeAll(",\"redacted\":true") catch {};
+            outw.writeByte('}') catch {};
+        } else {
+            const shown = if (value.len == 0) "(unset)" else value;
+            outw.writeAll(name) catch {};
+            outw.writeAll("                        "[0 .. 24 - @min(name.len, 23)]) catch {};
+            outw.writeAll(shown) catch {};
+            outw.writeAll("                        "[0 .. 24 - @min(shown.len, 23)]) catch {};
+            outw.writeAll(@tagName(source.origins.get(key))) catch {};
+            outw.writeByte('\n') catch {};
+        }
+    }
+    if (json_mode) outw.writeAll("}}\n") catch {};
+    outw.flush() catch {};
+    std.process.exit(0);
 }
 
 /// Idle bound applied to `kite -c` when stdout is not a terminal and no

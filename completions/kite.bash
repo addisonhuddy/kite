@@ -10,6 +10,7 @@ _kite() {
         case "$w" in
             -c | --consume) mode=consume ;;
             -i | --install) mode=install ;;
+            --show-config) mode=show-config ;;
         esac
     done
 
@@ -37,9 +38,12 @@ _kite() {
         install)
             opts="-i --install --dir -y --yes -h --help"
             ;;
+        show-config)
+            opts="--show-config -b --bootstrap --config --format --json -q --quiet -v --verbose -h --help"
+            ;;
         *)
-            opts="-c --consume -i --install -V --version -b --bootstrap \
-                --config --format --json -H --csv --key \
+            opts="-c --consume -i --install -V --version --show-config \
+                -b --bootstrap --config --format --json -H --csv --key \
                 -q --quiet -v --verbose -h --help"
             ;;
     esac

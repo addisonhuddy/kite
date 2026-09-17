@@ -26,6 +26,16 @@ _kite() {
             '(-t --idle)'{-t,--idle}'[stop after idle duration]:duration:' \
             '(-f --follow)'{-f,--follow}'[never stop on idle]' \
             '*:topic:'
+    elif (( ${words[(I)--show-config]} )); then
+        _arguments -s \
+            '--show-config[show effective configuration]' \
+            '(-b --bootstrap)'{-b,--bootstrap}'[comma-separated host:port brokers]:hosts:' \
+            '--config[read this properties file]:file:_files' \
+            '--format[output shape]:format:(json)' \
+            '--json[JSON output]' \
+            '(-q --quiet)'{-q,--quiet}'[suppress progress lines]' \
+            '(-v --verbose)'{-v,--verbose}'[diagnostics]' \
+            '(-h --help)'{-h,--help}'[show help]'
     elif (( ${words[(I)(-i|--install)]} )); then
         _arguments -s \
             '(-i --install)'{-i,--install}'[install mode]' \
@@ -36,6 +46,7 @@ _kite() {
         _arguments -s $shared \
             '(-c --consume)'{-c,--consume}'[consume mode]' \
             '(-i --install)'{-i,--install}'[install mode]' \
+            '--show-config[show effective configuration]' \
             '-H[add a name: value header]:header:' \
             '--csv[read RFC 4180 CSV (same as --format csv)]' \
             '--key[use CSV column as record key]:column:' \

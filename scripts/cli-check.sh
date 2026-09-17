@@ -177,6 +177,60 @@ printf 'security.protocol=PLAINTEXT\n' >"$TMP/work/kite.properties"
 run_case file-without-bootstrap 1 empty "has no bootstrap.servers; add it, or pass -b HOST:PORT / set BOOTSTRAP_SERVERS" demo
 rm "$TMP/work/kite.properties"
 
+# --show-config: offline config inspection.
+set +e
+(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" BOOTSTRAP_SERVERS=h:1 "$BIN" --show-config >"$TMP/show-config-text.out" 2>"$TMP/show-config-text.err")
+status=$?
+set -e
+[ "$status" -eq 0 ] \
+    && grep -Eq '^bootstrap\.servers +h:1 +env$' "$TMP/show-config-text.out" \
+    && grep -Eq '^security\.protocol +PLAINTEXT +default$' "$TMP/show-config-text.out" \
+    && [ ! -s "$TMP/show-config-text.err" ] || {
+    echo "FAIL show-config-text"; cat "$TMP/show-config-text.out"; cat "$TMP/show-config-text.err"; exit 1;
+}
+echo "PASS show-config-text"
+
+printf 'security.protocol=SASL_PLAINTEXT\nsasl.mechanism=PLAIN\nsasl.username=u\nsasl.password=hunter2\nbootstrap.servers=f:2\n' >"$TMP/work/kite.properties"
+set +e
+(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" --show-config >"$TMP/show-config-redact.out" 2>&1)
+status=$?
+set -e
+[ "$status" -eq 0 ] && grep -Fq '********' "$TMP/show-config-redact.out" \
+    && ! grep -Fq hunter2 "$TMP/show-config-redact.out" || {
+    echo "FAIL show-config-redact"; cat "$TMP/show-config-redact.out"; exit 1;
+}
+echo "PASS show-config-redact"
+
+set +e
+(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" --show-config --json -b h:1 >"$TMP/show-config-json.out" 2>"$TMP/show-config-json.err")
+status=$?
+set -e
+[ "$status" -eq 0 ] \
+    && grep -Fq '{"file":' "$TMP/show-config-json.out" \
+    && grep -Fq '"sasl.password":{"value":"********","source":"file","redacted":true}' "$TMP/show-config-json.out" \
+    && grep -Fq '"bootstrap.servers":{"value":"h:1","source":"flag"}' "$TMP/show-config-json.out" \
+    || { echo "FAIL show-config-json"; cat "$TMP/show-config-json.out"; exit 1; }
+if command -v jq >/dev/null 2>&1; then
+    jq -e '.settings' "$TMP/show-config-json.out" >/dev/null || {
+        echo "FAIL show-config-json: jq rejected .settings"; exit 1;
+    }
+fi
+echo "PASS show-config-json"
+
+printf 'security.protocol=bogus\nbootstrap.servers=f:2\n' >"$TMP/work/kite.properties"
+set +e
+(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" --show-config >"$TMP/show-config-invalid.out" 2>"$TMP/show-config-invalid.err")
+status=$?
+set -e
+[ "$status" -eq 1 ] && [ ! -s "$TMP/show-config-invalid.out" ] \
+    && grep -Fq "invalid security.protocol" "$TMP/show-config-invalid.err" || {
+    echo "FAIL show-config-invalid"; cat "$TMP/show-config-invalid.err"; exit 1;
+}
+echo "PASS show-config-invalid"
+rm "$TMP/work/kite.properties"
+
+run_case show-config-conflict 1 empty "kite: --show-config cannot be combined with --consume" -c --show-config demo
+
 grep -Fq "Try 'kite --help' for examples." "$TMP/unknown-option.err"
 grep -Fq "Try 'kite -c --help' for examples." "$TMP/consume-unknown.err"
 for name in empty-topic unknown-option missing-header malformed-header missing-key key-without-csv extra-topic; do

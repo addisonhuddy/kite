@@ -287,6 +287,27 @@ Templates are in [`examples/config/`](examples/config). Idempotence means
 broker deduplication of retried batches, not end-to-end exactly-once
 processing.
 
+### Inspecting the effective configuration
+
+`kite --show-config` resolves the effective settings — flags over
+environment over the properties file — and prints each key with its origin,
+without ever connecting to a broker. An invalid or incomplete configuration
+exits 1 with the usual `kite: ...` message; `sasl.password` is redacted.
+
+```text
+config file: /home/me/kite.properties
+bootstrap.servers        localhost:9092          flag
+security.protocol        PLAINTEXT               default
+sasl.password            ********               env
+...
+```
+
+For automation there is a stable-schema JSON form:
+
+```sh
+kite --show-config --json | jq -r '.settings["bootstrap.servers"].value'
+```
+
 ## Output streams and exit codes
 
 - Producer: stdout is never written; the summary and diagnostics go to
