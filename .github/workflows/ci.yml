@@ -21,3 +21,15 @@ jobs:
       - run: scripts/install-quote-check.sh
       - run: scripts/install-pty-check.sh
       - run: scripts/check-size.sh
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: zig build
+      - run: scripts/e2e-docker.sh
