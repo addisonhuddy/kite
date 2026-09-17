@@ -3,6 +3,7 @@ const client = @import("client.zig");
 const protocol = @import("protocol.zig");
 const stats = @import("stats.zig");
 const json = @import("json.zig");
+const format_mod = @import("format.zig");
 
 const Encoder = protocol.Encoder;
 const Decoder = protocol.Decoder;
@@ -15,8 +16,8 @@ pub const Options = struct {
     partition: ?i32 = null,
     max_records: ?u64 = null,
     idle_ms: ?u64 = null,
-    /// Emit one JSON object per record instead of TAB-separated text.
-    json: bool = false,
+    /// Record output shape; `auto` sniffs keys/headers like the producer.
+    format: format_mod.Format = .auto,
     stats: ?*stats.Stats = null,
     /// Set asynchronously (e.g. by a SIGINT handler) to stop after the
     /// current fetch round.
@@ -318,7 +319,7 @@ fn fetchLeader(
                     .max = opts.max_records,
                     .range = &range,
                     .stats = opts.stats,
-                    .json = opts.json,
+                    .format = opts.format,
                     .topic = opts.topic,
                     .pidx = pidx,
                 };
@@ -363,7 +364,7 @@ const RecordSink = struct {
     max: ?u64,
     range: *Range,
     stats: ?*stats.Stats,
-    json: bool,
+    format: format_mod.Format,
     topic: []const u8,
     pidx: i32,
 };
@@ -387,23 +388,30 @@ fn writeJsonRecord(w: *std.Io.Writer, topic: []const u8, pidx: i32, offset: i64,
     try w.writeByte('}');
 }
 
+/// key<TAB>[h: v<TAB>]*value — the shape `auto` and `tsv` share.
+fn writeTsvRecord(w: *std.Io.Writer, rec: protocol.Record) !void {
+    if (rec.key) |key| try w.writeAll(key);
+    try w.writeByte('\t');
+    for (rec.headers) |header| {
+        try w.writeAll(header.key);
+        try w.writeAll(": ");
+        if (header.value) |value| try w.writeAll(value);
+        try w.writeByte('\t');
+    }
+    try w.writeAll(rec.value);
+}
+
 fn onRecord(ctx: *RecordSink, offset: i64, timestamp_ms: i64, rec: protocol.Record) !void {
     if (ctx.max) |max| if (ctx.count.* >= max) return;
     if (ctx.stats) |s| s.beforeOutput();
-    if (ctx.json) {
-        try writeJsonRecord(ctx.out, ctx.topic, ctx.pidx, offset, timestamp_ms, rec);
-    } else if (rec.key == null and rec.headers.len == 0) {
-        try ctx.out.writeAll(rec.value);
-    } else {
-        if (rec.key) |key| try ctx.out.writeAll(key);
-        try ctx.out.writeByte('\t');
-        for (rec.headers) |header| {
-            try ctx.out.writeAll(header.key);
-            try ctx.out.writeAll(": ");
-            if (header.value) |value| try ctx.out.writeAll(value);
-            try ctx.out.writeByte('\t');
-        }
-        try ctx.out.writeAll(rec.value);
+    switch (ctx.format) {
+        .json => try writeJsonRecord(ctx.out, ctx.topic, ctx.pidx, offset, timestamp_ms, rec),
+        .value => try ctx.out.writeAll(rec.value),
+        .tsv => try writeTsvRecord(ctx.out, rec),
+        .auto, .csv => if (rec.key == null and rec.headers.len == 0)
+            try ctx.out.writeAll(rec.value)
+        else
+            try writeTsvRecord(ctx.out, rec),
     }
     try ctx.out.writeByte('\n');
     ctx.count.* += 1;
@@ -472,4 +480,35 @@ test "json record output without key or headers" {
         "{\"topic\":\"t\",\"partition\":0,\"offset\":0,\"timestamp\":-1,\"key\":null,\"headers\":[],\"value\":\"x\"}",
         w.buffered(),
     );
+}
+
+test "text record output honors value and tsv formats" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var count: u64 = 0;
+    var range = Range{};
+    const headers = [_]protocol.Header{.{ .key = "h", .value = "v" }};
+    var sink = RecordSink{
+        .out = &w,
+        .count = &count,
+        .max = null,
+        .range = &range,
+        .stats = null,
+        .format = .value,
+        .topic = "t",
+        .pidx = 0,
+    };
+    try onRecord(&sink, 0, 0, .{ .key = "k", .value = "val", .headers = &headers });
+    try std.testing.expectEqualStrings("val\n", w.buffered());
+
+    w = .fixed(&buf);
+    sink.format = .tsv;
+    try onRecord(&sink, 1, 0, .{ .value = "v2", .headers = &headers });
+    try std.testing.expectEqualStrings("\th: v\tv2\n", w.buffered());
+
+    w = .fixed(&buf);
+    sink.format = .auto;
+    try onRecord(&sink, 2, 0, .{ .value = "plain" });
+    try onRecord(&sink, 3, 0, .{ .key = "k", .value = "v3" });
+    try std.testing.expectEqualStrings("plain\nk\tv3\n", w.buffered());
 }

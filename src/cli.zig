@@ -1,12 +1,17 @@
 const std = @import("std");
 const consumer = @import("consumer.zig");
 const protocol = @import("protocol.zig");
+const format_mod = @import("format.zig");
+
+pub const Format = format_mod.Format;
 
 /// Options shared by produce and consume.
 pub const Common = struct {
     verbose: bool = false,
     quiet: bool = false,
-    json: bool = false,
+    format: Format = .auto,
+    /// First spelling that set `format`, for conflict messages.
+    format_spelling: ?[]const u8 = null,
     bootstrap: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
 };
@@ -14,9 +19,12 @@ pub const Common = struct {
 pub const ProduceArgs = struct {
     topic: []const u8,
     common: Common = .{},
-    csv: bool = false,
     key_col: ?[]const u8 = null,
     headers: []const protocol.Header,
+
+    pub fn isCsv(a: ProduceArgs) bool {
+        return a.common.format == .csv;
+    }
 };
 
 pub const ConsumeArgs = struct {
@@ -55,6 +63,7 @@ fn takesSeparateValue(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "-b") or
         std.mem.eql(u8, arg, "--bootstrap") or
         std.mem.eql(u8, arg, "--config") or
+        std.mem.eql(u8, arg, "--format") or
         std.mem.eql(u8, arg, "-H") or
         std.mem.eql(u8, arg, "--key") or
         std.mem.eql(u8, arg, "--offset") or
@@ -129,19 +138,18 @@ pub const produce_help =
     "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
     "  --config FILE         Read this properties file instead of searching.\n" ++
     "  -H HEADER             Add a 'name: value' header (repeatable).\n" ++
-    "  --csv                 Read RFC 4180 CSV and write JSON values.\n" ++
+    "  --csv                 Read RFC 4180 CSV (same as --format csv).\n" ++
     "  --key COL             Use CSV column COL as the record key; requires --csv.\n" ++
-    "  --json                Read one JSON object per line:\n" ++
-    "                        {\"key\":..,\"value\":..,\"headers\":{..}}\n" ++
+    "  --format FMT          Record shape: value, tsv, json (default: auto; see\n" ++
+    "                        below). --json is short for --format json.\n" ++
     "  -q, --quiet           Suppress the summary and progress lines on stderr.\n" ++
     "  -v, --verbose         Write connection and retry diagnostics to stderr.\n" ++
     "  -h, --help            Show this help and exit.\n" ++
     "\n" ++
     "Input format:\n" ++
-    "  value                 Write a value-only record.\n" ++
-    "  key<TAB>value         Write a record with a key and value.\n" ++
-    "  key<TAB>h: v<TAB>value\n" ++
-    "                        Write a record with headers between key and value.\n" ++
+    "  auto/tsv              value | key<TAB>value | key<TAB>h: v<TAB>value\n" ++
+    "  value                 The whole line is the value; TAB is not special.\n" ++
+    "  json                  {\"key\":..,\"value\":..,\"headers\":{..}} per line.\n" ++
     "\n" ++
     "Examples:\n" ++
     "  kite events < examples/data/lines.txt\n" ++
@@ -169,12 +177,17 @@ pub const consume_help =
     "  --idle DUR            Stop after DUR without a record (3s, 500ms, 1m;\n" ++
     "                        a bare number is milliseconds). Also -t.\n" ++
     "  -f, --follow          Never stop on idle; wait for new records.\n" ++
-    "  --json                Write one JSON object per record:\n" ++
-    "                        {\"topic\",\"partition\",\"offset\",\"timestamp\",\"key\",\n" ++
-    "                        \"headers\",\"value\"}\n" ++
+    "  --format FMT          Record shape: value, tsv, json (default: auto; see\n" ++
+    "                        below). --json is short for --format json.\n" ++
     "  -q, --quiet           Suppress the summary and progress lines on stderr.\n" ++
     "  -v, --verbose         Write fetch diagnostics to stderr.\n" ++
     "  -h, --help            Show this help and exit.\n" ++
+    "\n" ++
+    "Output format:\n" ++
+    "  auto                  Value alone, or key<TAB>h: v<TAB>value when set.\n" ++
+    "  value                 Only the record value.\n" ++
+    "  tsv                   Always key<TAB>[h: v<TAB>]value (empty key field).\n" ++
+    "  json                  One object per record with full metadata.\n" ++
     "\n" ++
     "By default, start at the latest offset. When stdout is a terminal the read\n" ++
     "follows new records until Ctrl-C; when stdout is a pipe or file and none of\n" ++
@@ -293,7 +306,14 @@ fn parseCommon(comptime T: type, alloc: std.mem.Allocator, common: *Common, args
     } else if (std.mem.eql(u8, arg, "-q") or std.mem.eql(u8, arg, "--quiet")) {
         common.quiet = true;
     } else if (std.mem.eql(u8, arg, "--json")) {
-        common.json = true;
+        if (setFormat(T, alloc, common, .json, "--json")) |r| return r;
+    } else if (std.mem.eql(u8, arg, "--format")) {
+        i.* += 1;
+        if (i.* >= args.len) return errorResult(T, alloc, "--format requires a value", .{});
+        const value = args[i.*];
+        if (parseFormatArg(T, alloc, common, value, std.fmt.allocPrint(alloc, "--format {s}", .{value}) catch return .{ .err = "out of memory" })) |r| return r;
+    } else if (std.mem.startsWith(u8, arg, "--format=")) {
+        if (parseFormatArg(T, alloc, common, arg["--format=".len..], arg)) |r| return r;
     } else if (std.mem.eql(u8, arg, "-b") or std.mem.eql(u8, arg, "--bootstrap")) {
         i.* += 1;
         if (i.* >= args.len) return errorResult(T, alloc, "{s} requires a value", .{arg});
@@ -314,6 +334,22 @@ fn parseCommon(comptime T: type, alloc: std.mem.Allocator, common: *Common, args
     return .{ .ok = undefined };
 }
 
+/// Record a format choice; a different non-auto format already set is a
+/// conflict reported with the user's own spellings.
+fn setFormat(comptime T: type, alloc: std.mem.Allocator, common: *Common, format: Format, spelling: []const u8) ?Result(T) {
+    if (common.format != .auto and common.format != format)
+        return errorResult(T, alloc, "{s} cannot be combined with {s}", .{ common.format_spelling.?, spelling });
+    common.format = format;
+    if (common.format_spelling == null) common.format_spelling = spelling;
+    return null;
+}
+
+fn parseFormatArg(comptime T: type, alloc: std.mem.Allocator, common: *Common, value: []const u8, spelling: []const u8) ?Result(T) {
+    const format = format_mod.parse(value) orelse
+        return errorResult(T, alloc, "--format: '{s}' is not a format (want value, tsv, json, or csv)", .{value});
+    return setFormat(T, alloc, common, format, spelling);
+}
+
 fn finishCommon(comptime T: type, alloc: std.mem.Allocator, common: Common) ?Result(T) {
     if (common.quiet and common.verbose) return errorResult(T, alloc, "--quiet cannot be combined with --verbose", .{});
     if (common.bootstrap) |b| if (b.len == 0) return errorResult(T, alloc, "--bootstrap must not be empty", .{});
@@ -325,7 +361,6 @@ pub fn parseProduce(alloc: std.mem.Allocator, args: []const []const u8) Result(P
     var headers: std.ArrayListUnmanaged(protocol.Header) = .empty;
     var topic: ?[]const u8 = null;
     var common: Common = .{};
-    var csv = false;
     var key_col: ?[]const u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -348,7 +383,7 @@ pub fn parseProduce(alloc: std.mem.Allocator, args: []const []const u8) Result(P
                 return errorResult(ProduceArgs, alloc, "malformed header '{s}' (want 'name: value')", .{arg[2..]})) catch
                 return .{ .err = "out of memory" };
         } else if (std.mem.eql(u8, arg, "--csv")) {
-            csv = true;
+            if (setFormat(ProduceArgs, alloc, &common, .csv, "--csv")) |r| return r;
         } else if (std.mem.eql(u8, arg, "--key")) {
             i += 1;
             if (i >= args.len) return errorResult(ProduceArgs, alloc, "--key requires a value", .{});
@@ -366,13 +401,11 @@ pub fn parseProduce(alloc: std.mem.Allocator, args: []const []const u8) Result(P
 
     const topic_name = topic orelse return errorResult(ProduceArgs, alloc, "missing TOPIC", .{});
     if (topic_name.len == 0) return errorResult(ProduceArgs, alloc, "TOPIC must not be empty", .{});
-    if (key_col != null and !csv) return errorResult(ProduceArgs, alloc, "--key requires --csv", .{});
-    if (csv and common.json) return errorResult(ProduceArgs, alloc, "--csv cannot be combined with --json", .{});
+    if (key_col != null and common.format != .csv) return errorResult(ProduceArgs, alloc, "--key requires --csv", .{});
     if (finishCommon(ProduceArgs, alloc, common)) |r| return r;
     return .{ .ok = .{
         .topic = topic_name,
         .common = common,
-        .csv = csv,
         .key_col = key_col,
         .headers = headers.items,
     } };
@@ -498,6 +531,8 @@ pub fn parseConsume(alloc: std.mem.Allocator, args: []const []const u8) Result(C
     if (topic_name.len == 0) return errorResult(ConsumeArgs, alloc, "TOPIC must not be empty", .{});
     if (parsed.follow and parsed.idle_ms != null)
         return errorResult(ConsumeArgs, alloc, "--follow cannot be combined with --idle", .{});
+    if (parsed.common.format == .csv)
+        return errorResult(ConsumeArgs, alloc, "--format csv is only valid when producing", .{});
     if (finishCommon(ConsumeArgs, alloc, parsed.common)) |r| return r;
     parsed.topic = topic_name;
     return .{ .ok = parsed };
@@ -518,7 +553,7 @@ test "produce parser accepts option spellings and zero-independent fields" {
         .ok => |args| {
             try std.testing.expectEqualStrings("events", args.topic);
             try std.testing.expect(args.common.verbose);
-            try std.testing.expect(args.csv);
+            try std.testing.expect(args.isCsv());
             try std.testing.expectEqualStrings("id", args.key_col.?);
             try std.testing.expectEqualStrings("h:1", args.common.bootstrap.?);
             try std.testing.expectEqualStrings("x.properties", args.common.config_path.?);
@@ -542,6 +577,59 @@ test "quiet flag parses and conflicts with verbose" {
     }
     try expectErr(ProduceArgs, parseProduce(alloc, &.{ "-q", "-v", "demo" }), "--quiet cannot be combined with --verbose");
     try expectErr(ConsumeArgs, parseConsume(alloc, &.{ "-q", "-v", "demo" }), "--quiet cannot be combined with --verbose");
+}
+
+test "format option sets common.format" {
+    const alloc = std.heap.page_allocator;
+    const value = parseProduce(alloc, &.{ "--format", "value", "demo" });
+    switch (value) {
+        .ok => |args| try std.testing.expectEqual(Format.value, args.common.format),
+        else => return error.TestUnexpectedResult,
+    }
+    const tsv = parseProduce(alloc, &.{ "--format=tsv", "demo" });
+    switch (tsv) {
+        .ok => |args| try std.testing.expectEqual(Format.tsv, args.common.format),
+        else => return error.TestUnexpectedResult,
+    }
+    const json = parseProduce(alloc, &.{ "--json", "demo" });
+    switch (json) {
+        .ok => |args| try std.testing.expectEqual(Format.json, args.common.format),
+        else => return error.TestUnexpectedResult,
+    }
+    const csv = parseProduce(alloc, &.{ "--csv", "demo" });
+    switch (csv) {
+        .ok => |args| {
+            try std.testing.expectEqual(Format.csv, args.common.format);
+            try std.testing.expect(args.isCsv());
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const repeat = parseProduce(alloc, &.{ "--format", "json", "--json", "demo" });
+    switch (repeat) {
+        .ok => |args| try std.testing.expectEqual(Format.json, args.common.format),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "format conflicts and bad values are errors" {
+    const alloc = std.heap.page_allocator;
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{ "--format", "x", "demo" }), "--format: 'x' is not a format (want value, tsv, json, or csv)");
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{ "--format", "demo" }), "--format: 'demo' is not a format (want value, tsv, json, or csv)");
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{"--format"}), "--format requires a value");
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{ "--csv", "--json", "demo" }), "--csv cannot be combined with --json");
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{ "--json", "--format", "tsv", "demo" }), "--json cannot be combined with --format tsv");
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{ "--format", "tsv", "--json", "demo" }), "--format tsv cannot be combined with --json");
+    const csv_key = parseProduce(alloc, &.{ "--format", "csv", "--key", "id", "demo" });
+    switch (csv_key) {
+        .ok => |args| try std.testing.expect(args.isCsv()),
+        else => return error.TestUnexpectedResult,
+    }
+    try expectErr(ConsumeArgs, parseConsume(alloc, &.{ "--format", "csv", "demo" }), "--format csv is only valid when producing");
+    const value_consume = parseConsume(alloc, &.{ "--format", "value", "demo" });
+    switch (value_consume) {
+        .ok => |args| try std.testing.expectEqual(Format.value, args.common.format),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "mode flags are split from arguments" {
@@ -604,7 +692,7 @@ test "consume parser accepts separate option values" {
             try std.testing.expectEqual(@as(i32, 2), args.partition.?);
             try std.testing.expectEqual(@as(u64, 3), args.max_records.?);
             try std.testing.expectEqual(@as(u64, 4), args.idle_ms.?);
-            try std.testing.expect(args.common.json);
+            try std.testing.expectEqual(Format.json, args.common.format);
             try std.testing.expectEqualStrings("h:1", args.common.bootstrap.?);
         },
         else => return error.TestUnexpectedResult,
