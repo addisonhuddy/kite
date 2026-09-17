@@ -50,10 +50,31 @@ pub const ModeSplit = struct {
     rest: []const []const u8,
 };
 
+fn takesSeparateValue(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "-b") or
+        std.mem.eql(u8, arg, "--bootstrap") or
+        std.mem.eql(u8, arg, "--config") or
+        std.mem.eql(u8, arg, "-H") or
+        std.mem.eql(u8, arg, "--key") or
+        std.mem.eql(u8, arg, "--offset") or
+        std.mem.eql(u8, arg, "--partition") or
+        std.mem.eql(u8, arg, "-n") or
+        std.mem.eql(u8, arg, "--max") or
+        std.mem.eql(u8, arg, "-t") or
+        std.mem.eql(u8, arg, "--idle") or
+        std.mem.eql(u8, arg, "--dir");
+}
+
 pub fn splitMode(alloc: std.mem.Allocator, args: []const []const u8) Result(ModeSplit) {
     var mode: Mode = .produce;
     var rest: std.ArrayListUnmanaged([]const u8) = .empty;
+    var value_follows = false;
     for (args) |arg| {
+        if (value_follows) {
+            rest.append(alloc, arg) catch return .{ .err = "out of memory" };
+            value_follows = false;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--consume")) {
             if (mode == .install)
                 return .{ .err = "--consume cannot be combined with --install" };
@@ -64,6 +85,7 @@ pub fn splitMode(alloc: std.mem.Allocator, args: []const []const u8) Result(Mode
             mode = .install;
         } else {
             rest.append(alloc, arg) catch return .{ .err = "out of memory" };
+            value_follows = takesSeparateValue(arg);
         }
     }
     return .{ .ok = .{ .mode = mode, .rest = rest.toOwnedSlice(alloc) catch return .{ .err = "out of memory" } } };
@@ -525,6 +547,15 @@ test "mode flags are split from arguments" {
         .ok => |result| {
             try std.testing.expectEqual(Mode.consume, result.mode);
             try std.testing.expectEqualSlices([]const u8, &.{"events"}, result.rest);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const option_value = splitMode(alloc, &.{ "--csv", "--key", "-c", "events" });
+    switch (option_value) {
+        .ok => |result| {
+            try std.testing.expectEqual(Mode.produce, result.mode);
+            try std.testing.expectEqualSlices([]const u8, &.{ "--csv", "--key", "-c", "events" }, result.rest);
         },
         else => return error.TestUnexpectedResult,
     }

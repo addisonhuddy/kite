@@ -113,6 +113,7 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
                     for (cursors[0..cursor_count]) |*refresh| {
                         refresh.leader = c.partitionLeader(refresh.pidx) orelse refresh.leader;
                     }
+                    continue;
                 },
                 else => {
                     retry_attempts = 0;
@@ -321,9 +322,12 @@ fn fetchLeader(
                     .topic = opts.topic,
                     .pidx = pidx,
                 };
-                next_from_batches = protocol.decodeBatches(alloc, blob, &ctx, onRecord) catch |err| {
-                    c.setErr("decode fetch partition {d}: {s}", .{ pidx, @errorName(err) });
-                    return error.FetchFailed;
+                next_from_batches = protocol.decodeBatches(alloc, blob, &ctx, onRecord) catch |err| switch (err) {
+                    error.WriteFailed => return error.WriteFailed,
+                    else => {
+                        c.setErr("decode fetch partition {d}: {s}", .{ pidx, @errorName(err) });
+                        return error.FetchFailed;
+                    },
                 };
             }
             if (range.last) |last| {
