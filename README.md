@@ -1,7 +1,10 @@
 # kite
 
-**The Kafka CLI for agents and shell pipelines.** One ~585 KB binary,
-no JVM, no runtime, no daemon. stdin in, stdout out, non-zero exit on failure.
+**kite is an ultra-lightweight Kafka CLI built for agents and sandboxes.**
+One binary under 600 KB, no JVM, no runtime, no daemon. stdin in, stdout out,
+non-zero exit on failure.
+
+## Quickstart
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh
@@ -11,33 +14,10 @@ kite -c -B --idle 3s events                    # consume, stop after 3 s idle
 kite -c -B --json events | jq -c .value        # with partition/offset metadata
 ```
 
-## Contents
-
-- [Why kite](#why-kite)
-- [Install](#install)
-- [Quickstart](#quickstart)
-- [Command reference](#command-reference)
-- [Common recipes](#common-recipes)
-- [Consuming](#consuming)
-- [Input/output format and CSV](#inputoutput-format-and-csv)
-- [Configuration](#configuration)
-- [Output streams and exit codes](#output-streams-and-exit-codes)
-- [Troubleshooting](#troubleshooting)
-- [Development and testing](#development-and-testing)
-- [License](#license)
-
 ## Why kite
 
-If you are an agent (or a human writing scripts for one) and need to read or
-write Kafka, kite is the shortest path:
-
-| | kite | `kafka-console-*.sh` | kcat | Python/Node client |
-| --- | --- | --- | --- | --- |
-| Install | one `curl \| sh`, ~585 KB binary | JDK + 100 MB distribution | package manager + librdkafka | interpreter + package + native lib |
-| Startup | milliseconds, no VM warm-up | seconds (JVM) | fast | interpreter start |
-| Interface | stdin/stdout lines, flags, exit codes | verbose Java flags, log noise on stdout | flags | write code first |
-| Dependencies | none (Zig, no shared libraries) | Java | librdkafka, OpenSSL | many |
-| Surface area | produce, consume, install. That's it. | dozens of tools | large flag set | full API |
+If you are an agent reading this (or a human who also likes Kafka), here's
+why I think you will love kite.
 
 - **Small.** The stripped binary is about 585 KB on Linux and 560 KB on macOS
   arm64, gated in CI below 600,000 bytes. It fits in a container layer, a
@@ -54,9 +34,6 @@ write Kafka, kite is the shortest path:
 - **Predictable for automation.** Every error is a one-line `kite: ...` on
   stderr with exit code 1 and a `Try 'kite --help'` hint. Help pages are
   plain text, ≤ 80 columns, no ANSI unless stderr is a terminal.
-- **Speaks modern Kafka.** Kafka 4.0+ KRaft brokers, PLAINTEXT / SSL /
-  SASL_SSL / SASL_PLAINTEXT, PLAIN and SCRAM-SHA-256/512, gzip/Snappy/LZ4
-  consumer decompression.
 
 kite is not a Kafka admin tool: it never creates topics, manages consumer
 groups, or commits offsets. Point it at an existing topic and move data.
@@ -104,58 +81,16 @@ install -m755 zig-out/bin/kite ~/.local/bin/kite
 Cross-compile with, for example, `zig build -Dtarget=aarch64-macos` or
 `zig build -Dtarget=x86_64-linux`.
 
-## Quickstart
-
-Prerequisites: a reachable Kafka 4.0+ KRaft broker, an existing topic, and
-permission to read and write it.
-
-Point kite at a broker with a flag, an environment variable, or a properties
-file (see [Configuration](#configuration)):
-
-```sh
-export BOOTSTRAP_SERVERS=localhost:9092     # or: kite -b localhost:9092 ...
-```
-
-Produce the checked-in sample data:
-
-```sh
-kite events < examples/data/lines.txt
-```
-
-```text
-5 record(s) produced to 'events' across 3 of 3 partition(s)
-85 B in 0.01s (620 msg/s, 10.4 KiB/s), last offsets p0=1, p1=1, p2=0
-3 produce request(s), 0 retried batch(es), 2.1ms avg per request, 3 connection(s)
-```
-
-The summary goes to stderr; stdout stays empty so `kite` can sit in a pipe.
-
-Read from the beginning and stop after 3 seconds without a record:
-
-```sh
-kite -c -B --idle 3s events
-```
-
-```text
-line one
-line two
-...
-```
-
-While it runs on a terminal, a status line on stderr shows the topic, record
-count, rates, and elapsed time (or `waiting for records ... Ctrl-C to stop`
-when nothing has arrived yet); it is replaced by a final summary at exit.
-
 ## Command reference
 
 Produce is the default mode. `-c`/`--consume` switches to consume,
-`-i`/`--install` to install. Mode flags may appear anywhere on the command
-line; there are no reserved topic names.
+`-i`/`--install` to quickly add kite to your PATH. Mode flags may appear
+anywhere on the command line; there are no reserved topic names.
 
 ```text
 kite [OPTIONS] TOPIC          Produce stdin lines to TOPIC (default).
 kite -c [OPTIONS] TOPIC       Consume TOPIC to stdout.
-kite -i [OPTIONS]             Install this executable.
+kite -i [OPTIONS]             Add kite to PATH.
 kite --version                Print the version.
 ```
 
