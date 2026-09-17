@@ -401,7 +401,7 @@ fn note(comptime fmt: []const u8, args: anytype) void {
 
 const search_path_hint = "./kite.properties, $XDG_CONFIG_HOME/kite/kite.properties, ~/.config/kite/kite.properties";
 
-/// Resolve configuration from flags, KITE_* environment and properties file.
+/// Resolve configuration from flags, environment and properties file.
 fn loadConfig(init: std.process.Init, alloc: std.mem.Allocator, common: cli_args.Common) config.Config {
     var source: config.Source = .{};
     var cfg = config.load(init.io, alloc, init.environ_map, .{
@@ -409,13 +409,13 @@ fn loadConfig(init: std.process.Init, alloc: std.mem.Allocator, common: cli_args
         .config_path = common.config_path,
     }, &source) catch |err| switch (err) {
         error.ConfigNotFound => fatal(
-            "no broker configured. Pass -b HOST:PORT, set KITE_BOOTSTRAP_SERVERS, or create kite.properties (searched {s}); see 'kite --help' for the file format",
+            "no broker configured. Pass -b HOST:PORT, set BOOTSTRAP_SERVERS, or create kite.properties (searched {s}); see 'kite --help' for the file format",
             .{search_path_hint},
         ),
         error.ConfigFileNotFound => fatal("config file '{s}' not found", .{source.requested.?}),
         error.ConfigFileUnreadable => fatal("cannot read config file '{s}'", .{source.requested.?}),
         error.MissingBootstrapServers => fatal(
-            "'{s}' has no bootstrap.servers; add it, or pass -b HOST:PORT / set KITE_BOOTSTRAP_SERVERS",
+            "'{s}' has no bootstrap.servers; add it, or pass -b HOST:PORT / set BOOTSTRAP_SERVERS",
             .{source.file.?},
         ),
         error.InvalidSecurityProtocol => fatal("invalid security.protocol (want PLAINTEXT, SSL, SASL_SSL, or SASL_PLAINTEXT)", .{}),
@@ -429,7 +429,7 @@ fn loadConfig(init: std.process.Init, alloc: std.mem.Allocator, common: cli_args
         std.debug.print("kite: config from {s}{s}{s}{s}\n", .{
             if (source.flags) "flags" else "",
             if (source.flags and (source.env or source.file != null)) " > " else "",
-            if (source.env) "KITE_* env" else "",
+            if (source.env) "environment" else "",
             if (source.file) |f| f else if (!source.env and !source.flags) "(nothing)" else "",
         });
         if (source.env and source.file != null) std.debug.print("kite: (env overrides file)\n", .{});

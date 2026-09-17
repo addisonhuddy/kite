@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Smoke test: produce → consume roundtrip against any Kafka 4.0+ broker.
-# Needs a broker configured (-b is not used here, so set KITE_BOOTSTRAP_SERVERS
+# Needs a broker configured (-b is not used here, so set BOOTSTRAP_SERVERS
 # or put a kite.properties on the search path; see README "Configuration")
 # and an existing topic — kite never auto-creates topics by design.
 #
