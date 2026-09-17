@@ -274,6 +274,55 @@ pub fn parseHeaderArg(s: []const u8) !protocol.Header {
 const produce_only = [_][]const u8{ "-H", "--csv", "--key" };
 const consume_only = [_][]const u8{ "-B", "--from-beginning", "--offset", "--partition", "-n", "--max", "-t", "--idle", "-f", "--follow" };
 
+const produce_options = [_][]const u8{ "--consume", "--install", "--version", "--bootstrap", "--config", "--format", "--json", "--csv", "--key", "--quiet", "--verbose", "--help" };
+const consume_options = [_][]const u8{ "--consume", "--install", "--bootstrap", "--config", "--from-beginning", "--offset", "--partition", "--max", "--idle", "--follow", "--format", "--json", "--quiet", "--verbose", "--help" };
+const install_options = [_][]const u8{ "--install", "--dir", "--yes", "--help" };
+
+/// Damerau-Levenshtein distance (adjacent transposition counts as one edit).
+/// Inputs are capped so the DP matrix lives on the stack.
+fn editDistance(a: []const u8, b: []const u8) usize {
+    if (a.len > 64 or b.len > 64) return 256;
+    var d: [66][66]u16 = undefined;
+    for (0..a.len + 1) |i| d[i][0] = @intCast(i);
+    for (0..b.len + 1) |j| d[0][j] = @intCast(j);
+    for (1..a.len + 1) |i| {
+        for (1..b.len + 1) |j| {
+            const cost: u16 = if (a[i - 1] == b[j - 1]) 0 else 1;
+            var best = @min(@min(d[i - 1][j] + 1, d[i][j - 1] + 1), d[i - 1][j - 1] + cost);
+            if (i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1])
+                best = @min(best, d[i - 2][j - 2] + 1);
+            d[i][j] = best;
+        }
+    }
+    return d[a.len][b.len];
+}
+
+/// Closest valid long option for `name` when exactly one is within distance 2.
+fn suggestOption(mode: Mode, name: []const u8) ?[]const u8 {
+    if (name.len < 3 or !std.mem.startsWith(u8, name, "--") or name.len > 64) return null;
+    const candidates: []const []const u8 = switch (mode) {
+        .produce => &produce_options,
+        .consume => &consume_options,
+        .install => &install_options,
+    };
+    var best: ?[]const u8 = null;
+    var best_dist: usize = 3;
+    var tie = false;
+    for (candidates) |candidate| {
+        const dist = editDistance(name, candidate);
+        if (dist == 0) continue;
+        if (dist < best_dist) {
+            best = candidate;
+            best_dist = dist;
+            tie = false;
+        } else if (dist == best_dist) {
+            tie = true;
+        }
+    }
+    if (best_dist > 2 or tie) return null;
+    return best;
+}
+
 fn optionName(arg: []const u8) []const u8 {
     if (std.mem.indexOfScalar(u8, arg, '=')) |eq| return arg[0..eq];
     if (arg.len > 2 and arg[1] != '-') return arg[0..2];
@@ -294,6 +343,8 @@ fn unknownOption(comptime T: type, alloc: std.mem.Allocator, mode: Mode, arg: []
             return errorResult(T, alloc, "'{s}' is a produce option and is not valid with -c", .{name}),
         .install => {},
     }
+    if (suggestOption(mode, name)) |candidate|
+        return errorResult(T, alloc, "unknown option '{s}' (did you mean '{s}'?)", .{ arg, candidate });
     return errorResult(T, alloc, "unknown option '{s}'", .{arg});
 }
 
@@ -630,6 +681,16 @@ test "format conflicts and bad values are errors" {
         .ok => |args| try std.testing.expectEqual(Format.value, args.common.format),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "misspelled long options get a suggestion" {
+    const alloc = std.heap.page_allocator;
+    try expectErr(ConsumeArgs, parseConsume(alloc, &.{ "--from-begining", "demo" }), "unknown option '--from-begining' (did you mean '--from-beginning'?)");
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{ "--jsno", "demo" }), "unknown option '--jsno' (did you mean '--json'?)");
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{ "--verbos", "demo" }), "unknown option '--verbos' (did you mean '--verbose'?)");
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{ "--bogus", "demo" }), "unknown option '--bogus'");
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{ "-x", "demo" }), "unknown option '-x'");
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{ "--version", "demo" }), "unknown option '--version'");
 }
 
 test "mode flags are split from arguments" {
