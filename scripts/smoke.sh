@@ -24,6 +24,17 @@ trap 'rm -rf "$TMP"' EXIT
 echo "== produce =="
 "$K" "$TOPIC" <"$TMP/in"
 
+echo "== ack latency =="
+# Stdin stalls for 2s, but avg ack latency measures send-to-ack only and
+# must stay well under that.
+(sleep 2; printf '%s-slow\n' "$M") | "$K" "$TOPIC" 2>"$TMP/lat.err"
+grep -Fq "avg ack latency" "$TMP/lat.err" || { echo "FAIL: no avg ack latency"; cat "$TMP/lat.err"; exit 1; }
+! grep -Fq "avg per request" "$TMP/lat.err" || { echo "FAIL: stale 'avg per request' label"; cat "$TMP/lat.err"; exit 1; }
+ms=$(grep -o '[0-9.]*ms avg ack latency' "$TMP/lat.err" | head -1 | grep -o '^[0-9.]*')
+awk -v ms="$ms" 'BEGIN { exit !(ms + 0 < 1000) }' || {
+    echo "FAIL: avg ack latency ${ms}ms >= 1000ms (stdin wait leaked into the metric)"; exit 1;
+}
+
 echo "== consume roundtrip =="
 "$K" -c --from-beginning -t 5000 "$TOPIC" | grep "^$M" | sort >"$TMP/out"
 sort "$TMP/in" >"$TMP/expected"

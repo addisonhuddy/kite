@@ -289,12 +289,11 @@ fn produceSummary(cli: *client.Client, stats: *stats_mod.Stats, total: u64, npar
     stats.finish();
     if (total > 0) {
         var lat_buf: [32]u8 = undefined;
-        const secs = stats.elapsedSecs();
-        const per_req = if (cli.produce_requests > 0)
-            std.fmt.bufPrint(&lat_buf, "{d:.1}ms", .{secs * 1000.0 / @as(f64, @floatFromInt(cli.produce_requests))}) catch "?"
+        const per_req = if (cli.avgAckMs()) |ms|
+            std.fmt.bufPrint(&lat_buf, "{d:.1}ms", .{ms}) catch "?"
         else
             "n/a";
-        std.debug.print("{d} produce request(s), {d} retried batch(es), {s} avg per request, {d} connection(s)\n", .{
+        std.debug.print("{d} produce request(s), {d} retried batch(es), {s} avg ack latency, {d} connection(s)\n", .{
             cli.produce_requests, cli.produce_retries, per_req, cli.conns.count(),
         });
     }

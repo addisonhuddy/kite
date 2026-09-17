@@ -122,7 +122,7 @@ kite events < examples/data/lines.txt
 ```text
 5 record(s) produced to 'events' across 3 of 3 partition(s)
 85 B in 0.01s (620 msg/s, 10.4 KiB/s), last offsets p0=1, p1=1, p2=0
-3 produce request(s), 0 retried batch(es), 2.1ms avg per request, 3 connection(s)
+3 produce request(s), 0 retried batch(es), 4.2ms avg ack latency, 3 connection(s)
 ```
 
 The summary goes to stderr; stdout stays empty so `kite` can sit in a pipe.
@@ -337,7 +337,8 @@ processing.
 Every run ends with a summary on stderr. Produce reports the record count,
 partitions used, bytes, elapsed time, message and byte rates, the last
 acknowledged offset per partition (`p0=333, p1=332`), the number of produce
-requests and retried batches, average time per request, and connections
+requests and retried batches, average send-to-ack latency per request
+attempt (excludes waiting on stdin and connection setup), and connections
 used. Consume reports the record count and why it stopped (`(idle timeout)`,
 `(interrupted)`), plus the same throughput line and per-partition offsets.
 
