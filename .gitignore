@@ -17,7 +17,8 @@ release/
 *.pdb
 
 # --- Local config / secrets ---
-kite.properties
+*.properties
+!examples/config/*.properties
 .env
 .env.*
 *.pem
