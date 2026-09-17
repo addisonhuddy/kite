@@ -49,6 +49,26 @@ timeout, compares the roundtrip, checks a `--json` produce/consume roundtrip
 (key, nested value, headers), and asserts that an out-of-range `--offset`
 fails with the valid range instead of replaying the partition.
 
+## End-to-end: Docker Kafka
+
+`scripts/e2e-docker.sh` runs the full suite against a real broker with no
+setup beyond Docker: it pulls `apache/kafka` (pinned tag), starts a
+single-node KRaft container on `127.0.0.1:9092`, creates a `kite-e2e` topic,
+and runs `smoke.sh` plus broker-dependent edge cases (early pipe closure,
+`/dev/full` write errors):
+
+```sh
+zig build
+scripts/e2e-docker.sh
+```
+
+Environment overrides: `KITE_KAFKA_IMAGE` (default `apache/kafka:4.0.0`),
+`KITE_E2E_TIMEOUT` (broker readiness deadline in seconds, default 120),
+`KITE_E2E_KEEP=1` (keep the container for debugging). On failure the script
+dumps the broker logs and always removes the container otherwise.
+
+This runs in CI as the `e2e` job (blocking, after the unit job).
+
 Behaviours worth checking by hand on a terminal (not covered by the scripts):
 
 ```sh
