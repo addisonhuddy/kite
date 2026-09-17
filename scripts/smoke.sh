@@ -28,6 +28,7 @@ echo "== ack latency =="
 # Stdin stalls for 2s, but avg ack latency measures send-to-ack only and
 # must stay well under that.
 (sleep 2; printf '%s-slow\n' "$M") | "$K" "$TOPIC" 2>"$TMP/lat.err"
+printf '%s-slow\n' "$M" >>"$TMP/in"
 grep -Fq "avg ack latency" "$TMP/lat.err" || { echo "FAIL: no avg ack latency"; cat "$TMP/lat.err"; exit 1; }
 ! grep -Fq "avg per request" "$TMP/lat.err" || { echo "FAIL: stale 'avg per request' label"; cat "$TMP/lat.err"; exit 1; }
 ms=$(grep -o '[0-9.]*ms avg ack latency' "$TMP/lat.err" | head -1 | grep -o '^[0-9.]*')
