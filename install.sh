@@ -41,7 +41,7 @@ fi
 
 chmod +x "$tmp/kite"
 if [ -n "${KITE_INSTALL_DIR:-}" ]; then
-    "$tmp/kite" --install --dir "$KITE_INSTALL_DIR" "$@"
+    "$tmp/kite" --add-to-path --dir "$KITE_INSTALL_DIR" "$@"
 else
-    "$tmp/kite" --install "$@"
+    "$tmp/kite" --add-to-path "$@"
 fi

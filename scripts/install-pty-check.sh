@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PTY regression test for `kite -i`: the PATH prompt must read the answer
+# PTY regression test for `kite --add-to-path`: the PATH prompt must read the answer
 # from the controlling terminal (/dev/tty), not from a piped stdin — the
 # `curl … | sh` situation. Skips cleanly when python3 is missing.
 set -euo pipefail
@@ -35,7 +35,7 @@ def run(name, answer, extra=""):
         # stdin is a pipe (like `echo … | sh` under curl|sh); stdout and the
         # controlling terminal are the pty.
         os.execvpe("sh", ["sh", "-c",
-                          'echo ignored-stdin | "$KITE" -i --dir "$BINDIR" ' + extra], env)
+                          'echo ignored-stdin | "$KITE" --add-to-path --dir "$BINDIR" ' + extra], env)
     output = b""
     sent = False
     deadline = time.time() + 10

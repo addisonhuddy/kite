@@ -28,7 +28,7 @@ why I think you will love kite.
   startup, starts and exits in milliseconds. Produce runs are batched and
   idempotent by default; consume runs are bounded with `-n`/`-t` so a script
   always terminates.
-- **Easy install.** `curl | sh`, or `zig build && zig-out/bin/kite -i`. No
+- **Easy install.** `curl | sh`, or `zig build && zig-out/bin/kite --add-to-path`. No
   root, no package manager, no `JAVA_HOME`.
 - **Predictable for automation.** Every error is a one-line `kite: ...` on
   stderr with exit code 1 and a `Try 'kite --help'` hint. Help pages are
@@ -68,10 +68,10 @@ Requires Zig 0.16.x.
 
 ```sh
 zig build
-zig-out/bin/kite -i          # copies to ~/.local/bin and offers a PATH line
+zig-out/bin/kite --add-to-path # copies to ~/.local/bin and offers a PATH line
 ```
 
-`kite -i` accepts `--dir DIR` and `-y`/`--yes`. To install manually instead:
+`kite --add-to-path` accepts `--dir DIR` and `-y`/`--yes`. To install manually instead:
 
 ```sh
 install -m755 zig-out/bin/kite ~/.local/bin/kite
@@ -94,13 +94,13 @@ cp completions/kite.fish ~/.config/fish/completions/           # fish
 ## Command reference
 
 Produce is the default mode. `-c`/`--consume` switches to consume,
-`-i`/`--install` to quickly add kite to your PATH. Mode flags may appear
+`--add-to-path` to quickly add kite to your PATH. Mode flags may appear
 anywhere on the command line; there are no reserved topic names.
 
 ```text
 kite [OPTIONS] TOPIC          Produce stdin lines to TOPIC (default).
 kite -c [OPTIONS] TOPIC       Consume TOPIC to stdout.
-kite -i [OPTIONS]             Add kite to PATH.
+kite --add-to-path [OPTIONS]  Add kite to PATH.
 kite --version                Print the version.
 ```
 
@@ -125,7 +125,7 @@ kite --version                Print the version.
 | produce, consume | `-v`, `--verbose` | Connection, retry, and fetch diagnostics on stderr. |
 | all | `-h`, `--help` | Plain-text help for the selected mode. |
 
-`kite --help`, `kite -c --help`, and `kite -i --help` print the full pages.
+`kite --help`, `kite -c --help`, and `kite --add-to-path --help` print the full pages.
 
 ## Common recipes
 
