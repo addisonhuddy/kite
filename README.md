@@ -101,6 +101,17 @@ install -m755 zig-out/bin/kite ~/.local/bin/kite
 Cross-compile with, for example, `zig build -Dtarget=aarch64-macos` or
 `zig build -Dtarget=x86_64-linux`.
 
+### Shell completions
+
+Static completion scripts for bash, zsh, and fish are in
+[`completions/`](completions):
+
+```sh
+source completions/kite.bash                                   # bash (or copy to /etc/bash_completion.d/)
+fpath=(/path/to/kite/completions $fpath)                       # zsh: file must be named _kite
+cp completions/kite.fish ~/.config/fish/completions/           # fish
+```
+
 ## Quickstart
 
 Prerequisites: a reachable Kafka 4.0+ KRaft broker, an existing topic, and
