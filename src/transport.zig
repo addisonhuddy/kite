@@ -39,6 +39,9 @@ pub const Conn = struct {
     net_writer: std.Io.net.Stream.Writer,
     ca_lock: std.Io.RwLock,
     tls_client: ?std.crypto.tls.Client,
+    /// Set when the last send carried a SASL token; the matching response
+    /// dump is redacted too.
+    redact_next_recv: bool,
     input: *std.Io.Reader,
     output: *std.Io.Writer,
     host: []const u8,
@@ -98,6 +101,7 @@ pub fn connect(
         .net_writer = undefined,
         .ca_lock = .init,
         .tls_client = null,
+        .redact_next_recv = false,
         .input = undefined,
         .output = undefined,
         .host = host,
@@ -146,9 +150,18 @@ pub fn send(c: *Conn, payload: []const u8) TransportError!void {
 pub fn sendv(c: *Conn, parts: []const []const u8) TransportError!void {
     var total: usize = 0;
     for (parts) |p| total += p.len;
+    c.redact_next_recv = false;
     if (c.debug) {
         const first = parts[0];
-        std.debug.print("send {d}B: {x}\n", .{ total, first[0..@min(first.len, 200)] });
+        // The request header starts with the api key; never dump SASL tokens.
+        const redact = first.len >= 2 and
+            std.mem.readInt(i16, first[0..2], .big) == protocol.api_key.sasl_authenticate;
+        if (redact) {
+            c.redact_next_recv = true;
+            std.debug.print("send {d}B: <SaslAuthenticate redacted>\n", .{total});
+        } else {
+            std.debug.print("send {d}B: {x}\n", .{ total, first[0..@min(first.len, 200)] });
+        }
     }
     var hdr: [4]u8 = undefined;
     std.mem.writeInt(u32, &hdr, @intCast(total), .big);
@@ -190,8 +203,13 @@ pub fn recv(c: *Conn, alloc: std.mem.Allocator, expect_corr: i32, header_tags: b
     c.input.readSliceAll(frame) catch return error.IoFailed;
 
     if (c.debug) {
-        const n = @min(frame.len, 512);
-        std.debug.print("recv {d}B: {x}\n", .{ frame.len, frame[0..n] });
+        if (c.redact_next_recv) {
+            c.redact_next_recv = false;
+            std.debug.print("recv {d}B: <redacted>\n", .{frame.len});
+        } else {
+            const n = @min(frame.len, 512);
+            std.debug.print("recv {d}B: {x}\n", .{ frame.len, frame[0..n] });
+        }
     }
     var d = protocol.Decoder.init(frame);
     const corr = d.i32v() catch return error.MalformedResponse;

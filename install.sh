@@ -20,6 +20,7 @@ esac
 
 asset=kite-${os}-${arch}
 url=https://github.com/$REPO/releases/download/$VERSION/$asset
+sums_url=https://github.com/$REPO/releases/download/$VERSION/SHA256SUMS
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
@@ -30,12 +31,42 @@ download_failed() {
     exit 1
 }
 
+sums_failed() {
+    echo "kite: failed to download checksums from $sums_url" >&2
+    echo "kite: check that release $VERSION exists at https://github.com/$REPO/releases" >&2
+    exit 1
+}
+
 if command -v curl >/dev/null 2>&1; then
     curl -fsSL "$url" -o "$tmp/kite" || download_failed
+    curl -fsSL "$sums_url" -o "$tmp/SHA256SUMS" || sums_failed
 elif command -v wget >/dev/null 2>&1; then
     wget -q "$url" -O "$tmp/kite" || download_failed
+    wget -q "$sums_url" -O "$tmp/SHA256SUMS" || sums_failed
 else
     echo "kite: curl or wget is required to install kite" >&2
+    exit 1
+fi
+
+expected=$(awk -v a="$asset" '$2 ~ "(^|/)" a "$" {print $1}' "$tmp/SHA256SUMS")
+if [ -z "$expected" ]; then
+    echo "kite: no checksum for $asset in SHA256SUMS" >&2
+    exit 1
+fi
+
+if command -v sha256sum >/dev/null 2>&1; then
+    actual=$(sha256sum "$tmp/kite" | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+    actual=$(shasum -a 256 "$tmp/kite" | awk '{print $1}')
+else
+    echo "kite: sha256sum or shasum is required" >&2
+    exit 1
+fi
+
+if [ "$actual" != "$expected" ]; then
+    echo "kite: checksum mismatch for $asset" >&2
+    echo "kite: expected $expected" >&2
+    echo "kite: got      $actual" >&2
     exit 1
 fi
 
