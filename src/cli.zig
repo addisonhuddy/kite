@@ -92,21 +92,21 @@ pub fn splitMode(alloc: std.mem.Allocator, args: []const []const u8) Result(Mode
         }
         if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--consume")) {
             if (mode == .install)
-                return .{ .err = "--consume cannot be combined with --install" };
+                return .{ .err = "--consume cannot be combined with --add-to-path" };
             if (mode == .show_config)
                 return .{ .err = "--show-config cannot be combined with --consume" };
             mode = .consume;
-        } else if (std.mem.eql(u8, arg, "-i") or std.mem.eql(u8, arg, "--install")) {
+        } else if (std.mem.eql(u8, arg, "--add-to-path")) {
             if (mode == .consume)
-                return .{ .err = "--consume cannot be combined with --install" };
+                return .{ .err = "--consume cannot be combined with --add-to-path" };
             if (mode == .show_config)
-                return .{ .err = "--show-config cannot be combined with --install" };
+                return .{ .err = "--show-config cannot be combined with --add-to-path" };
             mode = .install;
         } else if (std.mem.eql(u8, arg, "--show-config")) {
             if (mode == .consume)
                 return .{ .err = "--show-config cannot be combined with --consume" };
             if (mode == .install)
-                return .{ .err = "--show-config cannot be combined with --install" };
+                return .{ .err = "--show-config cannot be combined with --add-to-path" };
             mode = .show_config;
         } else {
             rest.append(alloc, arg) catch return .{ .err = "out of memory" };
@@ -125,8 +125,8 @@ pub const consume_usage =
     "Try 'kite -c --help' for examples.\n";
 
 pub const install_usage =
-    "Usage: kite -i [OPTIONS]\n" ++
-    "Try 'kite -i --help' for details.\n";
+    "Usage: kite --add-to-path [OPTIONS]\n" ++
+    "Try 'kite --add-to-path --help' for details.\n";
 
 const config_help =
     "Configuration:\n" ++
@@ -144,12 +144,14 @@ pub const produce_help =
     "Usage:\n" ++
     "  kite [OPTIONS] TOPIC          Produce stdin lines to TOPIC (default).\n" ++
     "  kite -c [OPTIONS] TOPIC       Consume TOPIC to stdout. See 'kite -c --help'.\n" ++
-    "  kite -i [OPTIONS]             Install this executable. See 'kite -i --help'.\n" ++
+    "  kite --add-to-path [OPTIONS]  Install this executable. See\n" ++
+    "                                'kite --add-to-path --help'.\n" ++
     "  kite --show-config  Show the effective configuration; never connects.\n" ++
     "\n" ++
     "Options:\n" ++
     "  -c, --consume         Consume instead of produce.\n" ++
-    "  -i, --install         Install the executable to ~/.local/bin.\n" ++
+    "  --add-to-path         Install the executable to ~/.local/bin and\n" ++
+    "                        add it to PATH.\n" ++
     "  -V, --version         Print the version and exit.\n" ++
     "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
     "  --config FILE         Read this properties file instead of searching.\n" ++
@@ -248,10 +250,10 @@ pub const show_config_help =
     config_help;
 
 pub const install_help =
-    "kite -i - Install the current kite executable\n" ++
+    "kite --add-to-path - Install the current kite executable\n" ++
     "\n" ++
     "Usage:\n" ++
-    "  kite -i [OPTIONS]\n" ++
+    "  kite --add-to-path [OPTIONS]\n" ++
     "\n" ++
     "Options:\n" ++
     "  --dir DIR             Install to DIR (default: $KITE_INSTALL_DIR or\n" ++
@@ -320,9 +322,9 @@ pub fn parseHeaderArg(s: []const u8) !protocol.Header {
 const produce_only = [_][]const u8{ "-H", "--csv", "--key" };
 const consume_only = [_][]const u8{ "-B", "--from-beginning", "--offset", "--partition", "-n", "--max", "-t", "--idle", "-f", "--follow" };
 
-const produce_options = [_][]const u8{ "--consume", "--install", "--version", "--bootstrap", "--config", "--format", "--json", "--csv", "--key", "--quiet", "--verbose", "--help", "--show-config" };
-const consume_options = [_][]const u8{ "--consume", "--install", "--bootstrap", "--config", "--from-beginning", "--offset", "--partition", "--max", "--idle", "--follow", "--format", "--json", "--quiet", "--verbose", "--help" };
-const install_options = [_][]const u8{ "--install", "--dir", "--yes", "--help" };
+const produce_options = [_][]const u8{ "--consume", "--add-to-path", "--version", "--bootstrap", "--config", "--format", "--json", "--csv", "--key", "--quiet", "--verbose", "--help", "--show-config" };
+const consume_options = [_][]const u8{ "--consume", "--add-to-path", "--bootstrap", "--config", "--from-beginning", "--offset", "--partition", "--max", "--idle", "--follow", "--format", "--json", "--quiet", "--verbose", "--help" };
+const install_options = [_][]const u8{ "--add-to-path", "--dir", "--yes", "--help" };
 const show_config_options = [_][]const u8{ "--show-config", "--bootstrap", "--config", "--json", "--format", "--quiet", "--verbose", "--help" };
 
 /// Damerau-Levenshtein distance (adjacent transposition counts as one edit).
@@ -781,7 +783,7 @@ test "show-config mode split and parsing" {
         else => return error.TestUnexpectedResult,
     }
     try expectErr(ModeSplit, splitMode(alloc, &.{ "-c", "--show-config", "demo" }), "--show-config cannot be combined with --consume");
-    try expectErr(ModeSplit, splitMode(alloc, &.{ "-i", "--show-config" }), "--show-config cannot be combined with --install");
+    try expectErr(ModeSplit, splitMode(alloc, &.{ "--add-to-path", "--show-config" }), "--show-config cannot be combined with --add-to-path");
     try expectErr(ModeSplit, splitMode(alloc, &.{ "--show-config", "-c", "demo" }), "--show-config cannot be combined with --consume");
 
     const ok = parseShowConfig(alloc, &.{ "-b", "h:1", "--config", "x.properties", "--json" });
@@ -835,7 +837,7 @@ test "mode flags are split from arguments" {
         else => return error.TestUnexpectedResult,
     }
 
-    try expectErr(ModeSplit, splitMode(alloc, &.{ "-c", "-i", "events" }), "--consume cannot be combined with --install");
+    try expectErr(ModeSplit, splitMode(alloc, &.{ "-c", "--add-to-path", "events" }), "--consume cannot be combined with --add-to-path");
 
     const produce = splitMode(alloc, &.{"consume"});
     switch (produce) {
