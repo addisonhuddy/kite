@@ -22,3 +22,13 @@ chmod 600 ./kite.properties
 ```
 
 Redact credentials from logs, issue reports, and diagnostic output.
+
+## Debug output
+
+`KITE_DEBUG=1` hex-dumps wire frames to stderr (SASL auth frames are
+redacted). Review dumps before sharing them publicly.
+
+## Decompression limits
+
+Decompressed record batches are capped at 64 MiB per batch; oversized
+streams fail rather than exhausting memory.

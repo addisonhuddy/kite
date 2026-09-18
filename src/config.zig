@@ -283,7 +283,17 @@ pub fn load(
         if (cfg.sasl_username == null or cfg.sasl_password == null)
             return error.MissingSaslCredentials;
     }
+    if (source.origins.get(.sasl_password) == .file)
+        warnIfLoosePerms(io, source.file.?);
     return cfg;
+}
+
+/// Warn when a properties file that supplied sasl.password is readable by
+/// group/other users.
+fn warnIfLoosePerms(io: std.Io, path: []const u8) void {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return;
+    if (stat.permissions.toMode() & 0o077 != 0)
+        warn("{s} is readable by other users; run chmod 600 {s}", .{ path, path });
 }
 
 fn applyKey(cfg: *Config, alloc: std.mem.Allocator, source: *Source, origin: Origin, key: []const u8, val: []const u8) LoadError!void {

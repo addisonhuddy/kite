@@ -59,7 +59,8 @@ Pass `-s -- --yes` to skip the prompt in scripts:
 curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh -s -- --yes
 ```
 
-Prebuilt binaries and `SHA256SUMS` are on the
+The script downloads the matching `SHA256SUMS` and refuses to install on a
+checksum mismatch. Prebuilt binaries and `SHA256SUMS` are on the
 [releases page](https://github.com/addisonhuddy/kite/releases).
 
 ### From source
@@ -341,7 +342,9 @@ pipe.
 - `-q` / `--quiet` suppresses the live status line and the end-of-run
   summaries; data, warnings, and errors are unchanged.
 - `-v` / `--verbose` enables connection, retry, and fetch diagnostics.
-- `KITE_DEBUG=1` enables frame and TLS diagnostics.
+- `KITE_DEBUG=1` enables frame and TLS diagnostics, hex-dumping wire frames
+  to stderr (SASL auth frames are redacted). Review dumps before pasting
+  them into public issues.
 - `KITE_TIME=1` prints producer timing totals and connection count.
 
 The default stripped binary is under 600 KB (CI-gated by

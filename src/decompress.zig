@@ -5,25 +5,50 @@ pub const Error = error{
     InvalidCompression,
     InvalidSnappy,
     InvalidLz4,
+    DecompressedTooLarge,
 };
 
+/// A malicious broker could send a tiny batch that expands hugely; cap the
+/// decompressed size per batch.
+pub const max_decompressed_len: usize = 64 << 20;
+
 pub fn decompress(alloc: std.mem.Allocator, codec: u3, input: []const u8) ![]u8 {
+    return decompressWithLimit(alloc, codec, input, max_decompressed_len);
+}
+
+fn decompressWithLimit(alloc: std.mem.Allocator, codec: u3, input: []const u8, limit: usize) ![]u8 {
     return switch (codec) {
         0 => alloc.dupe(u8, input),
-        1 => streamFlate(alloc, input),
-        2 => streamSnappy(alloc, input),
-        3 => streamLz4(alloc, input),
+        1 => streamFlate(alloc, input, limit),
+        2 => streamSnappy(alloc, input, limit),
+        3 => streamLz4(alloc, input, limit),
         // zstd (4) is deliberately unsupported: its decoder costs ~50 KiB of binary.
         else => error.UnsupportedCompression,
     };
 }
 
-fn streamFlate(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
+/// Fail `append`/`appendSlice` calls that would grow `out` past `limit`.
+fn reserve(out: *std.ArrayListUnmanaged(u8), extra: usize, limit: usize) Error!void {
+    if (out.items.len +| extra > limit) return error.DecompressedTooLarge;
+}
+
+fn streamFlate(alloc: std.mem.Allocator, input: []const u8, limit: usize) ![]u8 {
     var reader: std.Io.Reader = .fixed(input);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    var d = std.compress.flate.Decompress.init(&reader, .gzip, &.{});
-    _ = try d.reader.streamRemaining(&out.writer);
+    var flate_buf: [std.compress.flate.max_window_len + 4096]u8 = undefined;
+    var d = std.compress.flate.Decompress.init(&reader, .gzip, &flate_buf);
+    // Pump in chunks so `out` can never grow past limit+1.
+    while (true) {
+        const chunk = d.reader.peekGreedy(1) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        const take_n = @min(chunk.len, limit +| 1 -| out.written().len);
+        out.writer.writeAll(chunk[0..take_n]) catch return error.OutOfMemory;
+        d.reader.toss(take_n);
+        if (out.written().len > limit) return error.DecompressedTooLarge;
+    }
     return out.toOwnedSlice();
 }
 
@@ -54,10 +79,11 @@ fn readSnappyVarint(data: []const u8, pos: *usize) !usize {
     }
 }
 
-fn decodeRawSnappy(alloc: std.mem.Allocator, input: []const u8, out: *std.ArrayListUnmanaged(u8)) !void {
+fn decodeRawSnappy(alloc: std.mem.Allocator, input: []const u8, out: *std.ArrayListUnmanaged(u8), limit: usize) !void {
     var pos: usize = 0;
     const start = out.items.len;
     const expected = try readSnappyVarint(input, &pos);
+    if (expected > limit) return error.DecompressedTooLarge;
     while (pos < input.len and out.items.len - start < expected) {
         const tag = input[pos];
         pos += 1;
@@ -73,6 +99,7 @@ fn decodeRawSnappy(alloc: std.mem.Allocator, input: []const u8, out: *std.ArrayL
                     len += 1;
                 }
                 if (input.len -| pos < len) return error.InvalidSnappy;
+                try reserve(out, len, limit);
                 try out.appendSlice(alloc, input[pos .. pos + len]);
                 pos += len;
             },
@@ -81,14 +108,14 @@ fn decodeRawSnappy(alloc: std.mem.Allocator, input: []const u8, out: *std.ArrayL
                 const len: usize = 4 + ((tag >> 2) & 7);
                 const offset = (@as(usize, tag >> 5) << 8) | input[pos];
                 pos += 1;
-                try copyMatch(alloc, out, offset, len, start);
+                try copyMatch(alloc, out, offset, len, start, limit);
             },
             2 => {
                 if (input.len -| pos < 2) return error.InvalidSnappy;
                 const len: usize = (tag >> 2) + 1;
                 const offset = @as(usize, input[pos]) | (@as(usize, input[pos + 1]) << 8);
                 pos += 2;
-                try copyMatch(alloc, out, offset, len, start);
+                try copyMatch(alloc, out, offset, len, start, limit);
             },
             3 => {
                 if (input.len -| pos < 4) return error.InvalidSnappy;
@@ -98,7 +125,7 @@ fn decodeRawSnappy(alloc: std.mem.Allocator, input: []const u8, out: *std.ArrayL
                     (@as(usize, input[pos + 2]) << 16) |
                     (@as(usize, input[pos + 3]) << 24);
                 pos += 4;
-                try copyMatch(alloc, out, offset, len, start);
+                try copyMatch(alloc, out, offset, len, start, limit);
             },
             else => unreachable,
         }
@@ -112,17 +139,19 @@ fn copyMatch(
     offset: usize,
     len: usize,
     start: usize,
+    limit: usize,
 ) !void {
     if (offset == 0 or offset > out.items.len - start) return error.InvalidSnappy;
+    try reserve(out, len, limit);
     for (0..len) |_| try out.append(alloc, out.items[out.items.len - offset]);
 }
 
-fn streamSnappy(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
+fn streamSnappy(alloc: std.mem.Allocator, input: []const u8, limit: usize) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(alloc);
     const magic = "\x82SNAPPY\x00";
     if (!std.mem.startsWith(u8, input, magic)) {
-        try decodeRawSnappy(alloc, input, &out);
+        try decodeRawSnappy(alloc, input, &out, limit);
         return out.toOwnedSlice(alloc);
     }
     var pos = magic.len;
@@ -132,13 +161,13 @@ fn streamSnappy(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     while (pos < input.len) {
         const block_len = try readBe32(input, &pos);
         if (input.len -| pos < block_len) return error.InvalidSnappy;
-        try decodeRawSnappy(alloc, input[pos .. pos + block_len], &out);
+        try decodeRawSnappy(alloc, input[pos .. pos + block_len], &out, limit);
         pos += block_len;
     }
     return out.toOwnedSlice(alloc);
 }
 
-fn decodeRawLz4(alloc: std.mem.Allocator, input: []const u8, out: *std.ArrayListUnmanaged(u8)) !void {
+fn decodeRawLz4(alloc: std.mem.Allocator, input: []const u8, out: *std.ArrayListUnmanaged(u8), limit: usize) !void {
     var pos: usize = 0;
     while (pos < input.len) {
         const token = input[pos];
@@ -154,6 +183,7 @@ fn decodeRawLz4(alloc: std.mem.Allocator, input: []const u8, out: *std.ArrayList
             }
         }
         if (input.len -| pos < literal_len) return error.InvalidLz4;
+        try reserve(out, literal_len, limit);
         try out.appendSlice(alloc, input[pos .. pos + literal_len]);
         pos += literal_len;
         if (pos == input.len) break;
@@ -171,7 +201,7 @@ fn decodeRawLz4(alloc: std.mem.Allocator, input: []const u8, out: *std.ArrayList
                 if (n != 255) break;
             }
         }
-        try copyLz4Match(alloc, out, offset, match_len);
+        try copyLz4Match(alloc, out, offset, match_len, limit);
     }
 }
 
@@ -180,12 +210,14 @@ fn copyLz4Match(
     out: *std.ArrayListUnmanaged(u8),
     offset: usize,
     len: usize,
+    limit: usize,
 ) !void {
     if (offset == 0 or offset > out.items.len) return error.InvalidLz4;
+    try reserve(out, len, limit);
     for (0..len) |_| try out.append(alloc, out.items[out.items.len - offset]);
 }
 
-fn streamLz4(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
+fn streamLz4(alloc: std.mem.Allocator, input: []const u8, limit: usize) ![]u8 {
     if (input.len < 7 or std.mem.readInt(u32, input[0..4], .little) != 0x184d2204)
         return error.InvalidLz4;
     const flg = input[4];
@@ -210,10 +242,12 @@ fn streamLz4(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
         const uncompressed = block_size & 0x80000000 != 0;
         const len = block_size & 0x7fffffff;
         if (input.len -| pos < len) return error.InvalidLz4;
-        if (uncompressed)
-            try out.appendSlice(alloc, input[pos .. pos + len])
-        else
-            try decodeRawLz4(alloc, input[pos .. pos + len], &out);
+        if (uncompressed) {
+            try reserve(&out, len, limit);
+            try out.appendSlice(alloc, input[pos .. pos + len]);
+        } else {
+            try decodeRawLz4(alloc, input[pos .. pos + len], &out, limit);
+        }
         pos += len;
         if (flg & 0x10 != 0) {
             if (input.len -| pos < 4) return error.InvalidLz4;
@@ -280,4 +314,44 @@ test "decompresses lz4 frame" {
     const result = try decompress(std.testing.allocator, 3, &compressed);
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("abcabcabcabcabcabc", result);
+}
+
+test "decompression limit is enforced per codec" {
+    const a = std.testing.allocator;
+    // gzip: existing vector expands to 18 bytes; limit of 4 trips the cap.
+    const gz = [_]u8{
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
+        0x4b, 0x4c, 0x4a, 0x4e, 0x44, 0x45, 0x00, 0x04, 0xc0, 0x26,
+        0xdc, 0x12, 0x00, 0x00, 0x00,
+    };
+    try std.testing.expectError(
+        error.DecompressedTooLarge,
+        decompressWithLimit(a, 1, &gz, 4),
+    );
+    // snappy: declared length above the limit fails before decoding.
+    const snappy_hdr = [_]u8{5}; // varint: declared output length 5
+    try std.testing.expectError(
+        error.DecompressedTooLarge,
+        decompressWithLimit(a, 2, &snappy_hdr, 4),
+    );
+    // snappy literal copy that would exceed the limit also fails.
+    const raw = [_]u8{ 18, 8, 'a', 'b', 'c', 0x1d, 3, 0x0e, 3, 0 };
+    try std.testing.expectError(
+        error.DecompressedTooLarge,
+        decompressWithLimit(a, 2, &raw, 4),
+    );
+    // lz4: same existing frame expands to 18 bytes.
+    const lz4 = [_]u8{
+        0x04, 0x22, 0x4d, 0x18, 0x60, 0x40, 0x00,
+        0x06, 0x00, 0x00, 0x00, 0x3b, 'a',  'b',
+        'c',  3,    0,    0x00, 0x00, 0x00, 0x00,
+    };
+    try std.testing.expectError(
+        error.DecompressedTooLarge,
+        decompressWithLimit(a, 3, &lz4, 4),
+    );
+    // and a large enough limit still succeeds.
+    const ok = try decompressWithLimit(a, 3, &lz4, 64);
+    defer a.free(ok);
+    try std.testing.expectEqualStrings("abcabcabcabcabcabc", ok);
 }
