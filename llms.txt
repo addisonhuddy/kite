@@ -1,0 +1,73 @@
+# kite
+
+> kite is a single-binary, dependency-free Kafka CLI (under 600 KB, written in Zig) that produces stdin lines to a topic and consumes a topic to stdout. It is built for scripts, containers, CI, and AI agents: no JVM, no librdkafka, no daemon, no prompts, and piped reads terminate on idle by default.
+
+Repository: https://github.com/addisonhuddy/kite
+License: Apache-2.0
+Platforms: Linux x86_64/aarch64, macOS x86_64/arm64
+Brokers: any Kafka-protocol broker (Apache Kafka, Confluent Cloud, Redpanda, Amazon MSK with SASL/SCRAM, Aiven, WarpStream)
+Security: PLAINTEXT, SSL, SASL_SSL, SASL_PLAINTEXT; SASL PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
+Scope: produce and consume only. kite does not create topics, join consumer groups, commit offsets, or administer clusters.
+
+## Install
+
+curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh
+Options: --bin-dir DIR (or KITE_BIN_DIR), --version vX.Y.Z (or KITE_VERSION). Release checksums (SHA256SUMS) are verified.
+From source: zig build (Zig 0.16.x).
+
+## Configure
+
+Precedence: flags > environment > properties file.
+-b HOST:PORT[,HOST:PORT]        brokers
+BOOTSTRAP_SERVERS               brokers
+SECURITY_PROTOCOL               PLAINTEXT | SSL | SASL_SSL | SASL_PLAINTEXT
+SASL_MECHANISM                  PLAIN | SCRAM-SHA-256 | SCRAM-SHA-512
+SASL_USERNAME, SASL_PASSWORD
+SSL_TRUSTSTORE_LOCATION         optional PEM CA bundle
+--config FILE                   properties file (also $KAFKA_PROPERTIES, ./kite.properties, ~/.config/kite/kite.properties)
+kite --show-config --json       print effective config with provenance; never connects
+
+## Produce (default mode)
+
+kite [OPTIONS] TOPIC            one stdin line = one record
+  value                         plain value
+  key<TAB>value                 keyed record
+  key<TAB>name: v<TAB>value     with headers
+--json                          {"key":...,"value":...,"headers":{...}} per line; non-string value sent verbatim
+--csv [--key COL]               RFC 4180 CSV rows -> JSON object values, optional key column
+-H 'name: value'                header on every record (repeatable)
+Produce is batched and idempotent by default. stdout is never written.
+
+## Consume
+
+kite -c [OPTIONS] TOPIC         records on stdout
+-B, --from-beginning            earliest offset (default: latest)
+--offset N  --partition P       start offset / single partition
+-n, --max N                     stop after N records
+-t, --idle DUR                  stop after DUR without records (3s, 500ms, 1m)
+-f, --follow                    never stop on idle
+--json                          {"topic","partition","offset","timestamp","key","headers","value"} per line
+Default when stdout is a pipe or file: stop after 5 s idle, so scripts never hang.
+
+## Contract
+
+stdout: data only. stderr: diagnostics and end-of-run summary.
+Exit 0 success; 1 any error with one line "kite: MESSAGE"; 130 on Ctrl-C.
+No interactive prompts. No color unless a TTY (NO_COLOR / KITE_COLOR honored). No files written.
+-q suppresses summaries; -v adds connection/retry diagnostics; KITE_DEBUG=1 adds frame/TLS traces.
+
+## Examples
+
+printf 'hello\n' | kite -b localhost:9092 events
+kite -c -B -n 100 --idle 3s events
+kite -c -B --json events | jq -c .value
+kite -c -B --json src | kite --json dst
+kite --csv --key user_id events < users.csv
+tail -f app.log | kite logs
+
+## Docs
+
+- README: https://github.com/addisonhuddy/kite/blob/main/README.md
+- Testing: https://github.com/addisonhuddy/kite/blob/main/TESTING.md
+- Config templates: https://github.com/addisonhuddy/kite/tree/main/examples/config
+- Releases: https://github.com/addisonhuddy/kite/releases
