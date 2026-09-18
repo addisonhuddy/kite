@@ -10,7 +10,6 @@ const transport = @import("transport.zig");
 const scram = @import("scram.zig");
 const csv = @import("csv.zig");
 const consumer = @import("consumer.zig");
-const install = @import("install.zig");
 const term = @import("term.zig");
 const stats_mod = @import("stats.zig");
 const json = @import("json.zig");
@@ -25,7 +24,6 @@ comptime {
     _ = scram;
     _ = csv;
     _ = consumer;
-    _ = install;
     _ = term;
     _ = stats_mod;
     _ = json;
@@ -135,10 +133,6 @@ pub fn main(init: std.process.Init) !void {
     switch (mode_args.mode) {
         .consume => {
             runConsume(init, mode_args.rest, alloc);
-            return;
-        },
-        .install => {
-            install.run(init, mode_args.rest, alloc);
             return;
         },
         .show_config => {

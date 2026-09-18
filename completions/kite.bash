@@ -9,7 +9,6 @@ _kite() {
     for w in "${COMP_WORDS[@]:1:COMP_CWORD-1}"; do
         case "$w" in
             -c | --consume) mode=consume ;;
-            --add-to-path) mode=install ;;
             --show-config) mode=show-config ;;
         esac
     done
@@ -19,7 +18,7 @@ _kite() {
             COMPREPLY=($(compgen -W "value tsv json csv" -- "$cur"))
             return
             ;;
-        --config | --dir)
+        --config)
             COMPREPLY=($(compgen -f -- "$cur"))
             return
             ;;
@@ -35,14 +34,11 @@ _kite() {
                 -B --from-beginning --offset --partition -n --max -t --idle \
                 -f --follow -q --quiet -v --verbose -h --help"
             ;;
-        install)
-            opts="--add-to-path --dir -y --yes -h --help"
-            ;;
         show-config)
             opts="--show-config -b --bootstrap --config --format --json -q --quiet -v --verbose -h --help"
             ;;
         *)
-            opts="-c --consume --add-to-path -V --version --show-config \
+            opts="-c --consume -V --version --show-config \
                 -b --bootstrap --config --format --json -H --csv --key \
                 -q --quiet -v --verbose -h --help"
             ;;

@@ -1,78 +1,120 @@
 #!/bin/sh
+# kite installer. Downloads the release binary for this platform and puts it
+# on your PATH.
+#
+#   curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh
+#   curl -fsSL ... | sh -s -- --bin-dir ~/.local/bin --version v0.1.0
+#
+# Options:
+#   -b, --bin-dir DIR    Install into DIR (default: $KITE_BIN_DIR or /usr/local/bin).
+#   -v, --version VER    Release tag to install (default: $KITE_VERSION or latest).
+#   -h, --help           Show this help.
 set -eu
 
-VERSION=${KITE_VERSION:-v0.1.0}
 REPO=addisonhuddy/kite
-OS=$(uname -s)
-ARCH=$(uname -m)
+bin_dir=${KITE_BIN_DIR:-/usr/local/bin}
+version=${KITE_VERSION:-latest}
 
-case "$OS" in
+fail() { echo "kite: $*" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+Usage: install.sh [OPTIONS]
+
+Download the kite release binary for this platform and put it on your PATH.
+
+Options:
+  -b, --bin-dir DIR    Install into DIR (default: \$KITE_BIN_DIR or /usr/local/bin).
+  -v, --version VER    Release tag to install (default: \$KITE_VERSION or latest).
+  -h, --help           Show this help.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -b|--bin-dir) [ $# -ge 2 ] || fail "$1 requires a value"; bin_dir=$2; shift 2 ;;
+        -v|--version) [ $# -ge 2 ] || fail "$1 requires a value"; version=$2; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) fail "unknown option '$1' (try --help)" ;;
+    esac
+done
+
+case "$(uname -s)" in
     Linux) os=linux ;;
     Darwin) os=macos ;;
-    *) echo "kite: unsupported operating system: $OS" >&2; exit 1 ;;
+    *) fail "unsupported operating system: $(uname -s)" ;;
 esac
-
-case "$ARCH" in
+case "$(uname -m)" in
     x86_64|amd64) arch=x86_64 ;;
     arm64|aarch64) arch=aarch64 ;;
-    *) echo "kite: unsupported architecture: $ARCH" >&2; exit 1 ;;
+    *) fail "unsupported architecture: $(uname -m)" ;;
 esac
 
-asset=kite-${os}-${arch}
-url=https://github.com/$REPO/releases/download/$VERSION/$asset
-sums_url=https://github.com/$REPO/releases/download/$VERSION/SHA256SUMS
+asset=kite-$os-$arch
+if [ "$version" = latest ]; then
+    base=https://github.com/$REPO/releases/latest/download
+else
+    base=https://github.com/$REPO/releases/download/$version
+fi
+url=$base/$asset
+sums_url=$base/SHA256SUMS
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
 download_failed() {
-    echo "kite: failed to download $url" >&2
-    echo "kite: check that release $VERSION exists at https://github.com/$REPO/releases" >&2
-    echo "kite: pick another with KITE_VERSION=vX.Y.Z, or build from source: zig build -Doptimize=ReleaseSmall" >&2
-    exit 1
+    fail "failed to download $1; check https://github.com/$REPO/releases (pin one with --version vX.Y.Z)"
 }
 
-sums_failed() {
-    echo "kite: failed to download checksums from $sums_url" >&2
-    echo "kite: check that release $VERSION exists at https://github.com/$REPO/releases" >&2
-    exit 1
+fetch() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$1" -o "$2"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q "$1" -O "$2"
+    else
+        fail "curl or wget is required"
+    fi
 }
 
-if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$tmp/kite" || download_failed
-    curl -fsSL "$sums_url" -o "$tmp/SHA256SUMS" || sums_failed
-elif command -v wget >/dev/null 2>&1; then
-    wget -q "$url" -O "$tmp/kite" || download_failed
-    wget -q "$sums_url" -O "$tmp/SHA256SUMS" || sums_failed
-else
-    echo "kite: curl or wget is required to install kite" >&2
-    exit 1
-fi
+echo "kite: downloading $url" >&2
+fetch "$url" "$tmp/kite" || download_failed "$url"
+fetch "$sums_url" "$tmp/SHA256SUMS" || download_failed "$sums_url"
 
 expected=$(awk -v a="$asset" '$2 ~ "(^|/)" a "$" {print $1}' "$tmp/SHA256SUMS")
-if [ -z "$expected" ]; then
-    echo "kite: no checksum for $asset in SHA256SUMS" >&2
-    exit 1
-fi
-
+[ -n "$expected" ] || fail "no checksum for $asset in SHA256SUMS"
 if command -v sha256sum >/dev/null 2>&1; then
     actual=$(sha256sum "$tmp/kite" | awk '{print $1}')
 elif command -v shasum >/dev/null 2>&1; then
     actual=$(shasum -a 256 "$tmp/kite" | awk '{print $1}')
 else
-    echo "kite: sha256sum or shasum is required" >&2
-    exit 1
+    fail "sha256sum or shasum is required"
 fi
+[ "$actual" = "$expected" ] || fail "checksum mismatch for $asset (expected $expected, got $actual)"
 
-if [ "$actual" != "$expected" ]; then
-    echo "kite: checksum mismatch for $asset" >&2
-    echo "kite: expected $expected" >&2
-    echo "kite: got      $actual" >&2
-    exit 1
-fi
+# Use sudo only when the target directory is not writable by this user.
+run_install() {
+    if [ -d "$bin_dir" ] && [ -w "$bin_dir" ]; then
+        install -m755 "$tmp/kite" "$bin_dir/kite"
+    elif [ ! -e "$bin_dir" ] && [ -w "$(dirname "$bin_dir")" ]; then
+        mkdir -p "$bin_dir" && install -m755 "$tmp/kite" "$bin_dir/kite"
+    elif command -v sudo >/dev/null 2>&1; then
+        echo "kite: $bin_dir is not writable; using sudo" >&2
+        sudo mkdir -p "$bin_dir" && sudo install -m755 "$tmp/kite" "$bin_dir/kite"
+    else
+        fail "$bin_dir is not writable and sudo is unavailable; rerun with --bin-dir DIR"
+    fi
+}
+run_install
 
-chmod +x "$tmp/kite"
-if [ -n "${KITE_INSTALL_DIR:-}" ]; then
-    "$tmp/kite" --add-to-path --dir "$KITE_INSTALL_DIR" "$@"
-else
-    "$tmp/kite" --add-to-path "$@"
-fi
+echo "kite: installed $("$bin_dir/kite" --version) to $bin_dir/kite" >&2
+
+case ":$PATH:" in
+    *":$bin_dir:"*) ;;
+    *)
+        echo "kite: $bin_dir is not on your PATH. Add it with:" >&2
+        case "${SHELL:-}" in
+            */fish) echo "  fish_add_path $bin_dir" >&2 ;;
+            *) echo "  export PATH=\"$bin_dir:\$PATH\"" >&2 ;;
+        esac
+        ;;
+esac

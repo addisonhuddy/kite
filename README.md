@@ -28,8 +28,8 @@ why I think you will love kite.
   startup, starts and exits in milliseconds. Produce runs are batched and
   idempotent by default; consume runs are bounded with `-n`/`-t` so a script
   always terminates.
-- **Easy install.** `curl | sh`, or `zig build && zig-out/bin/kite --add-to-path`. No
-  root, no package manager, no `JAVA_HOME`.
+- **Easy install.** One static binary: `curl` it onto your `PATH` or
+  `zig build`. No package manager, no `JAVA_HOME`.
 - **Predictable for automation.** Every error is a one-line `kite: ...` on
   stderr with exit code 1 and a `Try 'kite --help'` hint. Help pages are
   plain text, ≤ 80 columns, no ANSI unless stderr is a terminal.
@@ -45,22 +45,24 @@ groups, or commits offsets. Point it at an existing topic and move data.
 curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh
 ```
 
-The script downloads the `v0.1.0` release binary for your platform (override
-with `KITE_VERSION=vX.Y.Z`), copies it to `~/.local/bin` (override with
-`KITE_INSTALL_DIR`), and offers to add that directory to your `PATH`. If the
-release asset is missing the script says so and points at the releases page;
-until a release is published, build from source instead. The PATH prompt is
-answered on the controlling terminal (`/dev/tty`), so `curl … | sh` can still
-reply to it even though the script's stdin is the download; without a
-terminal (CI, `< /dev/null`) kite prints the line for you to paste instead.
-Pass `-s -- --yes` to skip the prompt in scripts:
+The script downloads the latest release binary for your platform and
+installs it to `/usr/local/bin`, which is on the default `PATH` of every
+supported OS (it uses `sudo` only if that directory is not writable). Pass
+options after `sh -s --`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh -s -- --yes
+curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh -s -- --bin-dir ~/.local/bin --version v0.1.0
 ```
 
-The script downloads the matching `SHA256SUMS` and refuses to install on a
-checksum mismatch. Prebuilt binaries and `SHA256SUMS` are on the
+| Option | Env | Meaning |
+| --- | --- | --- |
+| `-b`, `--bin-dir DIR` | `KITE_BIN_DIR` | Install into DIR (default `/usr/local/bin`). If DIR is not on your `PATH`, the script prints the line to add. |
+| `-v`, `--version VER` | `KITE_VERSION` | Release tag to install (default `latest`). |
+
+The script downloads the release's `SHA256SUMS` and refuses to install on a
+checksum mismatch. kite is a single static binary, so you can also skip the
+script: release assets are named `kite-{linux,macos}-{x86_64,aarch64}`, and
+prebuilt binaries plus `SHA256SUMS` are on the
 [releases page](https://github.com/addisonhuddy/kite/releases).
 
 ### From source
@@ -69,13 +71,7 @@ Requires Zig 0.16.x.
 
 ```sh
 zig build
-zig-out/bin/kite --add-to-path # copies to ~/.local/bin and offers a PATH line
-```
-
-`kite --add-to-path` accepts `--dir DIR` and `-y`/`--yes`. To install manually instead:
-
-```sh
-install -m755 zig-out/bin/kite ~/.local/bin/kite
+sudo install -m755 zig-out/bin/kite /usr/local/bin/kite
 ```
 
 Cross-compile with, for example, `zig build -Dtarget=aarch64-macos` or
@@ -95,13 +91,13 @@ cp completions/kite.fish ~/.config/fish/completions/           # fish
 ## Command reference
 
 Produce is the default mode. `-c`/`--consume` switches to consume,
-`--add-to-path` to quickly add kite to your PATH. Mode flags may appear
+`--show-config` prints the effective configuration. Mode flags may appear
 anywhere on the command line; there are no reserved topic names.
 
 ```text
 kite [OPTIONS] TOPIC          Produce stdin lines to TOPIC (default).
 kite -c [OPTIONS] TOPIC       Consume TOPIC to stdout.
-kite --add-to-path [OPTIONS]  Add kite to PATH.
+kite --show-config            Show the effective configuration.
 kite --version                Print the version.
 ```
 
@@ -120,13 +116,11 @@ kite --version                Print the version.
 | consume | `-n`, `--max MAX` | Stop after MAX records. |
 | consume | `-t`, `--idle DUR` | Stop after DUR without a record (`3s`, `500ms`, `1m`; bare number = ms). |
 | consume | `-f`, `--follow` | Never stop on idle, even when stdout is a pipe. |
-| install | `--dir DIR` | Install to DIR (default `$KITE_INSTALL_DIR` or `~/.local/bin`). |
-| install | `-y`, `--yes` | Add the install directory to `PATH` without prompting. |
 | produce, consume | `-q`, `--quiet` | Suppress the summary and progress lines on stderr. |
 | produce, consume | `-v`, `--verbose` | Connection, retry, and fetch diagnostics on stderr. |
 | all | `-h`, `--help` | Plain-text help for the selected mode. |
 
-`kite --help`, `kite -c --help`, and `kite --add-to-path --help` print the full pages.
+`kite --help`, `kite -c --help`, and `kite --show-config --help` print the full pages.
 
 ## Common recipes
 
@@ -342,9 +336,7 @@ pipe.
 - `-q` / `--quiet` suppresses the live status line and the end-of-run
   summaries; data, warnings, and errors are unchanged.
 - `-v` / `--verbose` enables connection, retry, and fetch diagnostics.
-- `KITE_DEBUG=1` enables frame and TLS diagnostics, hex-dumping wire frames
-  to stderr (SASL auth frames are redacted). Review dumps before pasting
-  them into public issues.
+- `KITE_DEBUG=1` enables frame and TLS diagnostics.
 - `KITE_TIME=1` prints producer timing totals and connection count.
 
 The default stripped binary is under 600 KB (CI-gated by
