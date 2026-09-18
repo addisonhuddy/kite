@@ -21,8 +21,6 @@ jobs:
       - run: zig build
       - run: zig build test
       - run: scripts/cli-check.sh
-      - run: scripts/install-quote-check.sh
-      - run: scripts/install-pty-check.sh
       - run: scripts/check-size.sh
 
   e2e:

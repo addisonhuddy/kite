@@ -2,7 +2,6 @@
 #   cp completions/kite.fish ~/.config/fish/completions/
 
 complete -c kite -s c -l consume -d 'Consume instead of produce'
-complete -c kite -l add-to-path -d 'Install the executable'
 complete -c kite -l show-config -d 'Show the effective configuration'
 complete -c kite -s V -l version -d 'Print the version'
 complete -c kite -s b -l bootstrap -d 'Comma-separated host:port brokers' -x
@@ -21,5 +20,3 @@ complete -c kite -l partition -d 'Read one partition' -x
 complete -c kite -s n -l max -d 'Stop after MAX records' -x
 complete -c kite -s t -l idle -d 'Stop after idle duration' -x
 complete -c kite -s f -l follow -d 'Never stop on idle'
-complete -c kite -l dir -d 'Install to DIR' -rF
-complete -c kite -s y -l yes -d 'Add install dir to PATH without prompting'

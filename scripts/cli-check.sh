@@ -47,8 +47,6 @@ cmp -s "$TMP/root-help.out" "$TMP/root-short-help.out" || {
 }
 run_case consume-help 0 nonempty empty -c --help
 run_case consume-short-help 0 nonempty empty -c -h
-run_case install-help 0 nonempty empty --add-to-path --help
-run_case install-unknown 1 empty "unknown option" --add-to-path --bogus
 cmp -s "$TMP/consume-help.out" "$TMP/consume-short-help.out" || {
     echo "FAIL consume help differs between -h and --help"
     exit 1
@@ -109,42 +107,13 @@ run_case format-conflict 1 empty "kite: --json cannot be combined with --format 
 run_case consume-format-csv 1 empty "kite: --format csv is only valid when producing" -c --format csv demo
 run_case typo-suggest 1 empty "did you mean '--from-beginning'?" -c --from-begining demo
 
-run_case install-copy 0 nonempty "Add that line" --add-to-path --dir "$TMP/bin"
-[ -x "$TMP/bin/kite" ] || { echo "FAIL install-copy: binary missing"; exit 1; }
-run_case install-relative 0 nonempty "$TMP/work/rel/bin" --add-to-path --dir rel/bin
-[ -x "$TMP/work/rel/bin/kite" ] || { echo "FAIL install-relative: binary missing"; exit 1; }
-
-set +e
-(cd "$TMP/work" && SHELL=/bin/bash HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" --add-to-path --dir "$TMP/bin" --yes >"$TMP/install-yes.out" 2>"$TMP/install-yes.err")
-status=$?
-set -e
-[ "$status" -eq 0 ] || { echo "FAIL install-yes: exit $status"; exit 1; }
-grep -Fq "export PATH=\"$TMP/bin:\$PATH\"" "$TMP/home/.bashrc" || {
-    echo "FAIL install-yes: PATH line missing"; exit 1;
-}
-echo "PASS install-yes"
-
-mkdir -p "$TMP/home2"
-printf '%s\n' '# managed by dotfiles' >"$TMP/home2/real.bashrc"
-ln -s real.bashrc "$TMP/home2/.bashrc"
-set +e
-(cd "$TMP/work" && SHELL=/bin/bash HOME="$TMP/home2" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" --add-to-path --dir "$TMP/bin" --yes >"$TMP/install-symlink.out" 2>"$TMP/install-symlink.err")
-status=$?
-set -e
-[ "$status" -eq 0 ] || { echo "FAIL install-symlink: exit $status"; exit 1; }
-[ -L "$TMP/home2/.bashrc" ] || { echo "FAIL install-symlink: rc symlink replaced"; exit 1; }
-grep -Fq "export PATH=\"$TMP/bin:\$PATH\"" "$TMP/home2/real.bashrc" || {
-    echo "FAIL install-symlink: PATH line missing"; exit 1;
-}
-echo "PASS install-symlink"
-
 run_case produce-no-config 1 empty "no broker configured. Pass -b HOST:PORT, set BOOTSTRAP_SERVERS, or create kite.properties" demo
 run_case consume-no-config 1 empty "no broker configured" -c demo
 run_case config-file-missing 1 empty "kite: config file 'nope.properties' not found" --config nope.properties demo
 run_case version 0 nonempty empty --version
 run_case version-extra 1 empty "unknown option '--version'" --version --bogus
 run_case mode-looking-option-value 1 empty "requires --csv" --key -c demo
-run_case mode-conflict 1 empty "cannot be combined" -c --add-to-path demo
+run_case mode-conflict 1 empty "cannot be combined" -c --show-config demo
 run_case topic-named-consume 1 empty "no broker configured" consume
 run_case flag-after-topic 1 empty "no broker configured" events -c
 

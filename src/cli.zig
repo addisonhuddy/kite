@@ -51,7 +51,6 @@ pub const version = "0.1.0";
 pub const Mode = enum {
     produce,
     consume,
-    install,
     show_config,
 };
 
@@ -76,8 +75,7 @@ fn takesSeparateValue(arg: []const u8) bool {
         std.mem.eql(u8, arg, "-n") or
         std.mem.eql(u8, arg, "--max") or
         std.mem.eql(u8, arg, "-t") or
-        std.mem.eql(u8, arg, "--idle") or
-        std.mem.eql(u8, arg, "--dir");
+        std.mem.eql(u8, arg, "--idle");
 }
 
 pub fn splitMode(alloc: std.mem.Allocator, args: []const []const u8) Result(ModeSplit) {
@@ -91,22 +89,12 @@ pub fn splitMode(alloc: std.mem.Allocator, args: []const []const u8) Result(Mode
             continue;
         }
         if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--consume")) {
-            if (mode == .install)
-                return .{ .err = "--consume cannot be combined with --add-to-path" };
             if (mode == .show_config)
                 return .{ .err = "--show-config cannot be combined with --consume" };
             mode = .consume;
-        } else if (std.mem.eql(u8, arg, "--add-to-path")) {
-            if (mode == .consume)
-                return .{ .err = "--consume cannot be combined with --add-to-path" };
-            if (mode == .show_config)
-                return .{ .err = "--show-config cannot be combined with --add-to-path" };
-            mode = .install;
         } else if (std.mem.eql(u8, arg, "--show-config")) {
             if (mode == .consume)
                 return .{ .err = "--show-config cannot be combined with --consume" };
-            if (mode == .install)
-                return .{ .err = "--show-config cannot be combined with --add-to-path" };
             mode = .show_config;
         } else {
             rest.append(alloc, arg) catch return .{ .err = "out of memory" };
@@ -124,10 +112,6 @@ pub const consume_usage =
     "Usage: kite -c [OPTIONS] TOPIC\n" ++
     "Try 'kite -c --help' for examples.\n";
 
-pub const install_usage =
-    "Usage: kite --add-to-path [OPTIONS]\n" ++
-    "Try 'kite --add-to-path --help' for details.\n";
-
 const config_help =
     "Configuration:\n" ++
     "  Flags override environment variables, which override the first\n" ++
@@ -144,14 +128,10 @@ pub const produce_help =
     "Usage:\n" ++
     "  kite [OPTIONS] TOPIC          Produce stdin lines to TOPIC (default).\n" ++
     "  kite -c [OPTIONS] TOPIC       Consume TOPIC to stdout. See 'kite -c --help'.\n" ++
-    "  kite --add-to-path [OPTIONS]  Install this executable. See\n" ++
-    "                                'kite --add-to-path --help'.\n" ++
     "  kite --show-config  Show the effective configuration; never connects.\n" ++
     "\n" ++
     "Options:\n" ++
     "  -c, --consume         Consume instead of produce.\n" ++
-    "  --add-to-path         Install the executable to ~/.local/bin and\n" ++
-    "                        add it to PATH.\n" ++
     "  -V, --version         Print the version and exit.\n" ++
     "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
     "  --config FILE         Read this properties file instead of searching.\n" ++
@@ -249,18 +229,6 @@ pub const show_config_help =
     "\n" ++
     config_help;
 
-pub const install_help =
-    "kite --add-to-path - Install the current kite executable\n" ++
-    "\n" ++
-    "Usage:\n" ++
-    "  kite --add-to-path [OPTIONS]\n" ++
-    "\n" ++
-    "Options:\n" ++
-    "  --dir DIR             Install to DIR (default: $KITE_INSTALL_DIR or\n" ++
-    "                        ~/.local/bin).\n" ++
-    "  -y, --yes             Add the install directory to PATH without prompting.\n" ++
-    "  -h, --help            Show this help and exit.\n";
-
 fn errorResult(comptime T: type, alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) Result(T) {
     return .{ .err = std.fmt.allocPrint(alloc, fmt, args) catch "out of memory" };
 }
@@ -322,9 +290,8 @@ pub fn parseHeaderArg(s: []const u8) !protocol.Header {
 const produce_only = [_][]const u8{ "-H", "--csv", "--key" };
 const consume_only = [_][]const u8{ "-B", "--from-beginning", "--offset", "--partition", "-n", "--max", "-t", "--idle", "-f", "--follow" };
 
-const produce_options = [_][]const u8{ "--consume", "--add-to-path", "--version", "--bootstrap", "--config", "--format", "--json", "--csv", "--key", "--quiet", "--verbose", "--help", "--show-config" };
-const consume_options = [_][]const u8{ "--consume", "--add-to-path", "--bootstrap", "--config", "--from-beginning", "--offset", "--partition", "--max", "--idle", "--follow", "--format", "--json", "--quiet", "--verbose", "--help" };
-const install_options = [_][]const u8{ "--add-to-path", "--dir", "--yes", "--help" };
+const produce_options = [_][]const u8{ "--consume", "--version", "--bootstrap", "--config", "--format", "--json", "--csv", "--key", "--quiet", "--verbose", "--help", "--show-config" };
+const consume_options = [_][]const u8{ "--consume", "--bootstrap", "--config", "--from-beginning", "--offset", "--partition", "--max", "--idle", "--follow", "--format", "--json", "--quiet", "--verbose", "--help" };
 const show_config_options = [_][]const u8{ "--show-config", "--bootstrap", "--config", "--json", "--format", "--quiet", "--verbose", "--help" };
 
 /// Damerau-Levenshtein distance (adjacent transposition counts as one edit).
@@ -352,7 +319,6 @@ fn suggestOption(mode: Mode, name: []const u8) ?[]const u8 {
     const candidates: []const []const u8 = switch (mode) {
         .produce => &produce_options,
         .consume => &consume_options,
-        .install => &install_options,
         .show_config => &show_config_options,
     };
     var best: ?[]const u8 = null;
@@ -395,7 +361,7 @@ fn unknownOption(alloc: std.mem.Allocator, mode: Mode, arg: []const u8) []const 
             return errMsg(alloc, "'{s}' is a consume option; use 'kite -c [OPTIONS] TOPIC'", .{name}),
         .consume => if (isOneOf(name, &produce_only))
             return errMsg(alloc, "'{s}' is a produce option and is not valid with -c", .{name}),
-        .install, .show_config => {},
+        .show_config => {},
     }
     if (suggestOption(mode, name)) |candidate|
         return errMsg(alloc, "unknown option '{s}' (did you mean '{s}'?)", .{ arg, candidate });
@@ -783,7 +749,6 @@ test "show-config mode split and parsing" {
         else => return error.TestUnexpectedResult,
     }
     try expectErr(ModeSplit, splitMode(alloc, &.{ "-c", "--show-config", "demo" }), "--show-config cannot be combined with --consume");
-    try expectErr(ModeSplit, splitMode(alloc, &.{ "--add-to-path", "--show-config" }), "--show-config cannot be combined with --add-to-path");
     try expectErr(ModeSplit, splitMode(alloc, &.{ "--show-config", "-c", "demo" }), "--show-config cannot be combined with --consume");
 
     const ok = parseShowConfig(alloc, &.{ "-b", "h:1", "--config", "x.properties", "--json" });
@@ -836,8 +801,6 @@ test "mode flags are split from arguments" {
         },
         else => return error.TestUnexpectedResult,
     }
-
-    try expectErr(ModeSplit, splitMode(alloc, &.{ "-c", "--add-to-path", "events" }), "--consume cannot be combined with --add-to-path");
 
     const produce = splitMode(alloc, &.{"consume"});
     switch (produce) {
@@ -950,7 +913,7 @@ test "help is detected in argument order" {
 test "help text stays plain and narrow" {
     try std.testing.expect(produce_help.len != consume_help.len);
     try std.testing.expect(std.mem.indexOf(u8, consume_help, "-c, --consume") == null);
-    for ([_][]const u8{ produce_help, consume_help, install_help }) |page| {
+    for ([_][]const u8{ produce_help, consume_help }) |page| {
         try std.testing.expect(std.mem.indexOf(u8, page, "-h, --help") != null);
         var lines = std.mem.splitScalar(u8, page, '\n');
         while (lines.next()) |line| {

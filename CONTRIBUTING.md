@@ -12,8 +12,6 @@ zig fmt --check src build.zig
 zig build
 zig build test
 scripts/cli-check.sh
-scripts/install-quote-check.sh
-scripts/install-pty-check.sh
 scripts/check-size.sh
 scripts/e2e-docker.sh
 ```
