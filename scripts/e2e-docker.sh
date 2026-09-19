@@ -91,6 +91,48 @@ set -e
 [ "$rc" -eq 0 ] || fail "bounds: 'kite -c -n 1 --idle 500ms' on an empty topic exited $rc; expected a clean idle stop"
 echo "PASS bounds"
 
+# CSV over a pipe must yield the same records as file redirection (a pipe's
+# first read is not seekable and used to be mistaken for EOF), including
+# --key column selection; a slow, chunked writer must not truncate or hang.
+csv_topic() {
+    local t="kite-csv-$1-$(date +%s)-$RANDOM"
+    docker exec "$NAME" /opt/kafka/bin/kafka-topics.sh \
+        --bootstrap-server localhost:9092 --create --topic "$t" \
+        --partitions 1 --replication-factor 1 >/dev/null
+    echo "$t"
+}
+# One JSON line per record with the per-topic/per-run fields dropped so two
+# topics can be compared (values with embedded newlines stay on one line).
+csv_dump() {
+    timeout 20s zig-out/bin/kite -c -B --idle 2s --json "$1" 2>/dev/null \
+        | sed -E 's/^\{"topic":"[^"]*","partition":[0-9]+,"offset":([0-9]+),"timestamp":[0-9]+,/{"offset":\1,/'
+}
+for fixture in users events; do
+    file="examples/data/$fixture.csv"
+    if [ "$fixture" = events ]; then keyopt=(--key user_id); records=8; else keyopt=(); records=6; fi
+    t_file=$(csv_topic "file-$fixture")
+    t_pipe=$(csv_topic "pipe-$fixture")
+    t_slow=$(csv_topic "slow-$fixture")
+    zig-out/bin/kite --csv "${keyopt[@]}" "$t_file" <"$file"
+    cat "$file" | timeout 20s zig-out/bin/kite --csv "${keyopt[@]}" "$t_pipe" \
+        || fail "csv-pipe: 'cat $file | kite --csv' exited $?"
+    while IFS= read -r line || [ -n "$line" ]; do
+        printf '%s\n' "$line"
+        sleep 0.2
+    done <"$file" | timeout 30s zig-out/bin/kite --csv "${keyopt[@]}" "$t_slow" \
+        || fail "csv-pipe: slow chunked pipe for $file exited $?"
+    want=$(csv_dump "$t_file")
+    n=$(printf '%s\n' "$want" | grep -c .)
+    [ "$n" -eq "$records" ] || fail "csv-pipe: file redirection of $file produced $n records, expected $records"
+    [ "$(csv_dump "$t_pipe")" = "$want" ] || fail "csv-pipe: pipe input of $file differs from file redirection"
+    [ "$(csv_dump "$t_slow")" = "$want" ] || fail "csv-pipe: slow pipe input of $file differs from file redirection"
+    if [ "$fixture" = events ]; then
+        printf '%s\n' "$want" | grep -qF '"key":"u-1","headers":[],"value":"{\"event_id\":\"e-1\",\"user_id\":\"u-1\"' \
+            || fail "csv-pipe: --key user_id did not set the key / keep the user_id field"
+    fi
+done
+echo "PASS csv-pipe"
+
 # Early pipe closure: once `head` exits, kite sees the closed sink and must
 # exit 0 without SIGPIPE noise on stderr (README: status 0).
 err=$(mktemp)
