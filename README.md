@@ -1,5 +1,10 @@
 # kite
 
+[![CI](https://github.com/addisonhuddy/kite/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/addisonhuddy/kite/actions/workflows/ci.yml)
+[![Release](https://github.com/addisonhuddy/kite/actions/workflows/release.yml/badge.svg)](https://github.com/addisonhuddy/kite/actions/workflows/release.yml)
+[![Version](https://img.shields.io/github/v/release/addisonhuddy/kite?sort=semver&display_name=tag&label=version)](https://github.com/addisonhuddy/kite/releases/latest)
+[![License](https://img.shields.io/github/license/addisonhuddy/kite)](LICENSE)
+
 **kite is an ultra-lightweight Kafka CLI built for agents and sandboxes.**
 One binary under 600 KB, no JVM, no runtime, no daemon. stdin in, stdout out,
 non-zero exit on failure.
