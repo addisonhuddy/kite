@@ -90,6 +90,13 @@ waitfor() {
             buf+=$chunk
             print -rn -- "$chunk" >&2
             [[ $buf == ${~1} ]] && return 0
+            # compaudit found group-writable system fpath dirs (CI runners
+            # have them) and asks whether to continue: answer y. That is a
+            # property of the machine, not of the README instructions.
+            if [[ $buf == *'abort compinit [n]? ' ]]; then
+                zpty -w -n kite_zsh y
+                buf=""
+            fi
         else
             sleep 0.05
         fi
@@ -98,15 +105,8 @@ waitfor() {
     return 1
 }
 zpty -b kite_zsh zsh -i
-# Wait for the first prompt. compaudit may instead ask about group-writable
-# system fpath dirs (CI runners have them); answer y — that is a property of
-# the machine, not of the README instructions.
-waitfor '*(Ignore insecure directories*|[%$#] )*' || exit 1
-if [[ $buf == *'insecure directories'* ]]; then
-    zpty -w -n kite_zsh y
-    buf=""
-    waitfor '*[%$#] *' || exit 1
-fi
+# Let .zshrc (and any compaudit prompt) finish before typing.
+waitfor '*[%$#] *' || exit 1
 zpty -w kite_zsh 'PROMPT=""; RPROMPT=""; setopt no_beep; zstyle ":completion:*" completer _complete
 __cands=()
 compadd() { local -a __r; builtin compadd -O __r "$@"; __cands+=($__r) }
