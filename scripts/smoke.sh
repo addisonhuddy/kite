@@ -2,14 +2,15 @@
 # Smoke test: produce → consume roundtrip against any Kafka 4.0+ broker.
 # Needs a broker configured (-b is not used here, so set BOOTSTRAP_SERVERS
 # or put a kite.properties on the search path; see README "Configuration")
-# and an existing topic — kite never auto-creates topics by design.
+# and a topic — kite creates a missing one automatically when not on a
+# terminal.
 #
 #   scripts/smoke.sh <topic>
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 K=zig-out/bin/kite
-TOPIC=${1:?"usage: scripts/smoke.sh <existing-topic>"}
+TOPIC=${1:?"usage: scripts/smoke.sh <topic>"}
 M=smoke-$(date +%s)-$RANDOM # unique marker so pre-existing records don't collide
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

@@ -52,8 +52,10 @@ why I think you will love kite.
   stderr with exit code 1 and a `Try 'kite --help'` hint. Help pages are
   plain text, ≤ 80 columns, no ANSI unless stderr is a terminal.
 
-kite is not a Kafka admin tool: it never creates topics, manages consumer
-groups, or commits offsets. Point it at an existing topic and move data.
+kite is not a Kafka admin tool: it never manages consumer groups or commits
+offsets. When the target topic does not exist it offers to create it —
+prompting on a terminal, creating automatically in scripts and pipes —
+with the broker's default partition count and replication factor.
 
 ### What kite is optimized for
 
@@ -429,9 +431,10 @@ The default stripped binary is under 600 KB (CI-gated by
   `BOOTSTRAP_SERVERS`, or copy a template to one of the search-path
   locations and edit `bootstrap.servers`. `-v` prints which sources were
   used.
-- **Topic does not exist:** create the topic with your Kafka administration
-  tooling; kite never creates topics. On some hosted clusters a missing topic
-  surfaces as an authorization error instead.
+- **Topic does not exist:** kite offers to create it on the spot — it asks
+  on a terminal and creates automatically in scripts and pipes, using the
+  broker's default partition count and replication factor. On some hosted
+  clusters a missing topic surfaces as an authorization error instead.
 - **`connection refused by HOST:PORT` / `cannot resolve host`:** check the
   address, DNS, and firewall rules; run with `-v` for connection diagnostics.
 - **Authentication or TLS failure:** check the SASL settings and CA bundle;
@@ -491,7 +494,7 @@ zig build test
 scripts/cli-check.sh
 scripts/check-size.sh
 scripts/pack.sh
-scripts/smoke.sh EXISTING_TOPIC
+scripts/smoke.sh TOPIC
 ```
 
 See [TESTING.md](TESTING.md) for broker-agnostic and broker-backed checks.

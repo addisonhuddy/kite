@@ -51,6 +51,8 @@ pub const Client = struct {
     control: ?*Conn,
     /// node_id -> advertised broker address from metadata
     brokers: std.AutoHashMapUnmanaged(i32, BrokerAddr),
+    /// controller node_id from the last Metadata response (-1 = unknown)
+    controller_id: i32 = -1,
     /// partition index -> leader node_id for the target topic
     partitions: std.ArrayListUnmanaged(Partition),
     /// api_key -> negotiated range, from the last ApiVersions response
@@ -509,7 +511,7 @@ pub const Client = struct {
             try c.brokers.put(c.alloc, node, .{ .host = try c.alloc.dupe(u8, host), .port = @intCast(@max(0, port)) });
         }
         _ = try d.compactString(); // cluster id
-        _ = try d.i32v(); // controller id
+        c.controller_id = try d.i32v();
 
         const ntopics = try d.compactArrayLen();
         var t: i64 = 0;
@@ -553,6 +555,99 @@ pub const Client = struct {
 
     pub fn partitionCount(c: *const Client) usize {
         return c.partitions.items.len;
+    }
+
+    // -- CreateTopics --------------------------------------------------------
+
+    /// Create `topic` with the broker's default partition count and
+    /// replication factor (CreateTopics v7). Sent to the controller when its
+    /// node id/address is known — that is the only broker that can create
+    /// topics — else to the control connection. TopicAlreadyExists counts as
+    /// success (someone else won the race to create it).
+    pub fn createTopic(c: *Client, topic: []const u8) !void {
+        if (!c.checkVersion(protocol.api_key.create_topics, protocol.version.create_topics)) {
+            const r = c.api_ranges.get(protocol.api_key.create_topics);
+            c.setErr(
+                "broker lacks CreateTopics v{d} (range {d}..{d})",
+                .{ protocol.version.create_topics, if (r) |x| x.min else -1, if (r) |x| x.max else -1 },
+            );
+            return error.CreateTopicFailed;
+        }
+        const body = struct {
+            fn f(e: *Encoder, t: []const u8) protocol.ProtoError!void {
+                try e.compactArrayLen(1);
+                try e.compactString(t);
+                try e.i32v(-1); // num_partitions: -1 = broker default
+                try e.i16v(-1); // replication_factor: -1 = broker default
+                try e.compactArrayLen(0); // assignments
+                try e.compactArrayLen(0); // configs
+                try e.tagBuffer();
+                try e.i32v(30000); // timeout_ms
+                try e.boolean(false); // validate_only
+                try e.tagBuffer();
+            }
+        }.f;
+
+        var conn = c.control orelse {
+            c.setErr("no connection for CreateTopics", .{});
+            return error.CreateTopicFailed;
+        };
+        // Produce conn keys are pidx*conns_per_partition+slot, so slot
+        // 0xFFFF_FFFF for the controller cannot collide with them.
+        if (c.controller_id >= 0 and c.brokers.contains(c.controller_id)) {
+            conn = c.connFor(c.controller_id, connKey(c.controller_id, 0xFFFF_FFFF)) catch conn;
+        }
+
+        var attempt: usize = 0;
+        while (attempt < 2) : (attempt += 1) {
+            const resp = c.sendRequest(conn, protocol.api_key.create_topics, protocol.version.create_topics, topic, body) catch {
+                c.setErr("CreateTopics request failed", .{});
+                return error.CreateTopicFailed;
+            };
+            var d = Decoder.init(resp.body);
+            _ = try d.i32v(); // throttle
+            const n = try d.compactArrayLen();
+            if (n < 1) {
+                c.alloc.free(resp.frame);
+                c.setErr("CreateTopics: empty topics array", .{});
+                return error.CreateTopicFailed;
+            }
+            _ = try d.compactString(); // name (we sent exactly one topic)
+            try d.skip(16); // topic_id uuid
+            const code: protocol.ErrorCode = @enumFromInt(try d.i16v());
+            const msg = try d.compactString();
+            c.alloc.free(resp.frame);
+            switch (code) {
+                .none, .topic_already_exists => {
+                    c.vlog("CreateTopics '{s}': {s}", .{ topic, code.name() });
+                    return;
+                },
+                .not_controller => {
+                    // Our controller id was stale or we never learned it;
+                    // one retry through the control connection.
+                    if (attempt == 0 and c.control != null and conn != c.control.?) {
+                        conn = c.control.?;
+                        continue;
+                    }
+                    c.setErr("CreateTopics '{s}': {s}", .{ topic, code.name() });
+                    return error.CreateTopicFailed;
+                },
+                .topic_authorization_failed, .cluster_authorization_failed => {
+                    c.setErr("CreateTopics '{s}': {s}", .{ topic, code.name() });
+                    return error.TopicAuthorizationFailed;
+                },
+                else => {
+                    if (msg) |m| {
+                        if (m.len > 0) {
+                            c.setErr("CreateTopics '{s}': {s} ({s})", .{ topic, code.name(), m });
+                            return error.CreateTopicFailed;
+                        }
+                    }
+                    c.setErr("CreateTopics '{s}': {s}", .{ topic, code.name() });
+                    return error.CreateTopicFailed;
+                },
+            }
+        }
     }
 
     // -- Idempotent produce: InitProducerId ----------------------------------

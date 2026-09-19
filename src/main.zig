@@ -165,7 +165,7 @@ pub fn main(init: std.process.Init) !void {
 
     var cfg = loadConfig(init, alloc, produce.common, &dummy_source);
     var cli = client.Client.init(alloc, io, init.environ_map, &cfg);
-    connectAndResolve(&cli, topic, "write");
+    connectAndResolve(&cli, topic, "write", quiet);
 
     const nparts = cli.partitionCount();
     var pend = alloc.alloc(Pending, nparts) catch fatal("out of memory", .{});
@@ -441,11 +441,69 @@ fn loadConfig(init: std.process.Init, alloc: std.mem.Allocator, common: cli_args
     return cfg;
 }
 
+/// True when a missing topic should be created: automatically when stderr
+/// is not a terminal (scripts, pipes) or /dev/tty cannot be opened, else
+/// only when the user confirms at the /dev/tty prompt. The prompt reads
+/// /dev/tty rather than stdin, which may be the record pipe for produce.
+fn shouldCreateTopic(io: std.Io, topic: []const u8) bool {
+    const stderr_tty = std.Io.File.stderr().isTty(io) catch false;
+    const tty: ?std.Io.File = if (stderr_tty)
+        std.Io.Dir.cwd().openFile(io, "/dev/tty", .{}) catch null
+    else
+        null;
+    const f = tty orelse return true;
+    defer f.close(io);
+    if (term.color.enabled)
+        out(term.dim ++ "kite: topic '{s}' does not exist. Create it? [y/N] " ++ term.reset, .{topic})
+    else
+        out("kite: topic '{s}' does not exist. Create it? [y/N] ", .{topic});
+    var buf: [256]u8 = undefined;
+    var fr = f.reader(io, &buf);
+    const line = fr.interface.takeDelimiter('\n') catch return false;
+    const answer = std.mem.trim(u8, line orelse return false, " \t\r");
+    return std.ascii.eqlIgnoreCase(answer, "y") or std.ascii.eqlIgnoreCase(answer, "yes");
+}
+
+/// Create the missing topic, then poll metadata until the brokers agree on
+/// its partition->leader table (a fresh topic reports no leader briefly).
+fn createAndResolve(cli: *client.Client, topic: []const u8, access: []const u8, quiet: bool) void {
+    if (!shouldCreateTopic(cli.io, topic))
+        fatal("topic '{s}' does not exist", .{topic});
+    cli.createTopic(topic) catch |err| switch (err) {
+        error.TopicAuthorizationFailed => fatal(
+            "not authorized to create topic '{s}' (check ACLs for this principal)",
+            .{topic},
+        ),
+        else => fatalErr(cli, "could not create topic"),
+    };
+    if (!quiet) note("created topic '{s}'", .{topic});
+    var attempt: usize = 0;
+    while (true) {
+        if (cli.refreshMetadata(topic)) |_| {
+            return;
+        } else |err| switch (err) {
+            error.TopicNotFound, error.MetadataFailed => {
+                attempt += 1;
+                if (attempt >= 10)
+                    fatalErr(cli, "metadata lookup failed after creating topic");
+                cli.sleep(200);
+            },
+            error.TopicAuthorizationFailed => fatal(
+                "not authorized to {s} topic '{s}' (check ACLs for this principal; on managed clusters this is also what a missing topic looks like)",
+                .{ access, topic },
+            ),
+            else => fatalErr(cli, "metadata lookup failed"),
+        }
+    }
+}
+
 /// Bootstrap and fetch topic metadata, exiting with a mode-aware message.
-fn connectAndResolve(cli: *client.Client, topic: []const u8, access: []const u8) void {
+/// A missing topic is created on the spot — after confirmation on a
+/// terminal, silently otherwise.
+fn connectAndResolve(cli: *client.Client, topic: []const u8, access: []const u8, quiet: bool) void {
     cli.bootstrap() catch fatalErr(cli, "could not reach any bootstrap server");
     cli.refreshMetadata(topic) catch |err| switch (err) {
-        error.TopicNotFound => fatal("topic '{s}' does not exist (create it first, or check the name)", .{topic}),
+        error.TopicNotFound => createAndResolve(cli, topic, access, quiet),
         error.TopicAuthorizationFailed => fatal(
             "not authorized to {s} topic '{s}' (check ACLs for this principal; on managed clusters this is also what a missing topic looks like)",
             .{ access, topic },
@@ -474,7 +532,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
 
     var cfg = loadConfig(init, alloc, consume.common, &dummy_source);
     var cli = client.Client.init(alloc, init.io, init.environ_map, &cfg);
-    connectAndResolve(&cli, topic_name, "read");
+    connectAndResolve(&cli, topic_name, "read", quiet);
 
     const stdout_tty = std.Io.File.stdout().isTty(init.io) catch false;
     const stderr_tty = std.Io.File.stderr().isTty(init.io) catch false;
