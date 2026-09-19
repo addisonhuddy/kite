@@ -165,7 +165,7 @@ pub fn main(init: std.process.Init) !void {
 
     var cfg = loadConfig(init, alloc, produce.common, &dummy_source);
     var cli = client.Client.init(alloc, io, init.environ_map, &cfg);
-    connectAndResolve(&cli, topic, "write", quiet);
+    connectAndResolve(&cli, topic, "write", quiet, true);
 
     const nparts = cli.partitionCount();
     var pend = alloc.alloc(Pending, nparts) catch fatal("out of memory", .{});
@@ -498,12 +498,16 @@ fn createAndResolve(cli: *client.Client, topic: []const u8, access: []const u8, 
 }
 
 /// Bootstrap and fetch topic metadata, exiting with a mode-aware message.
-/// A missing topic is created on the spot — after confirmation on a
-/// terminal, silently otherwise.
-fn connectAndResolve(cli: *client.Client, topic: []const u8, access: []const u8, quiet: bool) void {
+/// When `create_missing` (produce only) a missing topic is created on the
+/// spot — after confirmation on a terminal, silently otherwise; consume
+/// treats it as a plain error.
+fn connectAndResolve(cli: *client.Client, topic: []const u8, access: []const u8, quiet: bool, create_missing: bool) void {
     cli.bootstrap() catch fatalErr(cli, "could not reach any bootstrap server");
     cli.refreshMetadata(topic) catch |err| switch (err) {
-        error.TopicNotFound => createAndResolve(cli, topic, access, quiet),
+        error.TopicNotFound => if (create_missing)
+            createAndResolve(cli, topic, access, quiet)
+        else
+            fatal("topic '{s}' does not exist", .{topic}),
         error.TopicAuthorizationFailed => fatal(
             "not authorized to {s} topic '{s}' (check ACLs for this principal; on managed clusters this is also what a missing topic looks like)",
             .{ access, topic },
@@ -532,7 +536,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
 
     var cfg = loadConfig(init, alloc, consume.common, &dummy_source);
     var cli = client.Client.init(alloc, init.io, init.environ_map, &cfg);
-    connectAndResolve(&cli, topic_name, "read", quiet);
+    connectAndResolve(&cli, topic_name, "read", quiet, false);
 
     const stdout_tty = std.Io.File.stdout().isTty(init.io) catch false;
     const stderr_tty = std.Io.File.stderr().isTty(init.io) catch false;
