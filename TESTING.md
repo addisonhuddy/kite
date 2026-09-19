@@ -43,31 +43,39 @@ scripts/check-size.sh
 The default stripped binary must stay below 600,000 bytes. `scripts/pack.sh` is an
 optional UPX/LZMA packaging step.
 
-## End-to-end: any Kafka 4.0+ broker
+## End-to-end tests
 
-There is no bundled broker harness. Point kite at a broker with
-`BOOTSTRAP_SERVERS` (or copy an [`examples/config/`](examples/config)
+The broker-dependent checks live in `scripts/smoke.sh` and run in one of two
+ways: against a broker you already have (this section), or inside a throwaway
+Docker broker that `scripts/e2e-docker.sh` starts for you (next section). CI
+uses the Docker harness.
+
+### Existing Kafka 4.0+ broker
+
+Point kite at a broker with `BOOTSTRAP_SERVERS` (or copy an [`examples/config/`](examples/config)
 template to `./kite.properties` and set `bootstrap.servers` plus any
 authentication), build, and run:
 
 ```sh
 export BOOTSTRAP_SERVERS=localhost:9092
 zig build
-scripts/smoke.sh EXISTING_TOPIC
+scripts/smoke.sh TOPIC
 ```
 
-The topic must already exist; kite never creates topics. `smoke.sh` produces
+The topic is created on first produce if it does not exist (consume never
+creates topics). `smoke.sh` produces
 marked plain and keyed records, consumes them from the beginning with an idle
 timeout, compares the roundtrip, checks a `--json` produce/consume roundtrip
 (key, nested value, headers), and asserts that an out-of-range `--offset`
 fails with the valid range instead of replaying the partition.
 
-## End-to-end: Docker Kafka
+### Docker harness
 
 `scripts/e2e-docker.sh` runs the full suite against a real broker with no
 setup beyond Docker: it pulls `apache/kafka` (pinned tag), starts a
 single-node KRaft container on `127.0.0.1:9092`, creates a `kite-e2e` topic,
-and runs `smoke.sh` plus broker-dependent edge cases (early pipe closure,
+and runs `smoke.sh` plus broker-dependent edge cases (the README Quickstart on
+a fresh topic, `-n` vs `--idle` stopping behaviour, early pipe closure,
 `/dev/full` write errors):
 
 ```sh

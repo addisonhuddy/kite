@@ -29,12 +29,21 @@ member; use your Kafka admin tooling or a client library for those.
 
 ## Quickstart
 
+You need a reachable Kafka 4.0+ broker (`localhost:9092` below), permission to
+read and write the topic you name, and [`jq`](https://jqlang.github.io/jq/)
+for the last line. Use a fresh topic name so the output is exactly one record;
+produce creates a missing topic automatically when run from a script or pipe.
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh
 export BOOTSTRAP_SERVERS=localhost:9092
-printf 'hello\n' | kite events              # produce
-kite -c --json events | jq -c .value        # with partition/offset metadata
+printf 'hello\n' | kite events                       # produce one record
+kite -c -B --idle 3s --json events | jq -r .value    # prints: hello
 ```
+
+The consume line reads from the beginning (`-B`) and stops 3 s after the last
+record (`--idle 3s`). Without `-B` a consumer starts at the *latest* offset
+and would skip the record just produced.
 
 ## Why kite
 
@@ -49,8 +58,8 @@ why I think you will love kite.
   Records are lines. Diagnostics go to stderr, data goes to stdout.
 - **Fast.** Written in Zig: native code, no garbage collector, no JVM
   startup, starts and exits in milliseconds. Produce runs are batched and
-  idempotent by default; consume runs are bounded with `-n`/`-t` so a script
-  always terminates.
+  idempotent by default; consume runs can be bounded by record count (`-n`)
+  and by idle time (`-t`/`--idle`), so a script stops when the data does.
 - **Easy install.** One static binary: `curl` it onto your `PATH` or
   `zig build`. No package manager, no `JAVA_HOME`.
 - **Predictable for automation.** Every error is a one-line `kite: ...` on
@@ -72,8 +81,10 @@ an AI agent's tool call. That shapes every design choice:
 - **Zero-dependency install.** One static binary under 600 KB, fetched with
   `curl` and verified against `SHA256SUMS`. Nothing to apt-get, brew, or
   build; nothing that needs a JVM or a shared library at runtime.
-- **Always terminates.** A piped consume stops after 5 s idle unless you say
-  otherwise, so an unattended read can never hang a job.
+- **Bounded by default.** A piped consume with no `-n`, `--idle`, or `-f`
+  stops after 5 s without a record, so an unattended read does not hang a
+  job by accident. `-n` alone bounds records, not time: pair it with `--idle`
+  when you need a deadline (see [Consuming](#consuming)).
 - **Strict stream contract.** Data on stdout, diagnostics on stderr, exit `0`
   or `1`, one-line `kite: ...` errors, no prompts, no color when not a TTY.
 - **Structured in and out.** JSON records with full metadata, TSV keys and
@@ -103,15 +114,18 @@ the facts you need. They are stable across releases.
   effective configuration without connecting.
 - **Produce:** `printf 'value\n' | kite TOPIC`; JSON records with
   `kite --json TOPIC`; CSV with `kite --csv [--key COL] TOPIC`.
-- **Consume (always terminates in a pipe):** `kite -c -B -n 100 --idle 3s TOPIC`;
-  add `--json` for `{topic,partition,offset,timestamp,key,headers,value}` per
-  line.
+- **Consume (bounded):** `kite -c -B -n 100 --idle 3s TOPIC` stops after 100
+  records or 3 s without one, whichever comes first; add `--json` for
+  `{topic,partition,offset,timestamp,key,headers,value}` per line. A piped
+  read with neither bound stops after 5 s idle; `-n` alone waits for its
+  records; `-f` never stops.
 - **Contract:** data on stdout only, diagnostics on stderr only, exit `0` on
   success, `1` on any error with a single-line `kite: MESSAGE`, `130` on
   Ctrl-C. No interactive prompts, no color when stdout/stderr is not a TTY,
   no config written to disk, no network calls other than to the brokers.
-- **Does not:** create topics, join consumer groups, commit offsets, or manage
-  the cluster.
+- **Does not:** join consumer groups, commit offsets, or manage the cluster.
+  Produce creates a missing topic (automatically when not on a TTY); consume
+  never does.
 
 A tool description you can paste into an agent's tool registry:
 
@@ -120,7 +134,9 @@ kite: single-binary Kafka CLI. `kite TOPIC` produces stdin lines (or --json /
 --csv records) to TOPIC. `kite -c TOPIC` consumes TOPIC to stdout; use -B for
 history, -n N to cap records, --idle DUR to stop when quiet, --json for full
 metadata. Configure with BOOTSTRAP_SERVERS (and SASL_*/SECURITY_PROTOCOL) or
--b HOST:PORT. Exit 0 ok, 1 error (message on stderr). Never hangs in a pipe.
+-b HOST:PORT. Exit 0 ok, 1 error (message on stderr). A piped consume with
+no -n/--idle/-f stops after 5s idle; pass -n and --idle together for a
+bounded read.
 ```
 
 A machine-readable summary also lives in [`llms.txt`](llms.txt).
@@ -228,7 +244,8 @@ kite --version                Print the version.
 | --- | --- | --- |
 | produce, consume | `-b`, `--bootstrap HOSTS` | Comma-separated `host:port` brokers (overrides env and file). |
 | produce, consume | `--config FILE` | Read this properties file instead of searching. |
-| produce, consume | `--format FMT` | Record shape: `value`, `tsv`, `json`, `csv` (default `auto`). |
+| produce, consume | `--format FMT` | Record shape: `value`, `tsv`, `json` (default `auto`). |
+| produce | `--format csv` | RFC 4180 CSV input (produce only); same as `--csv`. |
 | produce, consume | `--json` | Alias for `--format json`. |
 | produce | `-H 'name: value'` | Add a header to every record (repeatable). |
 | produce | `--csv` | Read RFC 4180 CSV; each row becomes a JSON object value. |
@@ -300,10 +317,19 @@ When the read stops depends on stdout:
 - **Pipe or file, no bound given:** stop after 5 s without a record, so
   scripts and agents never hang by accident. The reason is stated in the
   summary (`... (idle timeout)`).
-- `-n`/`--max MAX` stops after MAX records; `-t`/`--idle DUR` stops after DUR
-  without a record (`3s`, `500ms`, `1m`, or a bare number of milliseconds);
-  `-f`/`--follow` never stops on idle. `--follow` and `--idle` are mutually
+- `-n`/`--max MAX` stops after MAX records. This bounds the record count,
+  not the wall clock: `-n 1` on an empty topic waits until a record arrives,
+  and giving `-n` disables the 5 s default idle stop.
+- `-t`/`--idle DUR` stops after DUR without a record (`3s`, `500ms`, `1m`,
+  or a bare number of milliseconds). This bounds idle waiting, not total
+  runtime: a topic that keeps producing keeps the read alive.
+- `-f`/`--follow` never stops on idle. `--follow` and `--idle` are mutually
   exclusive.
+
+For a finite read in automation, give both bounds
+(`kite -c -B -n 100 --idle 3s TOPIC`): the read ends at 100 records or 3 s
+of silence, whichever comes first. Neither flag is an overall deadline; if
+you need one, wrap the command in `timeout`.
 
 An idle-bounded read is not a guarantee of a complete topic snapshot. If the
 downstream process closes the pipe (`kite -c -f events | head`), kite exits
@@ -501,9 +527,11 @@ record; `key<TAB>value` sets a key, `--json` and `--csv` accept structured
 input.
 
 **How do I read the last N messages from a Kafka topic in a script?**
-`kite -c -B -n N TOPIC` reads from the beginning and stops after N records.
-Without `-n`, a piped `kite -c` stops on its own after 5 s without data, so
-`kite -c -B TOPIC > dump.txt` produces a snapshot rather than hanging.
+`kite -c -B -n N --idle 3s TOPIC` reads from the beginning and stops after N
+records or 3 s of silence, whichever comes first (`-n` alone waits until N
+records exist). Without `-n`, a piped `kite -c` stops on its own after 5 s
+without data, so `kite -c -B TOPIC > dump.txt` produces a snapshot rather
+than hanging.
 
 **Does kite work with Confluent Cloud, Redpanda, Amazon MSK, or Aiven?**
 Yes. Any broker that speaks the Kafka protocol works. Set

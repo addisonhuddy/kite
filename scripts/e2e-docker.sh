@@ -59,6 +59,38 @@ export BOOTSTRAP_SERVERS=127.0.0.1:9092
 echo "== smoke.sh =="
 scripts/smoke.sh "$TOPIC"
 
+# README Quickstart, verbatim apart from the topic name: a fresh topic is
+# auto-created by produce, and `-B --idle 3s --json | jq -r .value` must print
+# exactly the record just produced (a consume without -B starts at latest and
+# prints nothing).
+QS_TOPIC="kite-quickstart-$(date +%s)-$RANDOM"
+printf 'hello\n' | zig-out/bin/kite "$QS_TOPIC"
+if command -v jq >/dev/null 2>&1; then
+    got=$(zig-out/bin/kite -c -B --idle 3s --json "$QS_TOPIC" 2>/dev/null | jq -r .value)
+else
+    got=$(zig-out/bin/kite -c -B --idle 3s --json "$QS_TOPIC" 2>/dev/null | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
+fi
+[ "$got" = "hello" ] || fail "quickstart: expected 'hello' from the README consume line, got '$got'"
+echo "PASS quickstart"
+
+# Stopping bounds: `-n 1` on an empty topic bounds records, not time, so it
+# must still be running after 3s; `-n 1 --idle 500ms` must stop on its own.
+EMPTY_TOPIC="kite-empty-$(date +%s)-$RANDOM"
+docker exec "$NAME" /opt/kafka/bin/kafka-topics.sh \
+    --bootstrap-server localhost:9092 --create --topic "$EMPTY_TOPIC" \
+    --partitions 1 --replication-factor 1 >/dev/null
+set +e
+timeout 3s zig-out/bin/kite -c -B -n 1 "$EMPTY_TOPIC" >/dev/null 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 124 ] || fail "bounds: 'kite -c -n 1' on an empty topic exited $rc within 3s; -n should only bound records"
+set +e
+timeout 10s zig-out/bin/kite -c -B -n 1 --idle 500ms "$EMPTY_TOPIC" >/dev/null 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "bounds: 'kite -c -n 1 --idle 500ms' on an empty topic exited $rc; expected a clean idle stop"
+echo "PASS bounds"
+
 # Early pipe closure: once `head` exits, kite sees the closed sink and must
 # exit 0 without SIGPIPE noise on stderr (README: status 0).
 err=$(mktemp)
