@@ -21,6 +21,8 @@ jobs:
       - run: zig build
       - run: zig build test
       - run: scripts/cli-check.sh
+      - run: sudo apt-get update && sudo apt-get install -y zsh fish
+      - run: scripts/completion-check.sh
       - run: scripts/check-size.sh
 
   e2e:

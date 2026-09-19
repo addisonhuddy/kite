@@ -1,7 +1,8 @@
 #compdef kite
 
-# zsh completion for kite — place on fpath as _kite, e.g.
-#   cp completions/kite.zsh ~/.zfunc/_kite && fpath=(~/.zfunc $fpath)
+# zsh completion for kite — install as _kite on fpath before compinit runs:
+#   mkdir -p ~/.zfunc && cp completions/kite.zsh ~/.zfunc/_kite
+#   # in ~/.zshrc: fpath=(~/.zfunc $fpath); autoload -Uz compinit && compinit
 
 _kite() {
     local -a shared
