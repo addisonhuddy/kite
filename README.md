@@ -55,18 +55,27 @@ why I think you will love kite.
 kite is not a Kafka admin tool: it never creates topics, manages consumer
 groups, or commits offsets. Point it at an existing topic and move data.
 
-### kite vs other Kafka CLIs
+### What kite is optimized for
 
-| | kite | `kafka-console-*.sh` | `kcat` / `kafkacat` | `rpk` |
-| --- | --- | --- | --- | --- |
-| Install | one static binary (`curl \| sh`) | JVM + Kafka distribution | librdkafka + package manager | one binary |
-| Size | < 600 KB | hundreds of MB | ~ MB + shared libs | tens of MB |
-| Startup | milliseconds | seconds (JVM) | milliseconds | sub-second |
-| Piped consume terminates by default | yes (5 s idle) | no | no | no |
-| Produce idempotent by default | yes | yes (Kafka ≥ 3.0) | no | no |
-| Keys, headers, JSON, CSV in/out | yes | partial | yes | yes |
-| Topic/group admin | no | yes | partial | yes |
-| Runtime dependencies | none | Java | librdkafka, OpenSSL, zlib, ... | none |
+kite is optimized for the case where a program, not a person, is on the
+other end of the pipe: a shell script, a CI step, a container entrypoint, or
+an AI agent's tool call. That shapes every design choice:
+
+- **Zero-dependency install.** One static binary under 600 KB, fetched with
+  `curl` and verified against `SHA256SUMS`. Nothing to apt-get, brew, or
+  build; nothing that needs a JVM or a shared library at runtime.
+- **Always terminates.** A piped consume stops after 5 s idle unless you say
+  otherwise, so an unattended read can never hang a job.
+- **Strict stream contract.** Data on stdout, diagnostics on stderr, exit `0`
+  or `1`, one-line `kite: ...` errors, no prompts, no color when not a TTY.
+- **Structured in and out.** JSON records with full metadata, TSV keys and
+  headers, and CSV rows in, so output can be piped straight into `jq` or back
+  into another topic without an adapter.
+- **Safe defaults.** Idempotent, batched producing; bounded consuming;
+  no writes to disk; no connections other than to the brokers you name.
+
+What it deliberately leaves out: topic and consumer-group administration,
+offset commits, and every knob that is not needed to move records.
 
 ## For AI agents
 
@@ -470,12 +479,6 @@ consumer groups or commit offsets; each consume run is stateless.
 Yes: it never prompts, never hangs in a pipe, writes data only to stdout and
 diagnostics only to stderr, and returns exit code 1 with a one-line
 `kite: ...` message on any failure.
-
-**How is kite different from kcat / kafkacat?**
-kite is a single static binary with no librdkafka dependency, bounds piped
-reads by default, produces idempotently by default, and reads/writes JSON and
-CSV natively. kcat exposes more low-level librdkafka options and some metadata
-commands.
 
 **Which compression codecs can kite consume?**
 gzip, Snappy, and LZ4. zstd is intentionally omitted to keep the binary small.
