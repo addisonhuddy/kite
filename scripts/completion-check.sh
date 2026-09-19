@@ -80,6 +80,10 @@ EOF
     cat >"$TMP/zsh-driver.zsh" <<'EOF'
 zmodload zsh/zpty
 zpty -b kite_zsh zsh -i
+# compaudit may find group-writable system fpath dirs (CI runners do) and ask
+# whether to continue; that is a machine property, not a README problem.
+zpty -r -m kite_zsh line '*(Ignore insecure directories*|% )*' || exit 1
+[[ $line == *'insecure directories'* ]] && zpty -w kite_zsh y
 zpty -w kite_zsh 'PROMPT=""; RPROMPT=""; setopt no_beep; zstyle ":completion:*" completer _complete
 __cands=()
 compadd() { local -a __r; builtin compadd -O __r "$@"; __cands+=($__r) }
@@ -96,8 +100,9 @@ for line in "$@"; do
 done
 zpty -w kite_zsh 'exit'
 EOF
-    out=$(cd "$H" && HOME=$H TERM=dumb timeout 30s zsh -f "$TMP/zsh-driver.zsh" 'kite -c --fr' 'kite --cs' 2>/dev/null |
-        tr -d '\r' | sed -n '/<</,/>>/p' | sed 's/.*<<//; s/>>.*//' | tr -d ' ' | grep -v '^$') || true
+    raw=$(cd "$H" && HOME=$H TERM=dumb timeout 30s zsh -f "$TMP/zsh-driver.zsh" 'kite -c --fr' 'kite --cs' 2>&1) || true
+    out=$(tr -d '\r' <<<"$raw" | sed -n '/<</,/>>/p' | sed 's/.*<<//; s/>>.*//' | tr -d ' ' | grep -v '^$') || true
+    [ -n "$out" ] || { echo "--- zsh raw transcript:" >&2; echo "$raw" >&2; }
     expect zsh "$out" --from-beginning --csv
 else
     echo "SKIP zsh"
