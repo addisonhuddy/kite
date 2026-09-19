@@ -1,5 +1,5 @@
 # fish completion for kite — install with
-#   cp completions/kite.fish ~/.config/fish/completions/
+#   mkdir -p ~/.config/fish/completions && cp completions/kite.fish ~/.config/fish/completions/
 
 complete -c kite -s c -l consume -d 'Consume instead of produce'
 complete -c kite -l show-config -d 'Show the effective configuration'

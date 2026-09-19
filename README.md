@@ -183,14 +183,49 @@ Cross-compile with, for example, `zig build -Dtarget=aarch64-macos` or
 
 ### Shell completions
 
-Static completion scripts for bash, zsh, and fish are in
-[`completions/`](completions):
+Static completion scripts for bash, zsh, and fish live in
+[`completions/`](completions) in the repository. The `curl` installer ships
+only the binary, so clone the repo (or download the one file you need from
+GitHub) first; the snippets below assume you are in the checkout. They only
+need the `kite` binary on your `PATH` and are safe to run in a clean home
+directory.
+
+**bash** (needs the `bash-completion` package for the user directory to be
+picked up automatically; otherwise `source` the file from `~/.bashrc`):
 
 ```sh
-source completions/kite.bash                                   # bash (or copy to /etc/bash_completion.d/)
-fpath=(/path/to/kite/completions $fpath)                       # zsh: file must be named _kite
-cp completions/kite.fish ~/.config/fish/completions/           # fish
+mkdir -p ~/.local/share/bash-completion/completions
+cp completions/kite.bash ~/.local/share/bash-completion/completions/kite
+# or, without bash-completion:
+echo 'source /path/to/kite/completions/kite.bash' >> ~/.bashrc
 ```
+
+**zsh** (the function file must be named `_kite` and sit on `fpath` before
+`compinit` runs):
+
+```sh
+mkdir -p ~/.zfunc
+cp completions/kite.zsh ~/.zfunc/_kite
+cat >> ~/.zshrc <<'EOF'
+fpath=(~/.zfunc $fpath)
+autoload -Uz compinit && compinit
+EOF
+```
+
+If `~/.zshrc` already calls `compinit`, put the `fpath` line above it instead
+of appending. Delete `~/.zcompdump*` if a stale cache hides the new function.
+
+**fish** (uses `$__fish_config_dir` when set, `~/.config/fish` otherwise):
+
+```sh
+set -q __fish_config_dir; or set __fish_config_dir ~/.config/fish
+mkdir -p $__fish_config_dir/completions
+cp completions/kite.fish $__fish_config_dir/completions/
+```
+
+Open a new shell and type `kite --<TAB>` to check.
+`scripts/completion-check.sh` performs these installs in a temporary `HOME`
+for every shell present on the machine and asserts that options complete.
 
 ## Command reference
 

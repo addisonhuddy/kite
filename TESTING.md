@@ -21,6 +21,19 @@ The script points `HOME`, `XDG_CONFIG_HOME`, and the working directory at an
 empty temporary tree. It captures stdout, stderr, and exit status separately,
 checking both help pages and actionable parser errors without a broker.
 
+## Shell completions
+
+```sh
+scripts/completion-check.sh
+```
+
+For each of bash, zsh, and fish that is installed (others are skipped), the
+script installs the completion file into a temporary `HOME` exactly as the
+README "Shell completions" snippets do, then drives the shell's real
+completion machinery (`_kite` under bash, `compinit` + a zpty-driven widget
+under zsh, `complete -C` under fish) and asserts that `kite -c --fr` offers
+`--from-beginning` and `kite --cs` offers `--csv`.
+
 ## Binary size
 
 ```sh
