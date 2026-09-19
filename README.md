@@ -165,8 +165,15 @@ curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh |
 
 The script downloads the release's `SHA256SUMS` and refuses to install on a
 checksum mismatch. kite is a single static binary, so you can also skip the
-script: release assets are named `kite-{linux,macos}-{x86_64,aarch64}`, and
-prebuilt binaries plus `SHA256SUMS` are on the
+script and fetch the latest release directly (assets are named
+`kite-{linux,macos}-{x86_64,aarch64}`):
+
+```sh
+curl -fsSL -o kite https://github.com/addisonhuddy/kite/releases/latest/download/kite-linux-x86_64
+chmod +x kite && sudo mv kite /usr/local/bin/
+```
+
+Prebuilt binaries plus `SHA256SUMS` for every version are on the
 [releases page](https://github.com/addisonhuddy/kite/releases).
 
 ### From source
