@@ -2,8 +2,8 @@
 # Smoke test: produce → consume roundtrip against any Kafka 4.0+ broker.
 # Needs a broker configured (-b is not used here, so set BOOTSTRAP_SERVERS
 # or put a kite.properties on the search path; see README "Configuration")
-# and a topic — kite creates a missing one automatically when not on a
-# terminal.
+# and a topic — kite's produce mode creates a missing one automatically when
+# not on a terminal (consume never does; a missing topic is an error).
 #
 #   scripts/smoke.sh <topic>
 set -euo pipefail

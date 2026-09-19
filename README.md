@@ -35,9 +35,10 @@ why I think you will love kite.
   plain text, ≤ 80 columns, no ANSI unless stderr is a terminal.
 
 kite is not a Kafka admin tool: it never manages consumer groups or commits
-offsets. When the target topic does not exist it offers to create it —
-prompting on a terminal, creating automatically in scripts and pipes —
-with the broker's default partition count and replication factor.
+offsets. When producing to a topic that does not exist it offers to create
+it — prompting on a terminal, creating automatically in scripts and pipes —
+with the broker's default partition count and replication factor. Consume
+never creates a topic; a missing one is a plain error.
 
 ## Install
 
@@ -351,10 +352,12 @@ The default stripped binary is under 600 KB (CI-gated by
   `BOOTSTRAP_SERVERS`, or copy a template to one of the search-path
   locations and edit `bootstrap.servers`. `-v` prints which sources were
   used.
-- **Topic does not exist:** kite offers to create it on the spot — it asks
-  on a terminal and creates automatically in scripts and pipes, using the
-  broker's default partition count and replication factor. On some hosted
-  clusters a missing topic surfaces as an authorization error instead.
+- **Topic does not exist:** when producing, kite offers to create it on the
+  spot — it asks on a terminal and creates automatically in scripts and
+  pipes, using the broker's default partition count and replication factor.
+  Consuming a missing topic is an error; kite never creates it there. On
+  some hosted clusters a missing topic surfaces as an authorization error
+  instead.
 - **`connection refused by HOST:PORT` / `cannot resolve host`:** check the
   address, DNS, and firewall rules; run with `-v` for connection diagnostics.
 - **Authentication or TLS failure:** check the SASL settings and CA bundle;
