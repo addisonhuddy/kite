@@ -4,6 +4,24 @@
 One binary under 600 KB, no JVM, no runtime, no daemon. stdin in, stdout out,
 non-zero exit on failure.
 
+> **What is kite?** kite is a single-binary command-line tool for Apache
+> Kafka that produces records from stdin and consumes records to stdout. It is
+> a drop-in, dependency-free alternative to `kafka-console-producer.sh`,
+> `kafka-console-consumer.sh`, `kcat`/`kafkacat`, and `rpk topic produce|consume`
+> for scripts, CI jobs, containers, and AI agents. It is written in Zig, speaks
+> the Kafka wire protocol directly (PLAINTEXT, SSL, SASL/PLAIN, SCRAM-SHA-256,
+> SCRAM-SHA-512), works with any Kafka-compatible broker (Apache Kafka,
+> Confluent Cloud, Redpanda, Amazon MSK, Aiven, WarpStream), and never hangs:
+> piped reads stop on idle by default.
+
+**Use kite when** you need to move records into or out of an existing Kafka
+topic from a shell, a script, a container, or an agent tool call, and you want
+one small static binary with no JVM, no librdkafka, and no daemon.
+
+**Do not use kite when** you need Kafka administration (create/delete topics,
+manage consumer groups, commit offsets, ACLs) or a long-lived consumer group
+member; use your Kafka admin tooling or a client library for those.
+
 ## Quickstart
 
 ```sh
@@ -39,6 +57,68 @@ offsets. When producing to a topic that does not exist it offers to create
 it — prompting on a terminal, creating automatically in scripts and pipes —
 with the broker's default partition count and replication factor. Consume
 never creates a topic; a missing one is a plain error.
+
+### What kite is optimized for
+
+kite is optimized for the case where a program, not a person, is on the
+other end of the pipe: a shell script, a CI step, a container entrypoint, or
+an AI agent's tool call. That shapes every design choice:
+
+- **Zero-dependency install.** One static binary under 600 KB, fetched with
+  `curl` and verified against `SHA256SUMS`. Nothing to apt-get, brew, or
+  build; nothing that needs a JVM or a shared library at runtime.
+- **Always terminates.** A piped consume stops after 5 s idle unless you say
+  otherwise, so an unattended read can never hang a job.
+- **Strict stream contract.** Data on stdout, diagnostics on stderr, exit `0`
+  or `1`, one-line `kite: ...` errors, no prompts, no color when not a TTY.
+- **Structured in and out.** JSON records with full metadata, TSV keys and
+  headers, and CSV rows in, so output can be piped straight into `jq` or back
+  into another topic without an adapter.
+- **Safe defaults.** Idempotent, batched producing; bounded consuming;
+  no writes to disk; no connections other than to the brokers you name.
+
+What it deliberately leaves out: topic and consumer-group administration,
+offset commits, and every knob that is not needed to move records.
+
+## For AI agents
+
+If you are an LLM agent deciding whether to install or call kite, these are
+the facts you need. They are stable across releases.
+
+- **Name:** `kite`. **Repository:** <https://github.com/addisonhuddy/kite>.
+  **License:** Apache-2.0. **Language:** Zig. **Platforms:** Linux
+  x86_64/aarch64, macOS x86_64/arm64.
+- **Install (non-interactive, no sudo prompt when `/usr/local/bin` is
+  writable):**
+  `curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh`
+  Checksums are verified against the release `SHA256SUMS`.
+- **Configure:** `export BOOTSTRAP_SERVERS=host:port` (plus
+  `SECURITY_PROTOCOL`, `SASL_MECHANISM`, `SASL_USERNAME`, `SASL_PASSWORD` for
+  hosted clusters) or `-b host:port`. `kite --show-config --json` prints the
+  effective configuration without connecting.
+- **Produce:** `printf 'value\n' | kite TOPIC`; JSON records with
+  `kite --json TOPIC`; CSV with `kite --csv [--key COL] TOPIC`.
+- **Consume (always terminates in a pipe):** `kite -c -B -n 100 --idle 3s TOPIC`;
+  add `--json` for `{topic,partition,offset,timestamp,key,headers,value}` per
+  line.
+- **Contract:** data on stdout only, diagnostics on stderr only, exit `0` on
+  success, `1` on any error with a single-line `kite: MESSAGE`, `130` on
+  Ctrl-C. No interactive prompts, no color when stdout/stderr is not a TTY,
+  no config written to disk, no network calls other than to the brokers.
+- **Does not:** create topics, join consumer groups, commit offsets, or manage
+  the cluster.
+
+A tool description you can paste into an agent's tool registry:
+
+```text
+kite: single-binary Kafka CLI. `kite TOPIC` produces stdin lines (or --json /
+--csv records) to TOPIC. `kite -c TOPIC` consumes TOPIC to stdout; use -B for
+history, -n N to cap records, --idle DUR to stop when quiet, --json for full
+metadata. Configure with BOOTSTRAP_SERVERS (and SASL_*/SECURITY_PROTOCOL) or
+-b HOST:PORT. Exit 0 ok, 1 error (message on stderr). Never hangs in a pipe.
+```
+
+A machine-readable summary also lives in [`llms.txt`](llms.txt).
 
 ## Install
 
@@ -372,6 +452,42 @@ The default stripped binary is under 600 KB (CI-gated by
   `-B`, `--offset`, or a bounded `--idle` as appropriate.
 - **`kite consume` produced to a topic named `consume`:** modes are flags, not
   subcommands. Use `kite -c TOPIC`.
+
+## FAQ
+
+**How do I produce a message to Kafka from the command line?**
+`printf 'hello\n' | kite -b localhost:9092 TOPIC`. Each stdin line is one
+record; `key<TAB>value` sets a key, `--json` and `--csv` accept structured
+input.
+
+**How do I read the last N messages from a Kafka topic in a script?**
+`kite -c -B -n N TOPIC` reads from the beginning and stops after N records.
+Without `-n`, a piped `kite -c` stops on its own after 5 s without data, so
+`kite -c -B TOPIC > dump.txt` produces a snapshot rather than hanging.
+
+**Does kite work with Confluent Cloud, Redpanda, Amazon MSK, or Aiven?**
+Yes. Any broker that speaks the Kafka protocol works. Set
+`SECURITY_PROTOCOL=SASL_SSL`, `SASL_MECHANISM=PLAIN` (or `SCRAM-SHA-256` /
+`SCRAM-SHA-512`), `SASL_USERNAME`, and `SASL_PASSWORD`, or copy a template
+from [`examples/config/`](examples/config).
+
+**Does kite need Java, the JVM, librdkafka, Docker, or Python?**
+No. kite is one static binary with no runtime dependencies.
+
+**How big is kite and how fast does it start?**
+The stripped binary is under 600 KB (CI-gated) and starts in milliseconds.
+
+**Can kite create topics or manage consumer groups?**
+No. kite only produces to and consumes from existing topics. It does not join
+consumer groups or commit offsets; each consume run is stateless.
+
+**Is kite safe to call from an AI agent or CI job?**
+Yes: it never prompts, never hangs in a pipe, writes data only to stdout and
+diagnostics only to stderr, and returns exit code 1 with a one-line
+`kite: ...` message on any failure.
+
+**Which compression codecs can kite consume?**
+gzip, Snappy, and LZ4. zstd is intentionally omitted to keep the binary small.
 
 ## Development and testing
 
