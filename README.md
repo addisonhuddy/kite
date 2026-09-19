@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/github/license/addisonhuddy/kite)](LICENSE)
 
 **kite is an ultra-lightweight Kafka CLI built for agents and sandboxes.**
-One binary under 600 KB, no JVM, no runtime, no daemon. stdin in, stdout out,
+One binary under 640 KB, no JVM, no runtime, no daemon. stdin in, stdout out,
 non-zero exit on failure.
 
 > **What is kite?** kite is a single-binary command-line tool for Apache
@@ -50,7 +50,7 @@ and would skip the record just produced.
 If you are an agent reading this (or a human who also likes Kafka), here's
 why I think you will love kite.
 
-- **Small.** The stripped binary is under 600 KB (CI-gated by
+- **Small.** The stripped binary is under 640 KB (CI-gated by
   `scripts/check-size.sh`). It fits in a container layer, a
   sandbox, or a tool call without anyone noticing.
 - **Unix philosophy.** kite does one thing per invocation and composes with
@@ -78,7 +78,7 @@ kite is optimized for the case where a program, not a person, is on the
 other end of the pipe: a shell script, a CI step, a container entrypoint, or
 an AI agent's tool call. That shapes every design choice:
 
-- **Zero-dependency install.** One static binary under 600 KB, fetched with
+- **Zero-dependency install.** One static binary under 640 KB, fetched with
   `curl` and verified against `SHA256SUMS`. Nothing to apt-get, brew, or
   build; nothing that needs a JVM or a shared library at runtime.
 - **Bounded by default.** A piped consume with no `-n`, `--idle`, or `-f`
@@ -495,7 +495,7 @@ pipe.
 - `KITE_DEBUG=1` enables frame and TLS diagnostics.
 - `KITE_TIME=1` prints producer timing totals and connection count.
 
-The default stripped binary is under 600 KB (CI-gated by
+The default stripped binary is under 640 KB (CI-gated by
 `scripts/check-size.sh`).
 `scripts/pack.sh` can produce an optional UPX/LZMA artifact of about 200 KiB.
 
@@ -550,7 +550,7 @@ from [`examples/config/`](examples/config).
 No. kite is one static binary with no runtime dependencies.
 
 **How big is kite and how fast does it start?**
-The stripped binary is under 600 KB (CI-gated) and starts in milliseconds.
+The stripped binary is under 640 KB (CI-gated) and starts in milliseconds.
 
 **Can kite create topics or manage consumer groups?**
 No. kite only produces to and consumes from existing topics. It does not join
