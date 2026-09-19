@@ -27,12 +27,50 @@ one small static binary with no JVM, no librdkafka, and no daemon.
 manage consumer groups, commit offsets, ACLs) or a long-lived consumer group
 member; use your Kafka admin tooling or a client library for those.
 
+## Run Kafka locally with Docker
+
+Already have a Kafka 4.0+ broker? Skip to the [Quickstart](#quickstart).
+Otherwise, a single-node broker on your laptop is one `docker run` away. The
+commands below need [Docker](https://docs.docker.com/get-docker/), `curl`,
+and (for the JSON example only) [`jq`](https://jqlang.github.io/jq/):
+
+```sh
+docker --version && curl --version | head -1 && jq --version
+```
+
+Start Kafka (the image kite is tested against; bound to loopback only) and
+wait until it answers:
+
+```sh
+docker run -d --name kite-kafka -p 127.0.0.1:9092:9092 apache/kafka:4.0.0
+
+until docker exec kite-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --list >/dev/null 2>&1; do
+  sleep 2
+done
+echo "kafka ready"
+```
+
+Check on it or tear it down later with:
+
+```sh
+docker ps --filter name=kite-kafka          # status
+docker logs kite-kafka | tail               # broker log
+docker rm -f kite-kafka                     # stop and remove
+```
+
+The default image auto-creates topics, so the Quickstart below works
+unchanged. For a fuller check against the same image, `scripts/e2e-docker.sh`
+runs the whole broker-backed suite in a throwaway container; see
+[TESTING.md](TESTING.md#docker-harness).
+
 ## Quickstart
 
-You need a reachable Kafka 4.0+ broker (`localhost:9092` below), permission to
-read and write the topic you name, and [`jq`](https://jqlang.github.io/jq/)
-for the last line. Use a fresh topic name so the output is exactly one record;
-produce creates a missing topic automatically when run from a script or pipe.
+You need a reachable Kafka 4.0+ broker (`localhost:9092` below, e.g. the
+Docker one above), permission to read and write the topic you name, and
+[`jq`](https://jqlang.github.io/jq/) for the last line only. Use a fresh
+topic name so the output is exactly one record; produce creates a missing
+topic automatically when run from a script or pipe.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh
@@ -41,9 +79,25 @@ printf 'hello\n' | kite events                       # produce one record
 kite -c -B --idle 3s --json events | jq -r .value    # prints: hello
 ```
 
-The consume line reads from the beginning (`-B`) and stops 3 s after the last
-record (`--idle 3s`). Without `-B` a consumer starts at the *latest* offset
-and would skip the record just produced.
+What to expect:
+
+- **stdout is data, stderr is diagnostics.** The produce line prints a short
+  summary (`1 record(s) produced to 'events' ...`) on stderr and nothing on stdout;
+  the consume line prints the record on stdout and its summary on stderr, so
+  `| jq` only ever sees records.
+- **`-B` is required here.** Without `--from-beginning` a consumer starts at
+  the *latest* offset and would skip the record produced before it started.
+- **`--idle 3s`** stops the read 3 s after the last record; otherwise a piped
+  consume stops after 5 s idle.
+- **`jq` is optional.** It only extracts `.value` from the JSON record; drop
+  `--json | jq -r .value` to print plain values.
+- **Topic creation depends on the broker.** kite asks the broker to create a
+  missing topic when producing from a script or pipe; a broker policy or
+  missing ACL can refuse that, in which case create the topic with your admin
+  tooling first.
+
+See [Troubleshooting](#troubleshooting) if the roundtrip does not print
+`hello`.
 
 ## Why kite
 
@@ -500,6 +554,27 @@ The default stripped binary is under 640 KB (CI-gated by
 `scripts/pack.sh` can produce an optional UPX/LZMA artifact of about 200 KiB.
 
 ## Troubleshooting
+
+First run against a local broker:
+
+- **`connection refused by localhost:9092`:** nothing is listening on 9092.
+  Start the broker (see [Run Kafka locally with Docker](#run-kafka-locally-with-docker))
+  and wait for the readiness loop to finish; `docker ps --filter
+  name=kite-kafka` shows whether the container is up.
+- **`Cannot connect to the Docker daemon` / `docker: command not found`:**
+  start Docker Desktop or `sudo systemctl start docker`, or install Docker;
+  on Linux, add your user to the `docker` group to run without `sudo`.
+- **`jq: command not found`:** install `jq` (`apt install jq`, `brew install
+  jq`) or drop `--json | jq -r .value` from the consume line; kite itself does
+  not need it.
+- **Produce fails with `not authorized` or a topic-creation error:** the
+  broker disables automatic topic creation or the principal lacks the ACL;
+  create the topic with your admin tooling and retry.
+- **Consume prints nothing and exits after the idle timeout:** `-B` was
+  omitted, so the read started at the latest offset, after the record you
+  produced. Add `-B` (or produce again while the consumer is running).
+
+General:
 
 - **`no broker configured`:** pass `-b HOST:PORT`, set
   `BOOTSTRAP_SERVERS`, or copy a template to one of the search-path
