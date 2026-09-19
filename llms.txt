@@ -1,6 +1,6 @@
 # kite
 
-> kite is a single-binary, dependency-free Kafka CLI (under 600 KB, written in Zig) that produces stdin lines to a topic and consumes a topic to stdout. It is built for scripts, containers, CI, and AI agents: no JVM, no librdkafka, no daemon, no prompts, and piped reads terminate on idle by default.
+> kite is a single-binary, dependency-free Kafka CLI (under 640 KB, written in Zig) that produces stdin lines to a topic and consumes a topic to stdout. It is built for scripts, containers, CI, and AI agents: no JVM, no librdkafka, no daemon, no prompts, and piped reads terminate on idle by default.
 
 Repository: https://github.com/addisonhuddy/kite
 License: Apache-2.0

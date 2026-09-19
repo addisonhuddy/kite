@@ -16,7 +16,7 @@ scripts/check-size.sh
 scripts/e2e-docker.sh
 ```
 
-The size check gates the binary at 600 KB. The Docker end-to-end check needs
+The size check gates the binary at 640 KB. The Docker end-to-end check needs
 Docker. See [TESTING.md](TESTING.md) for details.
 
 ## Pull requests
