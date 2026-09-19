@@ -10,14 +10,18 @@ pub fn nextRow(r: *std.Io.Reader, alloc: std.mem.Allocator) !?[]u8 {
     var acc: std.ArrayListUnmanaged(u8) = .empty;
     var in_quotes = false;
     var eof = false;
+    var need_more = false;
     while (true) {
         var buf = r.buffered();
-        if (buf.len == 0 and !eof) {
+        // A short read (a pipe's first read may deliver zero bytes without
+        // signalling EOF) is not the end of the stream; only EndOfStream is.
+        while ((buf.len == 0 or need_more) and !eof) {
             r.fillMore() catch |err| switch (err) {
                 error.EndOfStream => eof = true,
                 error.ReadFailed => return error.ReadFailed,
             };
             buf = r.buffered();
+            need_more = false;
         }
         if (buf.len == 0) {
             if (acc.items.len == 0) return null;
@@ -31,6 +35,7 @@ pub fn nextRow(r: *std.Io.Reader, alloc: std.mem.Allocator) !?[]u8 {
                     if (in_quotes and i + 1 < buf.len and buf[i + 1] == '"') {
                         i += 1; // "" escape: still inside quotes
                     } else if (in_quotes and i + 1 == buf.len and !eof) {
+                        need_more = true;
                         break :scan; // need next byte to tell close vs escape
                     } else in_quotes = !in_quotes;
                 },
@@ -235,6 +240,93 @@ test "rowJson escaping" {
     const fields = [_][]const u8{ "q\"q", "tab\there" };
     try rowJson(&jw.writer, &cols, &fields);
     try expectEqualStrings("{\"a\":\"q\\\"q\",\"b\":\"tab\\there\"}", jw.written());
+}
+
+/// Test reader that hands out `chunk` bytes per read (like a slow pipe) and,
+/// when `zero_first` is set, answers the first read with zero bytes without
+/// signalling EOF, as `File.Reader` does when a pipe is not seekable.
+const ChunkedReader = struct {
+    interface: std.Io.Reader,
+    src: []const u8,
+    pos: usize = 0,
+    chunk: usize,
+    zero_first: bool,
+
+    fn init(buf: []u8, src: []const u8, chunk: usize, zero_first: bool) ChunkedReader {
+        return .{
+            .interface = .{
+                .vtable = &.{ .stream = stream },
+                .buffer = buf,
+                .seek = 0,
+                .end = 0,
+            },
+            .src = src,
+            .chunk = chunk,
+            .zero_first = zero_first,
+        };
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *ChunkedReader = @alignCast(@fieldParentPtr("interface", r));
+        if (self.zero_first) {
+            self.zero_first = false;
+            return 0;
+        }
+        if (self.pos == self.src.len) return error.EndOfStream;
+        const n = @min(self.chunk, @intFromEnum(limit), self.src.len - self.pos);
+        try w.writeAll(self.src[self.pos .. self.pos + n]);
+        self.pos += n;
+        return n;
+    }
+};
+
+fn collectRows(alloc: std.mem.Allocator, r: *std.Io.Reader) ![]const []const []const u8 {
+    var rows: std.ArrayListUnmanaged([]const []const u8) = .empty;
+    while (try nextRow(r, alloc)) |row| try rows.append(alloc, try splitFields(alloc, row));
+    return rows.items;
+}
+
+const stream_fixture =
+    "id,name,note\r\n" ++
+    "1,\"Ann \"\"A\"\" Lee\",\"line one\nline two\"\r\n" ++
+    "2,Bob,\"\"\n" ++
+    "3,Cy,tail";
+
+fn expectStreamFixture(rows: []const []const []const u8) !void {
+    try expect(rows.len == 4);
+    try expectEqualStrings("note", rows[0][2]);
+    try expectEqualStrings("Ann \"A\" Lee", rows[1][1]);
+    try expectEqualStrings("line one\nline two", rows[1][2]);
+    try expectEqualStrings("", rows[2][2]);
+    try expectEqualStrings("3", rows[3][0]);
+    try expectEqualStrings("tail", rows[3][2]);
+}
+
+test "pipe whose first read returns zero bytes is not empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [64]u8 = undefined;
+    var cr = ChunkedReader.init(&buf, stream_fixture, 4096, true);
+    try expectStreamFixture(try collectRows(arena.allocator(), &cr.interface));
+}
+
+test "chunked input: every chunk size yields the same records" {
+    var chunk: usize = 1;
+    while (chunk <= stream_fixture.len + 1) : (chunk += 1) {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var buf: [16]u8 = undefined;
+        var cr = ChunkedReader.init(&buf, stream_fixture, chunk, false);
+        try expectStreamFixture(try collectRows(arena.allocator(), &cr.interface));
+    }
+}
+
+test "truly empty pipe reports EOF" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [16]u8 = undefined;
+    var cr = ChunkedReader.init(&buf, "", 1, true);
+    try expect((try nextRow(&cr.interface, arena.allocator())) == null);
 }
 
 test "rowReady" {
