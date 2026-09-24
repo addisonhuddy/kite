@@ -38,6 +38,10 @@ pub const LoadError = error{
     InvalidSaslMechanism,
     MissingSaslMechanism,
     MissingSaslCredentials,
+    /// A target was selected but the file defines no `target.NAME.*` keys.
+    UnknownTarget,
+    /// --target/KITE_TARGET was given but no properties file was found.
+    TargetWithoutFile,
     OutOfMemory,
 };
 
@@ -45,6 +49,8 @@ pub const LoadError = error{
 pub const Overrides = struct {
     bootstrap: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
+    /// --target NAME: pick the `target.NAME.*` group from the file.
+    target: ?[]const u8 = null,
 };
 
 /// Where the effective configuration came from, for `-v` and error messages.
@@ -55,6 +61,10 @@ pub const Source = struct {
     requested: ?[]const u8 = null,
     env: bool = false,
     flags: bool = false,
+    /// Selected target name, if any.
+    target: ?[]const u8 = null,
+    /// Sorted names of the `target.NAME.*` groups defined in the file.
+    targets: [][]const u8 = &.{},
     /// Per-key provenance for --show-config.
     origins: std.EnumArray(Key, Origin) = .initFill(.default),
 };
@@ -73,7 +83,7 @@ pub const Key = enum {
     enable_idempotence,
 };
 
-pub const Origin = enum { default, file, env, flag };
+pub const Origin = enum { default, file, env, flag, target };
 
 pub const key_names = std.EnumArray(Key, []const u8).init(.{
     .bootstrap_servers = "bootstrap.servers",
@@ -214,8 +224,6 @@ pub fn load(
     overrides: Overrides,
     source: *Source,
 ) LoadError!Config {
-    var cfg: Config = .{ .bootstrap_servers = &.{} };
-
     const explicit: ?[]const u8 = overrides.config_path orelse blk: {
         const from_env = env.get("KAFKA_PROPERTIES") orelse break :blk null;
         break :blk if (from_env.len > 0) from_env else null;
@@ -245,11 +253,95 @@ pub fn load(
         }
     }
 
-    if (text) |body| {
-        const props = try parse(alloc, body);
-        var it = props.iterator();
+    const props: ?Props = if (text) |body| try parse(alloc, body) else null;
+    const cfg = try applyProps(alloc, env, props, overrides, source);
+    const password_origin = source.origins.get(.sasl_password);
+    if (password_origin == .file or password_origin == .target)
+        warnIfLoosePerms(io, source.file.?);
+    return cfg;
+}
+
+fn validTargetName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return false;
+    }
+    return true;
+}
+
+/// Pure core of `load`: resolve Config from already-parsed properties,
+/// the environment map, and overrides. `props` is null when no file was
+/// found. Value precedence, highest first: flags, the selected target's
+/// `target.NAME.*` keys, environment, base file keys, defaults. A target
+/// is chosen by --target, then $KITE_TARGET, then the file's `target=` key.
+pub fn applyProps(
+    alloc: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+    props: ?Props,
+    overrides: Overrides,
+    source: *Source,
+) LoadError!Config {
+    var cfg: Config = .{ .bootstrap_servers = &.{} };
+
+    // Discover declared targets and the file's default target.
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    var file_target: ?[]const u8 = null;
+    if (props) |*p| {
+        var it = p.iterator();
         while (it.next()) |e| {
             const key = e.key_ptr.*;
+            if (std.mem.eql(u8, key, "target")) {
+                file_target = e.value_ptr.*;
+                continue;
+            }
+            if (!std.mem.startsWith(u8, key, "target.")) continue;
+            const tail = key["target.".len..];
+            const dot = std.mem.indexOfScalar(u8, tail, '.') orelse {
+                warn("unknown config key '{s}' ignored", .{key});
+                continue;
+            };
+            const name = tail[0..dot];
+            const inner = tail[dot + 1 ..];
+            if (!validTargetName(name) or inner.len == 0 or keyFromName(inner) == null) {
+                warn("unknown config key '{s}' ignored", .{key});
+                continue;
+            }
+            var seen = false;
+            for (names.items) |n| {
+                if (std.mem.eql(u8, n, name)) seen = true;
+            }
+            if (!seen) try names.append(alloc, name);
+        }
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+    source.targets = names.items;
+
+    var selected: ?[]const u8 = overrides.target;
+    if (selected == null) {
+        if (env.get("KITE_TARGET")) |t| {
+            if (t.len > 0) selected = t;
+        }
+    }
+    if (selected == null) selected = file_target;
+    if (selected != null and props == null) return error.TargetWithoutFile;
+    source.target = selected;
+    if (selected) |name| {
+        var found = false;
+        for (names.items) |n| {
+            if (std.mem.eql(u8, n, name)) found = true;
+        }
+        if (!found) return error.UnknownTarget;
+    }
+
+    if (props) |*p| {
+        var it = p.iterator();
+        while (it.next()) |e| {
+            const key = e.key_ptr.*;
+            if (std.mem.eql(u8, key, "target") or std.mem.startsWith(u8, key, "target.")) continue;
             if (overrides.bootstrap != null and std.mem.eql(u8, key, "bootstrap.servers")) continue;
             if (overriddenByEnv(env, key)) continue;
             try applyKey(&cfg, alloc, source, .file, key, e.value_ptr.*);
@@ -261,6 +353,23 @@ pub fn load(
         if (val.len == 0) continue;
         source.env = true;
         try applyKey(&cfg, alloc, source, .env, pair[1], val);
+    }
+
+    // The selected target's keys override ambient env vars: a named target
+    // is a complete cluster definition, so e.g. BOOTSTRAP_SERVERS must not
+    // silently redirect `--target prod`, but it still fills keys the
+    // target omits.
+    if (selected) |name| {
+        const prefix = try std.fmt.allocPrint(alloc, "target.{s}.", .{name});
+        var it = props.?.iterator();
+        while (it.next()) |e| {
+            const key = e.key_ptr.*;
+            if (!std.mem.startsWith(u8, key, prefix)) continue;
+            const inner = key[prefix.len..];
+            if (inner.len == 0 or keyFromName(inner) == null) continue;
+            if (overrides.bootstrap != null and std.mem.eql(u8, inner, "bootstrap.servers")) continue;
+            try applyKey(&cfg, alloc, source, .target, inner, e.value_ptr.*);
+        }
     }
 
     if (overrides.bootstrap) |b| {
@@ -283,8 +392,6 @@ pub fn load(
         if (cfg.sasl_username == null or cfg.sasl_password == null)
             return error.MissingSaslCredentials;
     }
-    if (source.origins.get(.sasl_password) == .file)
-        warnIfLoosePerms(io, source.file.?);
     return cfg;
 }
 
@@ -425,6 +532,119 @@ test "later applyKey calls override earlier values" {
     try std.testing.expectEqual(SecurityProtocol.sasl_ssl, cfg.security_protocol);
     try std.testing.expectError(error.InvalidSaslMechanism, applyKey(&cfg, arena.allocator(), &src, .file, "sasl.mechanism", "nope"));
     try std.testing.expectEqual(Origin.default, src.origins.get(.sasl_mechanism));
+}
+
+fn testEnv(alloc: std.mem.Allocator, pairs: []const [2][]const u8) !std.process.Environ.Map {
+    var env = std.process.Environ.Map.init(alloc);
+    for (pairs) |pair| try env.put(pair[0], pair[1]);
+    return env;
+}
+
+test "applyProps: target=dev in file selects the dev keys" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var props = try parse(alloc, "linger.ms=20\n" ++
+        "bootstrap.servers=base:1\n" ++
+        "target=dev\n" ++
+        "target.dev.bootstrap.servers=dev:2\n" ++
+        "target.prod.bootstrap.servers=prod:3\n" ++
+        "target.prod.security.protocol=SASL_SSL\n" ++
+        "target.prod.sasl.mechanism=PLAIN\n" ++
+        "target.prod.sasl.username=u\n" ++
+        "target.prod.sasl.password=p\n");
+    defer props.deinit();
+    var env = try testEnv(alloc, &.{});
+    defer env.deinit();
+    var src: Source = .{};
+    const cfg = try applyProps(gpa, &env, props, .{}, &src);
+    try std.testing.expectEqualStrings("dev:2", cfg.bootstrap_servers[0]);
+    try std.testing.expectEqual(Origin.target, src.origins.get(.bootstrap_servers));
+    try std.testing.expectEqualStrings("dev", src.target.?);
+    try std.testing.expectEqualStrings("dev", src.targets[0]);
+    try std.testing.expectEqualStrings("prod", src.targets[1]);
+    try std.testing.expectEqual(@as(usize, 2), src.targets.len);
+    // Base keys still apply for anything the target does not define.
+    try std.testing.expectEqual(@as(u64, 20), cfg.linger_ms);
+}
+
+test "applyProps: override.target beats file default and env, env fills gaps" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var props = try parse(alloc, "target=dev\n" ++
+        "target.dev.bootstrap.servers=dev:2\n" ++
+        "target.prod.bootstrap.servers=prod:3\n" ++
+        "target.prod.security.protocol=SASL_SSL\n" ++
+        "target.prod.sasl.mechanism=PLAIN\n" ++
+        "target.prod.sasl.username=u\n");
+    defer props.deinit();
+    var env = try testEnv(alloc, &.{
+        .{ "BOOTSTRAP_SERVERS", "env:9" },
+        .{ "SASL_PASSWORD", "from-env" },
+    });
+    defer env.deinit();
+    var src: Source = .{};
+    const cfg = try applyProps(gpa, &env, props, .{ .target = "prod" }, &src);
+    try std.testing.expectEqualStrings("prod:3", cfg.bootstrap_servers[0]);
+    try std.testing.expectEqual(Origin.target, src.origins.get(.bootstrap_servers));
+    try std.testing.expectEqualStrings("from-env", cfg.sasl_password.?);
+    try std.testing.expectEqual(Origin.env, src.origins.get(.sasl_password));
+}
+
+test "applyProps: unknown and missing targets" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var props = try parse(alloc, "bootstrap.servers=b:1\ntarget.dev.bootstrap.servers=d:2\n");
+    defer props.deinit();
+    var env = try testEnv(alloc, &.{});
+    defer env.deinit();
+    var src: Source = .{};
+    try std.testing.expectError(error.UnknownTarget, applyProps(gpa, &env, props, .{ .target = "nope" }, &src));
+    var plain = try parse(alloc, "bootstrap.servers=b:1\n");
+    defer plain.deinit();
+    var src2: Source = .{};
+    try std.testing.expectError(error.UnknownTarget, applyProps(gpa, &env, plain, .{ .target = "dev" }, &src2));
+    var src3: Source = .{};
+    try std.testing.expectError(error.TargetWithoutFile, applyProps(gpa, &env, null, .{ .target = "dev" }, &src3));
+}
+
+test "applyProps: no target selected behaves like before" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var props = try parse(alloc, "bootstrap.servers=b:1\nlinger.ms=30\n");
+    defer props.deinit();
+    var env = try testEnv(alloc, &.{});
+    defer env.deinit();
+    var src: Source = .{};
+    const cfg = try applyProps(gpa, &env, props, .{}, &src);
+    try std.testing.expect(src.target == null);
+    try std.testing.expectEqual(@as(usize, 0), src.targets.len);
+    try std.testing.expectEqualStrings("b:1", cfg.bootstrap_servers[0]);
+    try std.testing.expectEqual(Origin.file, src.origins.get(.bootstrap_servers));
+    try std.testing.expectEqual(@as(u64, 30), cfg.linger_ms);
+}
+
+test "applyProps: -b flag still beats the target" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var props = try parse(alloc, "target.dev.bootstrap.servers=d:2\n");
+    defer props.deinit();
+    var env = try testEnv(alloc, &.{});
+    defer env.deinit();
+    var src: Source = .{};
+    const cfg = try applyProps(gpa, &env, props, .{ .target = "dev", .bootstrap = "flag:9" }, &src);
+    try std.testing.expectEqualStrings("flag:9", cfg.bootstrap_servers[0]);
+    try std.testing.expectEqual(Origin.flag, src.origins.get(.bootstrap_servers));
+    try std.testing.expectEqualStrings("dev", src.target.?);
 }
 
 test "origins track the highest-precedence writer" {

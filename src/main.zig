@@ -411,6 +411,7 @@ fn loadConfig(init: std.process.Init, alloc: std.mem.Allocator, common: cli_args
     var cfg = config.load(init.io, alloc, init.environ_map, .{
         .bootstrap = common.bootstrap,
         .config_path = common.config_path,
+        .target = common.target,
     }, source) catch |err| switch (err) {
         error.ConfigNotFound => fatal(
             "no broker configured. Pass -b HOST:PORT, set BOOTSTRAP_SERVERS, or create kite.properties (searched {s}); see 'kite --help' for the file format",
@@ -426,6 +427,16 @@ fn loadConfig(init: std.process.Init, alloc: std.mem.Allocator, common: cli_args
         error.InvalidSaslMechanism => fatal("invalid sasl.mechanism (want PLAIN, SCRAM-SHA-256, or SCRAM-SHA-512)", .{}),
         error.MissingSaslMechanism => fatal("security.protocol=SASL_* requires sasl.mechanism", .{}),
         error.MissingSaslCredentials => fatal("sasl.mechanism set but sasl.username/sasl.password missing", .{}),
+        error.TargetWithoutFile => fatal(
+            "--target requires a properties file (searched {s})",
+            .{search_path_hint},
+        ),
+        error.UnknownTarget => {
+            if (source.targets.len == 0)
+                fatal("no target '{s}' in {s} (file defines no targets)", .{ source.target.?, source.file.? });
+            const names = std.mem.join(alloc, ", ", source.targets) catch fatal("out of memory", .{});
+            fatal("no target '{s}' in {s} (available: {s})", .{ source.target.?, source.file.?, names });
+        },
         error.OutOfMemory => fatal("out of memory", .{}),
     };
     cfg.verbose = common.verbose;
@@ -437,6 +448,7 @@ fn loadConfig(init: std.process.Init, alloc: std.mem.Allocator, common: cli_args
             if (source.file) |f| f else if (!source.env and !source.flags) "(nothing)" else "",
         });
         if (source.env and source.file != null) std.debug.print("kite: (env overrides file)\n", .{});
+        if (source.target) |t| std.debug.print("kite: target '{s}'\n", .{t});
     }
     return cfg;
 }
@@ -646,10 +658,19 @@ fn runShowConfig(init: std.process.Init, args: []const []const u8, alloc: std.me
     if (json_mode) {
         outw.writeAll("{\"file\":") catch {};
         if (source.file) |f| json.writeString(outw, f) catch {} else outw.writeAll("null") catch {};
-        outw.writeAll(",\"settings\":{") catch {};
+        outw.writeAll(",\"target\":") catch {};
+        if (source.target) |t| json.writeString(outw, t) catch {} else outw.writeAll("null") catch {};
+        outw.writeAll(",\"targets\":[") catch {};
+        for (source.targets, 0..) |t, i| {
+            if (i > 0) outw.writeByte(',') catch {};
+            json.writeString(outw, t) catch {};
+        }
+        outw.writeAll("],\"settings\":{") catch {};
     } else {
         outw.writeAll("config file: ") catch {};
         outw.writeAll(source.file orelse "(none)") catch {};
+        outw.writeAll("\ntarget: ") catch {};
+        outw.writeAll(source.target orelse "(none)") catch {};
         outw.writeByte('\n') catch {};
     }
     var first = true;

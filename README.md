@@ -305,6 +305,7 @@ kite --version                Print the version.
 | --- | --- | --- |
 | produce, consume | `-b`, `--bootstrap HOSTS` | Comma-separated `host:port` brokers (overrides env and file). |
 | produce, consume | `--config FILE` | Read this properties file instead of searching. |
+| produce, consume | `--target NAME` | Use cluster `NAME` from the properties file (or `$KITE_TARGET`). |
 | produce, consume | `--format FMT` | Record shape: `value`, `tsv`, `json` (default `auto`). |
 | produce | `--format csv` | RFC 4180 CSV input (produce only); same as `--csv`. |
 | produce, consume | `--json` | Alias for `--format json`. |
@@ -357,6 +358,8 @@ kite -c -B --json src | kite --json dst
 kite -c -B raw | jq -c '{id, ts}' | kite clean
 # one-off broker without a config file
 kite -b broker1:9092,broker2:9092 -c -B -n 5 events
+# named cluster from the properties file (see "Multiple clusters" below)
+kite --target prod events < examples/data/lines.txt
 ```
 
 The consumer output is in the same textual shape accepted by the producer,
@@ -495,6 +498,43 @@ Templates are in [`examples/config/`](examples/config). Idempotence means
 broker deduplication of retried batches, not end-to-end exactly-once
 processing.
 
+### Multiple clusters (targets)
+
+One properties file can hold several clusters. `target.NAME.key=value`
+defines `key` (any key from the table above) for the cluster called `NAME`;
+unprefixed keys remain shared defaults. Names match `[A-Za-z0-9_-]+`.
+
+```properties
+# shared defaults
+linger.ms=20
+target=dev
+
+target.dev.bootstrap.servers=localhost:9092
+
+target.prod.bootstrap.servers=pkc-xyz.us-east-1.aws.confluent.cloud:9092
+target.prod.security.protocol=SASL_SSL
+target.prod.sasl.mechanism=PLAIN
+target.prod.sasl.username=KEY
+target.prod.sasl.password=SECRET
+```
+
+The target is selected by, in order: `--target NAME`, `$KITE_TARGET`, the
+file's own `target=NAME` key, else no target and only the unprefixed keys
+apply. Passing `--target` without any properties file is an error, as is
+selecting a name the file does not define.
+
+Within a target, value precedence is: flags > the target's `target.NAME.*`
+keys > environment > base keys > defaults. A named target is a complete
+cluster definition, so ambient `BOOTSTRAP_SERVERS` cannot silently
+redirect `--target prod`; environment variables still fill in keys the
+target omits (for example `SASL_PASSWORD` while the target supplies the
+brokers).
+
+`kite --show-config` prints the selected name on a `target:` line and
+reports `target` as the origin of keys that came from `target.NAME.*`; the
+JSON form adds `"target"` and `"targets"` (all names defined in the file).
+See [`examples/config/targets.properties`](examples/config/targets.properties).
+
 ### Inspecting the effective configuration
 
 `kite --show-config` resolves the effective settings — flags over
@@ -504,6 +544,7 @@ exits 1 with the usual `kite: ...` message; `sasl.password` is redacted.
 
 ```text
 config file: /home/me/kite.properties
+target: prod
 bootstrap.servers        localhost:9092          flag
 security.protocol        PLAINTEXT               default
 sasl.password            ********               env

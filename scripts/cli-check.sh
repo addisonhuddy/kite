@@ -200,6 +200,49 @@ rm "$TMP/work/kite.properties"
 
 run_case show-config-conflict 1 empty "kite: --show-config cannot be combined with --consume" -c --show-config demo
 
+# --target: named cluster targets in the properties file.
+run_case target-missing-value 1 empty "kite: --target requires a value" --target
+run_case target-no-file 1 empty "requires a properties file" --target x demo
+cat >"$TMP/work/kite.properties" <<'EOF'
+bootstrap.servers=base:1
+linger.ms=20
+target.dev.bootstrap.servers=dev:2
+target.prod.bootstrap.servers=prod:3
+EOF
+set +e
+(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" --target x --show-config >"$TMP/target-unknown.out" 2>"$TMP/target-unknown.err")
+status=$?
+set -e
+[ "$status" -eq 1 ] \
+    && grep -Fq "no target 'x'" "$TMP/target-unknown.err" \
+    && grep -Fq "available: dev, prod" "$TMP/target-unknown.err" || {
+    echo "FAIL target-unknown"; cat "$TMP/target-unknown.err"; exit 1;
+}
+echo "PASS target-unknown"
+set +e
+(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" KITE_TARGET=prod "$BIN" --show-config --json >"$TMP/target-json.out" 2>"$TMP/target-json.err")
+status=$?
+set -e
+[ "$status" -eq 0 ] \
+    && grep -Fq '"target":"prod"' "$TMP/target-json.out" \
+    && grep -Fq '"bootstrap.servers":{"value":"prod:3","source":"target"}' "$TMP/target-json.out" \
+    && grep -Fq '"linger.ms":{"value":"20","source":"file"}' "$TMP/target-json.out" || {
+    echo "FAIL target-json"; cat "$TMP/target-json.out"; cat "$TMP/target-json.err"; exit 1;
+}
+echo "PASS target-json"
+printf 'bootstrap.servers=base:1\ntarget=dev\ntarget.dev.bootstrap.servers=dev:2\n' >"$TMP/work/kite.properties"
+set +e
+(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" --show-config --json >"$TMP/target-default.out" 2>"$TMP/target-default.err")
+status=$?
+set -e
+[ "$status" -eq 0 ] \
+    && grep -Fq '"target":"dev"' "$TMP/target-default.out" \
+    && grep -Fq '"bootstrap.servers":{"value":"dev:2","source":"target"}' "$TMP/target-default.out" || {
+    echo "FAIL target-default"; cat "$TMP/target-default.out"; cat "$TMP/target-default.err"; exit 1;
+}
+echo "PASS target-default"
+rm "$TMP/work/kite.properties"
+
 grep -Fq "Try 'kite --help' for examples." "$TMP/unknown-option.err"
 grep -Fq "Try 'kite -c --help' for examples." "$TMP/consume-unknown.err"
 for name in empty-topic unknown-option missing-header malformed-header missing-key key-without-csv extra-topic; do

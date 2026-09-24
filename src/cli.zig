@@ -14,6 +14,7 @@ pub const Common = struct {
     format_spelling: ?[]const u8 = null,
     bootstrap: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
+    target: ?[]const u8 = null,
 };
 
 pub const ProduceArgs = struct {
@@ -67,6 +68,7 @@ fn takesSeparateValue(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "-b") or
         std.mem.eql(u8, arg, "--bootstrap") or
         std.mem.eql(u8, arg, "--config") or
+        std.mem.eql(u8, arg, "--target") or
         std.mem.eql(u8, arg, "--format") or
         std.mem.eql(u8, arg, "-H") or
         std.mem.eql(u8, arg, "--key") or
@@ -119,7 +121,10 @@ const config_help =
     "  $XDG_CONFIG_HOME/kite/kite.properties, ~/.config/kite/kite.properties.\n" ++
     "  Environment: BOOTSTRAP_SERVERS, SECURITY_PROTOCOL,\n" ++
     "  SASL_MECHANISM, SASL_USERNAME, SASL_PASSWORD,\n" ++
-    "  SSL_TRUSTSTORE_LOCATION, KAFKA_PROPERTIES (path to a properties file).\n" ++
+    "  SSL_TRUSTSTORE_LOCATION, KAFKA_PROPERTIES (path to a properties file),\n" ++
+    "  KITE_TARGET (named cluster target).\n" ++
+    "  target.NAME.key lines in the file define a named cluster; select\n" ++
+    "  it with --target NAME, KITE_TARGET, or a `target=NAME` key.\n" ++
     "  Templates are in examples/config/.\n";
 
 pub const produce_help =
@@ -135,6 +140,8 @@ pub const produce_help =
     "  -V, --version         Print the version and exit.\n" ++
     "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
     "  --config FILE         Read this properties file instead of searching.\n" ++
+    "  --target NAME         Use cluster NAME from the properties file\n" ++
+    "                        (or $KITE_TARGET).\n" ++
     "  -H HEADER             Add a 'name: value' header (repeatable).\n" ++
     "  --csv                 Read RFC 4180 CSV (same as --format csv).\n" ++
     "  --key COL             Use CSV column COL as the record key; requires --csv.\n" ++
@@ -154,6 +161,7 @@ pub const produce_help =
     "  kite -b localhost:9092 events < examples/data/lines.txt\n" ++
     "  kite -H 'source: import' events < examples/data/headers.tsv\n" ++
     "  kite --csv --key user_id events < examples/data/events.csv\n" ++
+    "  kite --target prod events < examples/data/lines.txt\n" ++
     "  kite -c --json src | kite --json dst\n" ++
     "\n" ++
     config_help;
@@ -167,6 +175,8 @@ pub const consume_help =
     "Options:\n" ++
     "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
     "  --config FILE         Read this properties file instead of searching.\n" ++
+    "  --target NAME         Use cluster NAME from the properties file\n" ++
+    "                        (or $KITE_TARGET).\n" ++
     "  -B, --from-beginning  Start at the earliest available offset.\n" ++
     "  --offset N            Start at offset N in each selected partition.\n" ++
     "                        Cannot be combined with --from-beginning.\n" ++
@@ -196,6 +206,7 @@ pub const consume_help =
     "  kite -c -B --idle 3s events\n" ++
     "  kite -c --partition 0 --offset 42 -n 10 --idle 3s events\n" ++
     "  kite -c -B --json events | jq -c .value\n" ++
+    "  kite -c --target prod events\n" ++
     "\n" ++
     config_help;
 
@@ -212,6 +223,8 @@ pub const show_config_help =
     "Options:\n" ++
     "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
     "  --config FILE         Read this properties file instead of searching.\n" ++
+    "  --target NAME         Use cluster NAME from the properties file\n" ++
+    "                        (or $KITE_TARGET).\n" ++
     "  --format FMT          Output shape: json (default: text). --json is\n" ++
     "                        short for --format json.\n" ++
     "  -q, --quiet           Suppress the config-source note on stderr.\n" ++
@@ -290,9 +303,9 @@ pub fn parseHeaderArg(s: []const u8) !protocol.Header {
 const produce_only = [_][]const u8{ "-H", "--csv", "--key" };
 const consume_only = [_][]const u8{ "-B", "--from-beginning", "--offset", "--partition", "-n", "--max", "-t", "--idle", "-f", "--follow" };
 
-const produce_options = [_][]const u8{ "--consume", "--version", "--bootstrap", "--config", "--format", "--json", "--csv", "--key", "--quiet", "--verbose", "--help", "--show-config" };
-const consume_options = [_][]const u8{ "--consume", "--bootstrap", "--config", "--from-beginning", "--offset", "--partition", "--max", "--idle", "--follow", "--format", "--json", "--quiet", "--verbose", "--help" };
-const show_config_options = [_][]const u8{ "--show-config", "--bootstrap", "--config", "--json", "--format", "--quiet", "--verbose", "--help" };
+const produce_options = [_][]const u8{ "--consume", "--version", "--bootstrap", "--config", "--target", "--format", "--json", "--csv", "--key", "--quiet", "--verbose", "--help", "--show-config" };
+const consume_options = [_][]const u8{ "--consume", "--bootstrap", "--config", "--target", "--from-beginning", "--offset", "--partition", "--max", "--idle", "--follow", "--format", "--json", "--quiet", "--verbose", "--help" };
+const show_config_options = [_][]const u8{ "--show-config", "--bootstrap", "--config", "--target", "--json", "--format", "--quiet", "--verbose", "--help" };
 
 /// Damerau-Levenshtein distance (adjacent transposition counts as one edit).
 /// Inputs are capped so the DP matrix lives on the stack.
@@ -402,6 +415,12 @@ fn parseCommon(alloc: std.mem.Allocator, common: *Common, args: []const []const 
         common.config_path = args[i.*];
     } else if (std.mem.startsWith(u8, arg, "--config=")) {
         common.config_path = arg["--config=".len..];
+    } else if (std.mem.eql(u8, arg, "--target")) {
+        i.* += 1;
+        if (i.* >= args.len) return .{ .err = "--target requires a value" };
+        common.target = args[i.*];
+    } else if (std.mem.startsWith(u8, arg, "--target=")) {
+        common.target = arg["--target=".len..];
     } else {
         return null;
     }
@@ -428,6 +447,7 @@ fn finishCommon(common: Common) ?[]const u8 {
     if (common.quiet and common.verbose) return "--quiet cannot be combined with --verbose";
     if (common.bootstrap) |b| if (b.len == 0) return "--bootstrap must not be empty";
     if (common.config_path) |p| if (p.len == 0) return "--config must not be empty";
+    if (common.target) |t| if (t.len == 0) return "--target must not be empty";
     return null;
 }
 
@@ -843,6 +863,29 @@ test "consume parser accepts attached and equals spellings including zero" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "target option parses into common.target" {
+    const alloc = std.heap.page_allocator;
+    const produce = parseProduce(alloc, &.{ "--target", "prod", "events" });
+    switch (produce) {
+        .ok => |args| try std.testing.expectEqualStrings("prod", args.common.target.?),
+        else => return error.TestUnexpectedResult,
+    }
+    const consume = parseConsume(alloc, &.{ "--target=prod", "events" });
+    switch (consume) {
+        .ok => |args| try std.testing.expectEqualStrings("prod", args.common.target.?),
+        else => return error.TestUnexpectedResult,
+    }
+    const show = parseShowConfig(alloc, &.{ "--target", "prod" });
+    switch (show) {
+        .ok => |args| try std.testing.expectEqualStrings("prod", args.common.target.?),
+        else => return error.TestUnexpectedResult,
+    }
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{"--target"}), "--target requires a value");
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{ "--target", "", "events" }), "--target must not be empty");
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{ "--target=", "events" }), "--target must not be empty");
+    try expectErr(ConsumeArgs, parseConsume(alloc, &.{ "--target=", "events" }), "--target must not be empty");
 }
 
 test "consume parser accepts long spellings, durations, -B and --follow" {
