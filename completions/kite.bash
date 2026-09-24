@@ -22,6 +22,14 @@ _kite() {
             COMPREPLY=($(compgen -f -- "$cur"))
             return
             ;;
+        --target)
+            if [ -f kite.properties ]; then
+                local names
+                names=$(sed -n 's/^target\.\([A-Za-z0-9_-]*\)\..*/\1/p' kite.properties | sort -u)
+                COMPREPLY=($(compgen -W "$names" -- "$cur"))
+            fi
+            return
+            ;;
         -b | --bootstrap | -H | --key | --offset | --partition | -n | --max | -t | --idle)
             return
             ;;
@@ -30,16 +38,16 @@ _kite() {
     local opts
     case "$mode" in
         consume)
-            opts="-c --consume -b --bootstrap --config --format --json \
+            opts="-c --consume -b --bootstrap --config --target --format --json \
                 -B --from-beginning --offset --partition -n --max -t --idle \
                 -f --follow -q --quiet -v --verbose -h --help"
             ;;
         show-config)
-            opts="--show-config -b --bootstrap --config --format --json -q --quiet -v --verbose -h --help"
+            opts="--show-config -b --bootstrap --config --target --format --json -q --quiet -v --verbose -h --help"
             ;;
         *)
             opts="-c --consume -V --version --show-config \
-                -b --bootstrap --config --format --json -H --csv --key \
+                -b --bootstrap --config --target --format --json -H --csv --key \
                 -q --quiet -v --verbose -h --help"
             ;;
     esac
