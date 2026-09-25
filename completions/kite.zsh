@@ -4,10 +4,10 @@
 #   mkdir -p ~/.zfunc && cp completions/kite.zsh ~/.zfunc/_kite
 #   # in ~/.zshrc: fpath=(~/.zfunc $fpath); autoload -Uz compinit && compinit
 
-# Complete the names of `target.NAME.*` groups in ./kite.properties.
+# Complete the cluster names under `clusters:` in ./kite.yaml.
 _kite_targets() {
     local -a names
-    names=(${(f)"$(sed -n 's/^target\.\([A-Za-z0-9_-]*\)\..*/\1/p' kite.properties 2>/dev/null | sort -u)"})
+    names=(${(f)"$(awk '/^clusters:/{f=1;next} f&&/^[^ ]/{f=0} f&&/^  [A-Za-z0-9_-]+:/{sub(/^  /,"");sub(/:.*/,"");print}' kite.yaml 2>/dev/null | sort -u)"})
     compadd -a names
 }
 
@@ -16,7 +16,7 @@ _kite() {
     shared=(
         '(-b --bootstrap)'{-b,--bootstrap}'[comma-separated host:port brokers]:hosts:'
         '--config[read this properties file]:file:_files'
-        '--target[use cluster NAME from the properties file]:name:_kite_targets'
+        '--target[use cluster NAME from kite.yaml]:name:_kite_targets'
         '--format[record shape]:format:(value tsv json csv)'
         '--json[one JSON object per record (same as --format json)]'
         '(-q --quiet)'{-q,--quiet}'[suppress summary and progress lines]'
@@ -40,7 +40,7 @@ _kite() {
             '--show-config[show effective configuration]' \
             '(-b --bootstrap)'{-b,--bootstrap}'[comma-separated host:port brokers]:hosts:' \
             '--config[read this properties file]:file:_files' \
-            '--target[use cluster NAME from the properties file]:name:_kite_targets' \
+            '--target[use cluster NAME from kite.yaml]:name:_kite_targets' \
             '--format[output shape]:format:(json)' \
             '--json[JSON output]' \
             '(-q --quiet)'{-q,--quiet}'[suppress progress lines]' \

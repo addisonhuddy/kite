@@ -23,9 +23,9 @@ _kite() {
             return
             ;;
         --target)
-            if [ -f kite.properties ]; then
+            if [ -f kite.yaml ]; then
                 local names
-                names=$(sed -n 's/^target\.\([A-Za-z0-9_-]*\)\..*/\1/p' kite.properties | sort -u)
+                names=$(awk '/^clusters:/{f=1;next} f&&/^[^ ]/{f=0} f&&/^  [A-Za-z0-9_-]+:/{sub(/^  /,"");sub(/:.*/,"");print}' kite.yaml | sort -u)
                 COMPREPLY=($(compgen -W "$names" -- "$cur"))
             fi
             return

@@ -1,4 +1,5 @@
 const std = @import("std");
+const yaml = @import("yaml.zig");
 
 pub const SecurityProtocol = enum { plaintext, ssl, sasl_ssl, sasl_plaintext };
 pub const SaslMechanism = enum { plain, scram_sha_256, scram_sha_512 };
@@ -38,10 +39,12 @@ pub const LoadError = error{
     InvalidSaslMechanism,
     MissingSaslMechanism,
     MissingSaslCredentials,
-    /// A target was selected but the file defines no `target.NAME.*` keys.
+    /// A target was selected but the file defines no such cluster.
     UnknownTarget,
-    /// --target/KITE_TARGET was given but no properties file was found.
+    /// --target/KITE_TARGET was given but no config file was found.
     TargetWithoutFile,
+    /// The config file failed to parse (see source.diag).
+    ConfigSyntax,
     OutOfMemory,
 };
 
@@ -49,7 +52,7 @@ pub const LoadError = error{
 pub const Overrides = struct {
     bootstrap: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
-    /// --target NAME: pick the `target.NAME.*` group from the file.
+    /// --target NAME: pick the named cluster from the config file.
     target: ?[]const u8 = null,
 };
 
@@ -61,10 +64,14 @@ pub const Source = struct {
     requested: ?[]const u8 = null,
     env: bool = false,
     flags: bool = false,
-    /// Selected target name, if any.
+    /// Selected cluster name, if any.
     target: ?[]const u8 = null,
-    /// Sorted names of the `target.NAME.*` groups defined in the file.
+    /// Sorted names of the clusters defined in the file.
     targets: [][]const u8 = &.{},
+    /// Which file format was read, when a file was found.
+    file_kind: FileKind = .none,
+    /// Parse diagnostic when load fails with error.ConfigSyntax.
+    diag: yaml.Diag = .{},
     /// Per-key provenance for --show-config.
     origins: std.EnumArray(Key, Origin) = .initFill(.default),
 };
@@ -84,6 +91,17 @@ pub const Key = enum {
 };
 
 pub const Origin = enum { default, file, env, flag, target };
+
+pub const FileKind = enum { none, properties, yaml };
+
+/// Normalized config document: a flat map of shared settings plus an
+/// ordered set of named clusters. Properties files produce an empty
+/// `clusters` map and no default.
+pub const Doc = struct {
+    base: Props,
+    default_target: ?[]const u8 = null,
+    clusters: std.StringArrayHashMapUnmanaged(Props) = .empty,
+};
 
 pub const key_names = std.EnumArray(Key, []const u8).init(.{
     .bootstrap_servers = "bootstrap.servers",
@@ -179,18 +197,94 @@ pub fn parse(alloc: std.mem.Allocator, text: []const u8) !Props {
     return map;
 }
 
+fn appendUnique(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged([]const u8), p: []const u8) !void {
+    for (list.items) |q|
+        if (std.mem.eql(u8, q, p)) return;
+    try list.append(alloc, p);
+}
+
 fn configPaths(alloc: std.mem.Allocator, env: *std.process.Environ.Map, list: *std.ArrayListUnmanaged([]const u8)) !void {
-    try list.append(alloc, "./kite.properties");
+    try appendUnique(alloc, list, "./kite.yaml");
+    try appendUnique(alloc, list, "./kite.properties");
     if (env.get("XDG_CONFIG_HOME")) |xdg| {
-        if (xdg.len > 0)
-            try list.append(alloc, try std.fmt.allocPrint(alloc, "{s}/kite/kite.properties", .{xdg}));
+        if (xdg.len > 0) {
+            try appendUnique(alloc, list, try std.fmt.allocPrint(alloc, "{s}/kite/kite.yaml", .{xdg}));
+            try appendUnique(alloc, list, try std.fmt.allocPrint(alloc, "{s}/kite/kite.properties", .{xdg}));
+        }
     }
     if (env.get("HOME")) |home| {
         if (home.len > 0) {
-            const p = try std.fmt.allocPrint(alloc, "{s}/.config/kite/kite.properties", .{home});
-            for (list.items) |q|
-                if (std.mem.eql(u8, q, p)) return;
-            try list.append(alloc, p);
+            try appendUnique(alloc, list, try std.fmt.allocPrint(alloc, "{s}/.config/kite/kite.yaml", .{home}));
+            try appendUnique(alloc, list, try std.fmt.allocPrint(alloc, "{s}/.config/kite/kite.properties", .{home}));
+        }
+    }
+}
+
+fn isYamlPath(path: []const u8) bool {
+    const ext = std.fs.path.extension(path);
+    return std.ascii.eqlIgnoreCase(ext, ".yaml") or std.ascii.eqlIgnoreCase(ext, ".yml");
+}
+
+/// Turn a parsed YAML document into a Doc: `default:` is a cluster name,
+/// `defaults:` and each `clusters: NAME` entry are flat key/value maps.
+fn docFromYaml(alloc: std.mem.Allocator, text: []const u8, diag: *yaml.Diag) error{ Syntax, OutOfMemory }!Doc {
+    var top = try yaml.parse(alloc, text, diag);
+    var doc: Doc = .{ .base = Props.init(alloc) };
+    var it = top.iterator();
+    while (it.next()) |e| {
+        const key = e.key_ptr.*;
+        const node = e.value_ptr.*;
+        if (std.mem.eql(u8, key, "default")) {
+            switch (node) {
+                .scalar => |v| doc.default_target = v,
+                .map => warn("'default' must be a cluster name", .{}),
+            }
+        } else if (std.mem.eql(u8, key, "defaults")) {
+            switch (node) {
+                .scalar => warn("'defaults' must be a map of settings", .{}),
+                .map => |m| try collectProps(m, &doc.base, ""),
+            }
+        } else if (std.mem.eql(u8, key, "clusters")) {
+            switch (node) {
+                .scalar => warn("'clusters' must be a map of cluster names", .{}),
+                .map => |m| {
+                    var cit = m.iterator();
+                    while (cit.next()) |ce| {
+                        const name = ce.key_ptr.*;
+                        if (!validTargetName(name)) {
+                            warn("unknown config key 'clusters.{s}' ignored", .{name});
+                            continue;
+                        }
+                        switch (ce.value_ptr.*) {
+                            .scalar => warn("cluster '{s}' must be a map of settings", .{name}),
+                            .map => |cm| {
+                                const gop = try doc.clusters.getOrPut(alloc, name);
+                                gop.value_ptr.* = Props.init(alloc);
+                                try collectProps(cm, gop.value_ptr, name);
+                            },
+                        }
+                    }
+                },
+            }
+        } else {
+            warn("unknown config key '{s}' ignored", .{key});
+        }
+    }
+    return doc;
+}
+
+/// Copy scalar entries of a yaml map into a Props table. Nested maps are
+/// rejected with the unknown-key warning, prefixed by `ctx` when set.
+fn collectProps(m: yaml.Map, props: *Props, ctx: []const u8) error{OutOfMemory}!void {
+    var it = m.iterator();
+    while (it.next()) |e| {
+        const key = e.key_ptr.*;
+        switch (e.value_ptr.*) {
+            .scalar => |v| try props.put(key, v),
+            .map => if (ctx.len == 0)
+                warn("unknown config key '{s}' ignored", .{key})
+            else
+                warn("unknown config key '{s}.{s}' ignored", .{ ctx, key }),
         }
     }
 }
@@ -253,8 +347,24 @@ pub fn load(
         }
     }
 
-    const props: ?Props = if (text) |body| try parse(alloc, body) else null;
-    const cfg = try applyProps(alloc, env, props, overrides, source);
+    var doc: ?Doc = null;
+    if (text) |body| {
+        if (isYamlPath(source.file.?)) {
+            source.file_kind = .yaml;
+            var diag: yaml.Diag = .{};
+            doc = docFromYaml(alloc, body, &diag) catch |err| switch (err) {
+                error.Syntax => {
+                    source.diag = diag;
+                    return error.ConfigSyntax;
+                },
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+        } else {
+            source.file_kind = .properties;
+            doc = .{ .base = try parse(alloc, body) };
+        }
+    }
+    const cfg = try applyProps(alloc, env, doc, overrides, source);
     const password_origin = source.origins.get(.sasl_password);
     if (password_origin == .file or password_origin == .target)
         warnIfLoosePerms(io, source.file.?);
@@ -269,49 +379,24 @@ fn validTargetName(name: []const u8) bool {
     return true;
 }
 
-/// Pure core of `load`: resolve Config from already-parsed properties,
-/// the environment map, and overrides. `props` is null when no file was
-/// found. Value precedence, highest first: flags, the selected target's
-/// `target.NAME.*` keys, environment, base file keys, defaults. A target
-/// is chosen by --target, then $KITE_TARGET, then the file's `target=` key.
+/// Pure core of `load`: resolve Config from a normalized document,
+/// the environment map, and overrides. `doc` is null when no file was
+/// found. Value precedence, highest first: flags, the selected cluster's
+/// keys, environment, shared/base file keys, defaults. A cluster is
+/// chosen by --target, then $KITE_TARGET, then the file's `default`.
 pub fn applyProps(
     alloc: std.mem.Allocator,
     env: *std.process.Environ.Map,
-    props: ?Props,
+    doc: ?Doc,
     overrides: Overrides,
     source: *Source,
 ) LoadError!Config {
     var cfg: Config = .{ .bootstrap_servers = &.{} };
 
-    // Discover declared targets and the file's default target.
     var names: std.ArrayListUnmanaged([]const u8) = .empty;
-    var file_target: ?[]const u8 = null;
-    if (props) |*p| {
-        var it = p.iterator();
-        while (it.next()) |e| {
-            const key = e.key_ptr.*;
-            if (std.mem.eql(u8, key, "target")) {
-                file_target = e.value_ptr.*;
-                continue;
-            }
-            if (!std.mem.startsWith(u8, key, "target.")) continue;
-            const tail = key["target.".len..];
-            const dot = std.mem.indexOfScalar(u8, tail, '.') orelse {
-                warn("unknown config key '{s}' ignored", .{key});
-                continue;
-            };
-            const name = tail[0..dot];
-            const inner = tail[dot + 1 ..];
-            if (!validTargetName(name) or inner.len == 0 or keyFromName(inner) == null) {
-                warn("unknown config key '{s}' ignored", .{key});
-                continue;
-            }
-            var seen = false;
-            for (names.items) |n| {
-                if (std.mem.eql(u8, n, name)) seen = true;
-            }
-            if (!seen) try names.append(alloc, name);
-        }
+    if (doc) |*d| {
+        var it = d.clusters.iterator();
+        while (it.next()) |e| try names.append(alloc, e.key_ptr.*);
     }
     std.mem.sort([]const u8, names.items, {}, struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {
@@ -326,22 +411,19 @@ pub fn applyProps(
             if (t.len > 0) selected = t;
         }
     }
-    if (selected == null) selected = file_target;
-    if (selected != null and props == null) return error.TargetWithoutFile;
+    if (selected == null) {
+        if (doc) |*d| selected = d.default_target;
+    }
+    if (selected != null and doc == null) return error.TargetWithoutFile;
     source.target = selected;
     if (selected) |name| {
-        var found = false;
-        for (names.items) |n| {
-            if (std.mem.eql(u8, n, name)) found = true;
-        }
-        if (!found) return error.UnknownTarget;
+        if (!doc.?.clusters.contains(name)) return error.UnknownTarget;
     }
 
-    if (props) |*p| {
-        var it = p.iterator();
+    if (doc) |*d| {
+        var it = d.base.iterator();
         while (it.next()) |e| {
             const key = e.key_ptr.*;
-            if (std.mem.eql(u8, key, "target") or std.mem.startsWith(u8, key, "target.")) continue;
             if (overrides.bootstrap != null and std.mem.eql(u8, key, "bootstrap.servers")) continue;
             if (overriddenByEnv(env, key)) continue;
             try applyKey(&cfg, alloc, source, .file, key, e.value_ptr.*);
@@ -355,20 +437,16 @@ pub fn applyProps(
         try applyKey(&cfg, alloc, source, .env, pair[1], val);
     }
 
-    // The selected target's keys override ambient env vars: a named target
-    // is a complete cluster definition, so e.g. BOOTSTRAP_SERVERS must not
-    // silently redirect `--target prod`, but it still fills keys the
-    // target omits.
+    // The selected cluster's keys override ambient env vars: a named
+    // cluster is a complete definition, so e.g. BOOTSTRAP_SERVERS must
+    // not silently redirect `--target prod`, but env still fills keys
+    // the cluster omits.
     if (selected) |name| {
-        const prefix = try std.fmt.allocPrint(alloc, "target.{s}.", .{name});
-        var it = props.?.iterator();
+        var it = doc.?.clusters.get(name).?.iterator();
         while (it.next()) |e| {
             const key = e.key_ptr.*;
-            if (!std.mem.startsWith(u8, key, prefix)) continue;
-            const inner = key[prefix.len..];
-            if (inner.len == 0 or keyFromName(inner) == null) continue;
-            if (overrides.bootstrap != null and std.mem.eql(u8, inner, "bootstrap.servers")) continue;
-            try applyKey(&cfg, alloc, source, .target, inner, e.value_ptr.*);
+            if (overrides.bootstrap != null and std.mem.eql(u8, key, "bootstrap.servers")) continue;
+            try applyKey(&cfg, alloc, source, .target, key, e.value_ptr.*);
         }
     }
 
@@ -540,32 +618,42 @@ fn testEnv(alloc: std.mem.Allocator, pairs: []const [2][]const u8) !std.process.
     return env;
 }
 
-test "applyProps: target=dev in file selects the dev keys" {
+/// Build a Doc from properties-text fragments: `base` for the flat map and
+/// name/text pairs for clusters (parsed with the same props parser).
+fn testDoc(
+    alloc: std.mem.Allocator,
+    base_text: []const u8,
+    default_target: ?[]const u8,
+    clusters: []const [2][]const u8,
+) !Doc {
+    var doc: Doc = .{ .base = try parse(alloc, base_text), .default_target = default_target };
+    for (clusters) |pair| {
+        const gop = try doc.clusters.getOrPut(alloc, pair[0]);
+        gop.value_ptr.* = try parse(alloc, pair[1]);
+    }
+    return doc;
+}
+
+test "applyProps: default cluster selects its keys" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const gpa = arena.allocator();
-    var props = try parse(alloc, "linger.ms=20\n" ++
-        "bootstrap.servers=base:1\n" ++
-        "target=dev\n" ++
-        "target.dev.bootstrap.servers=dev:2\n" ++
-        "target.prod.bootstrap.servers=prod:3\n" ++
-        "target.prod.security.protocol=SASL_SSL\n" ++
-        "target.prod.sasl.mechanism=PLAIN\n" ++
-        "target.prod.sasl.username=u\n" ++
-        "target.prod.sasl.password=p\n");
-    defer props.deinit();
+    const doc = try testDoc(gpa, "linger.ms=20\nbootstrap.servers=base:1\n", "dev", &.{
+        .{ "dev", "bootstrap.servers=dev:2\n" },
+        .{ "prod", "bootstrap.servers=prod:3\nsecurity.protocol=SASL_SSL\nsasl.mechanism=PLAIN\nsasl.username=u\nsasl.password=p\n" },
+    });
     var env = try testEnv(alloc, &.{});
     defer env.deinit();
     var src: Source = .{};
-    const cfg = try applyProps(gpa, &env, props, .{}, &src);
+    const cfg = try applyProps(gpa, &env, doc, .{}, &src);
     try std.testing.expectEqualStrings("dev:2", cfg.bootstrap_servers[0]);
     try std.testing.expectEqual(Origin.target, src.origins.get(.bootstrap_servers));
     try std.testing.expectEqualStrings("dev", src.target.?);
     try std.testing.expectEqualStrings("dev", src.targets[0]);
     try std.testing.expectEqualStrings("prod", src.targets[1]);
     try std.testing.expectEqual(@as(usize, 2), src.targets.len);
-    // Base keys still apply for anything the target does not define.
+    // Shared defaults still apply for anything the cluster does not set.
     try std.testing.expectEqual(@as(u64, 20), cfg.linger_ms);
 }
 
@@ -574,20 +662,17 @@ test "applyProps: override.target beats file default and env, env fills gaps" {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const gpa = arena.allocator();
-    var props = try parse(alloc, "target=dev\n" ++
-        "target.dev.bootstrap.servers=dev:2\n" ++
-        "target.prod.bootstrap.servers=prod:3\n" ++
-        "target.prod.security.protocol=SASL_SSL\n" ++
-        "target.prod.sasl.mechanism=PLAIN\n" ++
-        "target.prod.sasl.username=u\n");
-    defer props.deinit();
+    const doc = try testDoc(gpa, "", "dev", &.{
+        .{ "dev", "bootstrap.servers=dev:2\n" },
+        .{ "prod", "bootstrap.servers=prod:3\nsecurity.protocol=SASL_SSL\nsasl.mechanism=PLAIN\nsasl.username=u\n" },
+    });
     var env = try testEnv(alloc, &.{
         .{ "BOOTSTRAP_SERVERS", "env:9" },
         .{ "SASL_PASSWORD", "from-env" },
     });
     defer env.deinit();
     var src: Source = .{};
-    const cfg = try applyProps(gpa, &env, props, .{ .target = "prod" }, &src);
+    const cfg = try applyProps(gpa, &env, doc, .{ .target = "prod" }, &src);
     try std.testing.expectEqualStrings("prod:3", cfg.bootstrap_servers[0]);
     try std.testing.expectEqual(Origin.target, src.origins.get(.bootstrap_servers));
     try std.testing.expectEqualStrings("from-env", cfg.sasl_password.?);
@@ -599,14 +684,14 @@ test "applyProps: unknown and missing targets" {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const gpa = arena.allocator();
-    var props = try parse(alloc, "bootstrap.servers=b:1\ntarget.dev.bootstrap.servers=d:2\n");
-    defer props.deinit();
+    const doc = try testDoc(gpa, "bootstrap.servers=b:1\n", null, &.{
+        .{ "dev", "bootstrap.servers=d:2\n" },
+    });
     var env = try testEnv(alloc, &.{});
     defer env.deinit();
     var src: Source = .{};
-    try std.testing.expectError(error.UnknownTarget, applyProps(gpa, &env, props, .{ .target = "nope" }, &src));
-    var plain = try parse(alloc, "bootstrap.servers=b:1\n");
-    defer plain.deinit();
+    try std.testing.expectError(error.UnknownTarget, applyProps(gpa, &env, doc, .{ .target = "nope" }, &src));
+    const plain = try testDoc(gpa, "bootstrap.servers=b:1\n", null, &.{});
     var src2: Source = .{};
     try std.testing.expectError(error.UnknownTarget, applyProps(gpa, &env, plain, .{ .target = "dev" }, &src2));
     var src3: Source = .{};
@@ -618,12 +703,11 @@ test "applyProps: no target selected behaves like before" {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const gpa = arena.allocator();
-    var props = try parse(alloc, "bootstrap.servers=b:1\nlinger.ms=30\n");
-    defer props.deinit();
+    const doc = try testDoc(gpa, "bootstrap.servers=b:1\nlinger.ms=30\n", null, &.{});
     var env = try testEnv(alloc, &.{});
     defer env.deinit();
     var src: Source = .{};
-    const cfg = try applyProps(gpa, &env, props, .{}, &src);
+    const cfg = try applyProps(gpa, &env, doc, .{}, &src);
     try std.testing.expect(src.target == null);
     try std.testing.expectEqual(@as(usize, 0), src.targets.len);
     try std.testing.expectEqualStrings("b:1", cfg.bootstrap_servers[0]);
@@ -631,20 +715,43 @@ test "applyProps: no target selected behaves like before" {
     try std.testing.expectEqual(@as(u64, 30), cfg.linger_ms);
 }
 
-test "applyProps: -b flag still beats the target" {
+test "applyProps: -b flag still beats the cluster" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const gpa = arena.allocator();
-    var props = try parse(alloc, "target.dev.bootstrap.servers=d:2\n");
-    defer props.deinit();
+    const doc = try testDoc(gpa, "", null, &.{
+        .{ "dev", "bootstrap.servers=d:2\n" },
+    });
     var env = try testEnv(alloc, &.{});
     defer env.deinit();
     var src: Source = .{};
-    const cfg = try applyProps(gpa, &env, props, .{ .target = "dev", .bootstrap = "flag:9" }, &src);
+    const cfg = try applyProps(gpa, &env, doc, .{ .target = "dev", .bootstrap = "flag:9" }, &src);
     try std.testing.expectEqualStrings("flag:9", cfg.bootstrap_servers[0]);
     try std.testing.expectEqual(Origin.flag, src.origins.get(.bootstrap_servers));
     try std.testing.expectEqualStrings("dev", src.target.?);
+}
+
+test "docFromYaml maps clusters and defaults" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var diag: yaml.Diag = .{};
+    const doc = try docFromYaml(gpa, "default: dev\n" ++
+        "defaults:\n" ++
+        "  linger.ms: 20\n" ++
+        "clusters:\n" ++
+        "  dev:\n" ++
+        "    bootstrap.servers: dev:2\n" ++
+        "  prod:\n" ++
+        "    bootstrap.servers: prod:3\n", &diag);
+    try std.testing.expectEqualStrings("dev", doc.default_target.?);
+    try std.testing.expectEqualStrings("20", doc.base.get("linger.ms").?);
+    try std.testing.expectEqualStrings("dev:2", doc.clusters.get("dev").?.get("bootstrap.servers").?);
+    try std.testing.expectEqualStrings("prod:3", doc.clusters.get("prod").?.get("bootstrap.servers").?);
+    var diag2: yaml.Diag = .{};
+    try std.testing.expectError(error.Syntax, docFromYaml(gpa, "clusters\n", &diag2));
 }
 
 test "origins track the highest-precedence writer" {
