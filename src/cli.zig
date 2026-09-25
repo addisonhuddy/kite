@@ -117,14 +117,14 @@ pub const consume_usage =
 const config_help =
     "Configuration:\n" ++
     "  Flags override environment variables, which override the first\n" ++
-    "  kite.properties found in: ./kite.properties,\n" ++
-    "  $XDG_CONFIG_HOME/kite/kite.properties, ~/.config/kite/kite.properties.\n" ++
+    "  kite.yaml or kite.properties found in: ./, $XDG_CONFIG_HOME/kite/,\n" ++
+    "  ~/.config/kite/ (kite.yaml wins in each directory).\n" ++
     "  Environment: BOOTSTRAP_SERVERS, SECURITY_PROTOCOL,\n" ++
     "  SASL_MECHANISM, SASL_USERNAME, SASL_PASSWORD,\n" ++
-    "  SSL_TRUSTSTORE_LOCATION, KAFKA_PROPERTIES (path to a properties file),\n" ++
-    "  KITE_TARGET (named cluster target).\n" ++
-    "  target.NAME.key lines in the file define a named cluster; select\n" ++
-    "  it with --target NAME, KITE_TARGET, or a `target=NAME` key.\n" ++
+    "  SSL_TRUSTSTORE_LOCATION, KAFKA_PROPERTIES (path to a config file),\n" ++
+    "  KITE_TARGET (named cluster).\n" ++
+    "  kite.yaml's `clusters:` maps a name to settings; `default:` picks\n" ++
+    "  the cluster when --target/KITE_TARGET is absent.\n" ++
     "  Templates are in examples/config/.\n";
 
 pub const produce_help =
@@ -140,8 +140,8 @@ pub const produce_help =
     "  -V, --version         Print the version and exit.\n" ++
     "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
     "  --config FILE         Read this properties file instead of searching.\n" ++
-    "  --target NAME         Use cluster NAME from the properties file\n" ++
-    "                        (or $KITE_TARGET).\n" ++
+    "  --target NAME         Use cluster NAME from kite.yaml (or\n" ++
+    "                        $KITE_TARGET).\n" ++
     "  -H HEADER             Add a 'name: value' header (repeatable).\n" ++
     "  --csv                 Read RFC 4180 CSV (same as --format csv).\n" ++
     "  --key COL             Use CSV column COL as the record key; requires --csv.\n" ++
@@ -175,8 +175,8 @@ pub const consume_help =
     "Options:\n" ++
     "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
     "  --config FILE         Read this properties file instead of searching.\n" ++
-    "  --target NAME         Use cluster NAME from the properties file\n" ++
-    "                        (or $KITE_TARGET).\n" ++
+    "  --target NAME         Use cluster NAME from kite.yaml (or\n" ++
+    "                        $KITE_TARGET).\n" ++
     "  -B, --from-beginning  Start at the earliest available offset.\n" ++
     "  --offset N            Start at offset N in each selected partition.\n" ++
     "                        Cannot be combined with --from-beginning.\n" ++
@@ -223,8 +223,8 @@ pub const show_config_help =
     "Options:\n" ++
     "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
     "  --config FILE         Read this properties file instead of searching.\n" ++
-    "  --target NAME         Use cluster NAME from the properties file\n" ++
-    "                        (or $KITE_TARGET).\n" ++
+    "  --target NAME         Use cluster NAME from kite.yaml (or\n" ++
+    "                        $KITE_TARGET).\n" ++
     "  --format FMT          Output shape: json (default: text). --json is\n" ++
     "                        short for --format json.\n" ++
     "  -q, --quiet           Suppress the config-source note on stderr.\n" ++

@@ -6,7 +6,7 @@ complete -c kite -l show-config -d 'Show the effective configuration'
 complete -c kite -s V -l version -d 'Print the version'
 complete -c kite -s b -l bootstrap -d 'Comma-separated host:port brokers' -x
 complete -c kite -l config -d 'Read this properties file' -rF
-complete -c kite -l target -d 'Use cluster NAME from the properties file' -xa '(begin; test -f kite.properties; and sed -n "s/^target\.\([A-Za-z0-9_-]*\)\..*/\1/p" kite.properties | sort -u; end)'
+complete -c kite -l target -d 'Use cluster NAME from kite.yaml' -xa '(begin; test -f kite.yaml; and awk "/^clusters:/{f=1;next} f&&/^[^ ]/{f=0} f&&/^  [A-Za-z0-9_-]+:/{sub(/^  /,\"\");sub(/:.*/,\"\");print}" kite.yaml | sort -u; end)'
 complete -c kite -l format -d 'Record shape' -xa 'value tsv json csv'
 complete -c kite -l json -d 'One JSON object per record (--format json)'
 complete -c kite -s q -l quiet -d 'Suppress summary and progress lines'

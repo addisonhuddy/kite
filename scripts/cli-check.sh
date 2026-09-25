@@ -200,21 +200,25 @@ rm "$TMP/work/kite.properties"
 
 run_case show-config-conflict 1 empty "kite: --show-config cannot be combined with --consume" -c --show-config demo
 
-# --target: named cluster targets in the properties file.
+# --target: named clusters in kite.yaml.
 run_case target-missing-value 1 empty "kite: --target requires a value" --target
 run_case target-no-file 1 empty "requires a properties file" --target x demo
-cat >"$TMP/work/kite.properties" <<'EOF'
-bootstrap.servers=base:1
-linger.ms=20
-target.dev.bootstrap.servers=dev:2
-target.prod.bootstrap.servers=prod:3
+cat >"$TMP/work/kite.yaml" <<'EOF'
+defaults:
+  linger.ms: 20
+  bootstrap.servers: base:1
+clusters:
+  dev:
+    bootstrap.servers: dev:2
+  prod:
+    bootstrap.servers: prod:3
 EOF
 set +e
 (cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" --target x --show-config >"$TMP/target-unknown.out" 2>"$TMP/target-unknown.err")
 status=$?
 set -e
 [ "$status" -eq 1 ] \
-    && grep -Fq "no target 'x'" "$TMP/target-unknown.err" \
+    && grep -Fq "no cluster 'x'" "$TMP/target-unknown.err" \
     && grep -Fq "available: dev, prod" "$TMP/target-unknown.err" || {
     echo "FAIL target-unknown"; cat "$TMP/target-unknown.err"; exit 1;
 }
@@ -230,7 +234,16 @@ set -e
     echo "FAIL target-json"; cat "$TMP/target-json.out"; cat "$TMP/target-json.err"; exit 1;
 }
 echo "PASS target-json"
-printf 'bootstrap.servers=base:1\ntarget=dev\ntarget.dev.bootstrap.servers=dev:2\n' >"$TMP/work/kite.properties"
+printf 'bootstrap.servers=base:1\n' >"$TMP/work/kite.properties"
+rm "$TMP/work/kite.yaml"
+run_case target-properties-file 1 empty "properties files define a single cluster" --target dev demo
+rm "$TMP/work/kite.properties"
+cat >"$TMP/work/kite.yaml" <<'EOF'
+default: dev
+clusters:
+  dev:
+    bootstrap.servers: dev:2
+EOF
 set +e
 (cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" --show-config --json >"$TMP/target-default.out" 2>"$TMP/target-default.err")
 status=$?
@@ -241,7 +254,24 @@ set -e
     echo "FAIL target-default"; cat "$TMP/target-default.out"; cat "$TMP/target-default.err"; exit 1;
 }
 echo "PASS target-default"
-rm "$TMP/work/kite.properties"
+printf 'default: dev\nclusters\n  dev:\n' >"$TMP/work/kite.yaml"
+run_case target-yaml-syntax 1 empty "kite.yaml:2: missing ':'" demo
+cat >"$TMP/work/foo.yml" <<'EOF'
+clusters:
+  prod:
+    bootstrap.servers: prod:3
+EOF
+rm "$TMP/work/kite.yaml"
+set +e
+(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" --config foo.yml --target prod --show-config --json >"$TMP/target-yml.out" 2>"$TMP/target-yml.err")
+status=$?
+set -e
+[ "$status" -eq 0 ] \
+    && grep -Fq '"target":"prod"' "$TMP/target-yml.out" \
+    && grep -Fq '"bootstrap.servers":{"value":"prod:3","source":"target"}' "$TMP/target-yml.out" || {
+    echo "FAIL target-yml"; cat "$TMP/target-yml.out"; cat "$TMP/target-yml.err"; exit 1;
+}
+echo "PASS target-yml"
 
 grep -Fq "Try 'kite --help' for examples." "$TMP/unknown-option.err"
 grep -Fq "Try 'kite -c --help' for examples." "$TMP/consume-unknown.err"

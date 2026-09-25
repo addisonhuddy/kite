@@ -305,7 +305,7 @@ kite --version                Print the version.
 | --- | --- | --- |
 | produce, consume | `-b`, `--bootstrap HOSTS` | Comma-separated `host:port` brokers (overrides env and file). |
 | produce, consume | `--config FILE` | Read this properties file instead of searching. |
-| produce, consume | `--target NAME` | Use cluster `NAME` from the properties file (or `$KITE_TARGET`). |
+| produce, consume | `--target NAME` | Use cluster `NAME` from kite.yaml (or `$KITE_TARGET`). |
 | produce, consume | `--format FMT` | Record shape: `value`, `tsv`, `json` (default `auto`). |
 | produce | `--format csv` | RFC 4180 CSV input (produce only); same as `--csv`. |
 | produce, consume | `--json` | Alias for `--format json`. |
@@ -358,7 +358,7 @@ kite -c -B --json src | kite --json dst
 kite -c -B raw | jq -c '{id, ts}' | kite clean
 # one-off broker without a config file
 kite -b broker1:9092,broker2:9092 -c -B -n 5 events
-# named cluster from the properties file (see "Multiple clusters" below)
+# named cluster from kite.yaml (see "Multiple clusters" below)
 kite --target prod events < examples/data/lines.txt
 ```
 
@@ -465,17 +465,20 @@ Settings are resolved in this order, highest precedence first:
 
 1. Flags: `-b`/`--bootstrap HOSTS`.
 2. Environment variables (below).
-3. A properties file: `--config FILE`, else `$KAFKA_PROPERTIES`, else the first of
-   `./kite.properties`, `$XDG_CONFIG_HOME/kite/kite.properties`,
-   `~/.config/kite/kite.properties`.
+3. A config file: `--config FILE`, else `$KAFKA_PROPERTIES`, else the first of
+   `./kite.yaml`, `./kite.properties`,
+   `$XDG_CONFIG_HOME/kite/kite.yaml`, `$XDG_CONFIG_HOME/kite/kite.properties`,
+   `~/.config/kite/kite.yaml`, `~/.config/kite/kite.properties`.
 
 A file is optional when `-b` or `BOOTSTRAP_SERVERS` supplies the
 brokers. With none of these, kite fails with a message listing all three
 ways to configure it. A `--config`/`KAFKA_PROPERTIES` path that does not exist is
 an error rather than a silent fallback. `-v` prints which sources were used.
 
-The parser supports a `key=value` subset of Java properties. Blank lines and
-`#`/`!` comments are accepted; unknown keys are ignored with a warning.
+The properties parser supports a `key=value` subset of Java properties.
+Blank lines and `#`/`!` comments are accepted; unknown keys are ignored
+with a warning. `.yaml`/`.yml` files are parsed as a strict YAML subset
+(see "Multiple clusters" below).
 
 Environment variable names are the Kafka property names upper-cased with `.`
 replaced by `_`, so `bootstrap.servers` becomes `BOOTSTRAP_SERVERS`.
@@ -500,40 +503,49 @@ processing.
 
 ### Multiple clusters (targets)
 
-One properties file can hold several clusters. `target.NAME.key=value`
-defines `key` (any key from the table above) for the cluster called `NAME`;
-unprefixed keys remain shared defaults. Names match `[A-Za-z0-9_-]+`.
+`kite.yaml` holds several clusters. `clusters:` maps each name to its
+settings (any key from the table above); `defaults:` holds shared
+settings applied to every cluster; `default:` names the cluster used
+when nothing selects one. Cluster names match `[A-Za-z0-9_-]+`.
 
-```properties
-# shared defaults
-linger.ms=20
-target=dev
+```yaml
+default: dev
 
-target.dev.bootstrap.servers=localhost:9092
+defaults:
+  linger.ms: 20
 
-target.prod.bootstrap.servers=pkc-xyz.us-east-1.aws.confluent.cloud:9092
-target.prod.security.protocol=SASL_SSL
-target.prod.sasl.mechanism=PLAIN
-target.prod.sasl.username=KEY
-target.prod.sasl.password=SECRET
+clusters:
+  dev:
+    bootstrap.servers: localhost:9092
+  prod:
+    bootstrap.servers: pkc-xyz.us-east-1.aws.confluent.cloud:9092
+    security.protocol: SASL_SSL
+    sasl.mechanism: PLAIN
+    sasl.username: KEY
+    sasl.password: SECRET
 ```
 
-The target is selected by, in order: `--target NAME`, `$KITE_TARGET`, the
-file's own `target=NAME` key, else no target and only the unprefixed keys
-apply. Passing `--target` without any properties file is an error, as is
-selecting a name the file does not define.
+Only a strict YAML subset is parsed: block mappings, plain and quoted
+scalars, comments. Lists, flow syntax, anchors, and block scalars are
+rejected with a `file:line` error.
 
-Within a target, value precedence is: flags > the target's `target.NAME.*`
-keys > environment > base keys > defaults. A named target is a complete
-cluster definition, so ambient `BOOTSTRAP_SERVERS` cannot silently
+The cluster is selected by, in order: `--target NAME`, `$KITE_TARGET`,
+the file's own `default:` key, else no cluster and only `defaults:`/
+unprefixed keys apply. Passing `--target` without any config file is an
+error, as is selecting a name the file does not define — including any
+name on a properties file, which always describes a single cluster.
+
+Within a cluster, value precedence is: flags > the cluster's keys >
+environment > `defaults:`/base keys > built-in defaults. A named cluster
+is a complete definition, so ambient `BOOTSTRAP_SERVERS` cannot silently
 redirect `--target prod`; environment variables still fill in keys the
-target omits (for example `SASL_PASSWORD` while the target supplies the
-brokers).
+cluster omits (for example `SASL_PASSWORD` while the cluster supplies
+the brokers).
 
 `kite --show-config` prints the selected name on a `target:` line and
-reports `target` as the origin of keys that came from `target.NAME.*`; the
-JSON form adds `"target"` and `"targets"` (all names defined in the file).
-See [`examples/config/targets.properties`](examples/config/targets.properties).
+reports `target` as the origin of keys that came from the cluster; the
+JSON form adds `"target"` and `"targets"` (all names defined in the
+file). See [`examples/config/kite.yaml`](examples/config/kite.yaml).
 
 ### Inspecting the effective configuration
 

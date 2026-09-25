@@ -1,0 +1,25 @@
+# copy to ./kite.yaml (or ~/.config/kite/kite.yaml)
+# One file, several clusters. `clusters:` maps each name to its settings
+# (the same dotted keys kite.properties uses). `defaults:` holds shared
+# settings applied to every cluster. `default:` picks the cluster used
+# when neither --target nor $KITE_TARGET is given.
+
+default: dev
+
+defaults:
+  linger.ms: 20
+
+clusters:
+  dev:
+    bootstrap.servers: localhost:9092
+
+  staging:
+    bootstrap.servers: staging.example.com:9092
+    security.protocol: SSL
+
+  prod:
+    bootstrap.servers: pkc-xyz.us-east-1.aws.confluent.cloud:9092
+    security.protocol: SASL_SSL
+    sasl.mechanism: PLAIN
+    sasl.username: KEY
+    sasl.password: SECRET

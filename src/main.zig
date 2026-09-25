@@ -5,6 +5,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const client = @import("client.zig");
 const cli_args = @import("cli.zig");
+const yaml = @import("yaml.zig");
 const protocol = @import("protocol.zig");
 const transport = @import("transport.zig");
 const scram = @import("scram.zig");
@@ -19,6 +20,7 @@ comptime {
     _ = config;
     _ = client;
     _ = cli_args;
+    _ = yaml;
     _ = protocol;
     _ = transport;
     _ = scram;
@@ -402,7 +404,7 @@ fn note(comptime fmt: []const u8, args: anytype) void {
         out("kite: " ++ fmt ++ "\n", args);
 }
 
-const search_path_hint = "./kite.properties, $XDG_CONFIG_HOME/kite/kite.properties, ~/.config/kite/kite.properties";
+const search_path_hint = "./kite.yaml, ./kite.properties, $XDG_CONFIG_HOME/kite/, ~/.config/kite/";
 
 /// Resolve configuration from flags, environment and properties file.
 var dummy_source: config.Source = .{};
@@ -431,11 +433,14 @@ fn loadConfig(init: std.process.Init, alloc: std.mem.Allocator, common: cli_args
             "--target requires a properties file (searched {s})",
             .{search_path_hint},
         ),
+        error.ConfigSyntax => fatal("{s}:{d}: {s}", .{ source.file.?, source.diag.line, source.diag.msg }),
         error.UnknownTarget => {
+            if (source.file_kind == .properties)
+                fatal("no cluster '{s}' in {s} (properties files define a single cluster; use kite.yaml for several)", .{ source.target.?, source.file.? });
             if (source.targets.len == 0)
-                fatal("no target '{s}' in {s} (file defines no targets)", .{ source.target.?, source.file.? });
+                fatal("no cluster '{s}' in {s} (file defines no clusters)", .{ source.target.?, source.file.? });
             const names = std.mem.join(alloc, ", ", source.targets) catch fatal("out of memory", .{});
-            fatal("no target '{s}' in {s} (available: {s})", .{ source.target.?, source.file.?, names });
+            fatal("no cluster '{s}' in {s} (available: {s})", .{ source.target.?, source.file.?, names });
         },
         error.OutOfMemory => fatal("out of memory", .{}),
     };
@@ -448,7 +453,7 @@ fn loadConfig(init: std.process.Init, alloc: std.mem.Allocator, common: cli_args
             if (source.file) |f| f else if (!source.env and !source.flags) "(nothing)" else "",
         });
         if (source.env and source.file != null) std.debug.print("kite: (env overrides file)\n", .{});
-        if (source.target) |t| std.debug.print("kite: target '{s}'\n", .{t});
+        if (source.target) |t| std.debug.print("kite: cluster '{s}'\n", .{t});
     }
     return cfg;
 }
