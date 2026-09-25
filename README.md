@@ -64,6 +64,84 @@ unchanged. For a fuller check against the same image, `scripts/e2e-docker.sh`
 runs the whole broker-backed suite in a throwaway container; see
 [TESTING.md](TESTING.md#docker-harness).
 
+### Remapped ports and several brokers: advertised listeners
+
+`-b HOST:PORT` is only how kite finds the *first* broker. The metadata
+that broker returns lists every broker by its **advertised listener**
+(`advertised.listeners`), and kite connects to those addresses for the
+actual produce and fetch traffic. If they are not reachable from where
+kite runs, the bootstrap connection succeeds and the very next step
+fails with `connection refused` or a timeout.
+
+The default image advertises `localhost:9092`, which is why the
+`-p 127.0.0.1:9092:9092` mapping above works and why simply remapping
+the host port does not: with `-p 19092:9092` the broker still tells kite
+to come back on `localhost:9092`. Set the advertised address to what the
+host sees. Any `KAFKA_*` variable replaces the image's whole default
+config, so the KRaft basics have to come along:
+
+```sh
+docker run -d --name kite-kafka -p 127.0.0.1:19092:9092 \
+  -e KAFKA_NODE_ID=1 \
+  -e KAFKA_PROCESS_ROLES=broker,controller \
+  -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+  -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+  -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+  -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:19092 \
+  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+  apache/kafka:4.0.0
+
+until kite -q -b localhost:19092 probe </dev/null 2>/dev/null; do sleep 2; done
+```
+
+The readiness loop from the previous section will *not* work here:
+`kafka-topics.sh` inside the container follows the same advertised
+address, and `localhost:19092` means nothing in there. Probe from the
+host with kite instead, as shown (an empty produce creates the topic
+and exits 0 once the broker answers).
+
+With several brokers each one needs its own host port *and* its own
+advertised address on that port, while brokers keep talking to each
+other over the Docker network. Two listeners per broker do that:
+`INTERNAL` (container names, used between brokers) and `EXTERNAL` (what
+the host sees). The common settings, then one container per broker:
+
+```sh
+docker network create kafka-net
+common=(
+  -e KAFKA_PROCESS_ROLES=broker,controller
+  -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka-1:9093,2@kafka-2:9093
+  -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
+  -e KAFKA_LISTENERS=INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+  -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+  -e KAFKA_INTER_BROKER_LISTENER_NAME=INTERNAL
+  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=2
+  -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=2
+  -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
+  -e CLUSTER_ID=5L6g3nShT-eMCtK--X86sw
+)
+docker run -d --name kafka-1 --network kafka-net -p 127.0.0.1:9092:9092 "${common[@]}" \
+  -e KAFKA_NODE_ID=1 \
+  -e KAFKA_ADVERTISED_LISTENERS=INTERNAL://kafka-1:29092,EXTERNAL://localhost:9092 \
+  apache/kafka:4.0.0
+docker run -d --name kafka-2 --network kafka-net -p 127.0.0.1:9093:9092 "${common[@]}" \
+  -e KAFKA_NODE_ID=2 \
+  -e KAFKA_ADVERTISED_LISTENERS=INTERNAL://kafka-2:29092,EXTERNAL://localhost:9093 \
+  apache/kafka:4.0.0
+
+kite -b localhost:9092,localhost:9093 -c -B events
+```
+
+The same rule explains the classic symptoms on any deployment, not just
+Docker: a broker that advertises an internal hostname (`kafka-1`, a
+private IP, a Kubernetes service name) is reachable for bootstrap through
+a tunnel or port-forward yet fails right after, because kite is being
+sent to an address only the cluster's own network can resolve. The
+error names the advertised address (`connection refused by kafka-1:9092`),
+and `kite -v` logs `connected broker N at HOST:PORT` for each one it
+reaches. Fix it on the broker side; a client cannot rewrite those
+addresses.
+
 ## Quickstart
 
 You need a reachable Kafka 4.0+ broker (`localhost:9092` below, e.g. the
@@ -291,13 +369,15 @@ for every shell present on the machine and asserts that options complete.
 ## Command reference
 
 Produce is the default mode. `-c`/`--consume` switches to consume,
-`--show-config` prints the effective configuration. Mode flags may appear
-anywhere on the command line; there are no reserved topic names.
+`--show-config` prints the effective configuration, `--targets` lists
+the clusters in kite.yaml. Mode flags may appear anywhere on the command
+line; there are no reserved topic names.
 
 ```text
 kite [OPTIONS] TOPIC          Produce stdin lines to TOPIC (default).
 kite -c [OPTIONS] TOPIC       Consume TOPIC to stdout.
 kite --show-config            Show the effective configuration.
+kite --targets                List the clusters defined in kite.yaml.
 kite --version                Print the version.
 ```
 
@@ -305,7 +385,7 @@ kite --version                Print the version.
 | --- | --- | --- |
 | produce, consume | `-b`, `--bootstrap HOSTS` | Comma-separated `host:port` brokers (overrides env and file). |
 | produce, consume | `--config FILE` | Read this properties file instead of searching. |
-| produce, consume | `--target NAME` | Use cluster `NAME` from kite.yaml (or `$KITE_TARGET`). |
+| produce, consume | `--target NAME`, `@NAME` | Use cluster `NAME` from kite.yaml (or `$KITE_TARGET`). |
 | produce, consume | `--format FMT` | Record shape: `value`, `tsv`, `json` (default `auto`). |
 | produce | `--format csv` | RFC 4180 CSV input (produce only); same as `--csv`. |
 | produce, consume | `--json` | Alias for `--format json`. |
@@ -322,7 +402,8 @@ kite --version                Print the version.
 | produce, consume | `-v`, `--verbose` | Connection, retry, and fetch diagnostics on stderr. |
 | all | `-h`, `--help` | Plain-text help for the selected mode. |
 
-`kite --help`, `kite -c --help`, and `kite --show-config --help` print the full pages.
+`kite --help`, `kite -c --help`, `kite --show-config --help`, and
+`kite --targets --help` print the full pages.
 
 ## Common recipes
 
@@ -359,7 +440,10 @@ kite -c -B raw | jq -c '{id, ts}' | kite clean
 # one-off broker without a config file
 kite -b broker1:9092,broker2:9092 -c -B -n 5 events
 # named cluster from kite.yaml (see "Multiple clusters" below)
-kite --target prod events < examples/data/lines.txt
+kite @prod events < examples/data/lines.txt
+kite --target prod events < examples/data/lines.txt   # same thing
+# which clusters are there, and which one is selected?
+kite --targets
 ```
 
 The consumer output is in the same textual shape accepted by the producer,
@@ -535,6 +619,35 @@ unprefixed keys apply. Passing `--target` without any config file is an
 error, as is selecting a name the file does not define — including any
 name on a properties file, which always describes a single cluster.
 
+`@NAME` is short for `--target NAME` and goes anywhere on the command
+line, so switching clusters is one word: `kite @prod events`,
+`kite -c @local-b -B events`. A bare `@` is an error; two different
+clusters on one command line (`@prod --target dev`) are rejected rather
+than letting the last one win. Topics never start with `@`, so there is
+no ambiguity.
+
+`kite --targets` lists the clusters, one per line and sorted, with ` *`
+after the one that `--target`/`@NAME`/`$KITE_TARGET`/`default:` would
+select, and a note on stderr naming the file it read (`-q` drops the
+note). It reads only the `clusters:` keys and never resolves a
+configuration or connects to a broker, so it works even while a cluster
+is still half written or lacks `bootstrap.servers`. `--json` yields
+`{"file":..,"target":..,"targets":[..]}`. It exits 1 when there is no
+config file at all or the selected name is not defined.
+
+```sh
+$ kite --targets
+dev *
+prod
+kite: clusters from ./kite.yaml
+$ kite --targets --json | jq -r '.targets[]'
+dev
+prod
+```
+
+Shell completion follows suit: after `--target ` or `@`, the Bash
+completion offers the cluster names from `./kite.yaml`.
+
 Within a cluster, value precedence is: flags > the cluster's keys >
 environment > `defaults:`/base keys > built-in defaults. A named cluster
 is a complete definition, so ambient `BOOTSTRAP_SERVERS` cannot silently
@@ -616,6 +729,11 @@ First run against a local broker:
   Start the broker (see [Run Kafka locally with Docker](#run-kafka-locally-with-docker))
   and wait for the readiness loop to finish; `docker ps --filter
   name=kite-kafka` shows whether the container is up.
+- **Bootstrap works, then `connection refused by HOST:PORT` for another
+  address (or a hang) on the first produce/fetch:** the broker advertises
+  an address kite cannot reach — typical after remapping the Docker port
+  or with several brokers on one host. See
+  [advertised listeners](#remapped-ports-and-several-brokers-advertised-listeners).
 - **`Cannot connect to the Docker daemon` / `docker: command not found`:**
   start Docker Desktop or `sudo systemctl start docker`, or install Docker;
   on Linux, add your user to the `docker` group to run without `sudo`.

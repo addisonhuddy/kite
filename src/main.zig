@@ -141,6 +141,10 @@ pub fn main(init: std.process.Init) !void {
             runShowConfig(init, mode_args.rest, alloc);
             return;
         },
+        .list_targets => {
+            runListTargets(init, mode_args.rest, alloc);
+            return;
+        },
         .produce => {},
     }
     const parsed = cli_args.parseProduce(alloc, mode_args.rest);
@@ -434,14 +438,7 @@ fn loadConfig(init: std.process.Init, alloc: std.mem.Allocator, common: cli_args
             .{search_path_hint},
         ),
         error.ConfigSyntax => fatal("{s}:{d}: {s}", .{ source.file.?, source.diag.line, source.diag.msg }),
-        error.UnknownTarget => {
-            if (source.file_kind == .properties)
-                fatal("no cluster '{s}' in {s} (properties files define a single cluster; use kite.yaml for several)", .{ source.target.?, source.file.? });
-            if (source.targets.len == 0)
-                fatal("no cluster '{s}' in {s} (file defines no clusters)", .{ source.target.?, source.file.? });
-            const names = std.mem.join(alloc, ", ", source.targets) catch fatal("out of memory", .{});
-            fatal("no cluster '{s}' in {s} (available: {s})", .{ source.target.?, source.file.?, names });
-        },
+        error.UnknownTarget => unknownTargetFatal(alloc, source),
         error.OutOfMemory => fatal("out of memory", .{}),
     };
     cfg.verbose = common.verbose;
@@ -456,6 +453,15 @@ fn loadConfig(init: std.process.Init, alloc: std.mem.Allocator, common: cli_args
         if (source.target) |t| std.debug.print("kite: cluster '{s}'\n", .{t});
     }
     return cfg;
+}
+
+fn unknownTargetFatal(alloc: std.mem.Allocator, source: *config.Source) noreturn {
+    if (source.file_kind == .properties)
+        fatal("no cluster '{s}' in {s} (properties files define a single cluster; use kite.yaml for several)", .{ source.target.?, source.file.? });
+    if (source.targets.len == 0)
+        fatal("no cluster '{s}' in {s} (file defines no clusters)", .{ source.target.?, source.file.? });
+    const names = std.mem.join(alloc, ", ", source.targets) catch fatal("out of memory", .{});
+    fatal("no cluster '{s}' in {s} (available: {s})", .{ source.target.?, source.file.?, names });
 }
 
 /// True when a missing topic should be created: automatically when stderr
@@ -494,16 +500,21 @@ fn createAndResolve(cli: *client.Client, topic: []const u8, access: []const u8, 
         else => fatalErr(cli, "could not create topic"),
     };
     if (!quiet) note("created topic '{s}'", .{topic});
+    const max_attempts = 10;
+    const retry_ms = 200;
     var attempt: usize = 0;
     while (true) {
         if (cli.refreshMetadata(topic)) |_| {
+            if (attempt > 0 and !quiet) note("topic '{s}' is ready", .{topic});
             return;
         } else |err| switch (err) {
             error.TopicNotFound, error.MetadataFailed => {
                 attempt += 1;
-                if (attempt >= 10)
-                    fatalErr(cli, "metadata lookup failed after creating topic");
-                cli.sleep(200);
+                if (attempt >= max_attempts)
+                    fatalErr(cli, "topic was created but its metadata did not appear in time; retry the command in a moment");
+                if (attempt == 1 and !quiet)
+                    note("waiting for the cluster to publish metadata for '{s}' (up to {d} ms) ...", .{ topic, max_attempts * retry_ms });
+                cli.sleep(retry_ms);
             },
             error.TopicAuthorizationFailed => fatal(
                 "not authorized to {s} topic '{s}' (check ACLs for this principal; on managed clusters this is also what a missing topic looks like)",
@@ -704,6 +715,71 @@ fn runShowConfig(init: std.process.Init, args: []const []const u8, alloc: std.me
         }
     }
     if (json_mode) outw.writeAll("}}\n") catch {};
+    outw.flush() catch {};
+    std.process.exit(0);
+}
+
+/// `kite --targets`: list the clusters in the config file without
+/// resolving an effective Config, so incomplete clusters still list.
+fn runListTargets(init: std.process.Init, args: []const []const u8, alloc: std.mem.Allocator) noreturn {
+    const parsed = cli_args.parseListTargets(alloc, args);
+    const common = switch (parsed) {
+        .help => {
+            if (term.detect(init.io, std.Io.File.stdout(), init.environ_map)) {
+                term.color.enabled = true;
+                const page = term.renderHelp(alloc, cli_args.list_targets_help) catch fatal("out of memory", .{});
+                writeText(init, std.Io.File.stdout(), page);
+            } else writeText(init, std.Io.File.stdout(), cli_args.list_targets_help);
+            std.process.exit(0);
+        },
+        .err => |message| parseFatal(init, message, cli_args.list_targets_usage),
+        .ok => |value| value.common,
+    };
+
+    var source: config.Source = .{};
+    const targets = config.listTargets(init.io, alloc, init.environ_map, .{
+        .config_path = common.config_path,
+        .target = common.target,
+    }, &source) catch |err| switch (err) {
+        error.ConfigNotFound => fatal("no config file found (searched {s}); see 'kite --help' for the file format", .{search_path_hint}),
+        error.ConfigFileNotFound => fatal("config file '{s}' not found", .{source.requested.?}),
+        error.ConfigFileUnreadable => fatal("cannot read config file '{s}'", .{source.requested.?}),
+        error.ConfigSyntax => fatal("{s}:{d}: {s}", .{ source.file.?, source.diag.line, source.diag.msg }),
+        error.UnknownTarget => unknownTargetFatal(alloc, &source),
+        error.OutOfMemory => fatal("out of memory", .{}),
+        else => unreachable,
+    };
+
+    var stdout_buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writer(init.io, &stdout_buf);
+    const outw = &w.interface;
+    if (common.format == .json) {
+        outw.writeAll("{\"file\":") catch {};
+        json.writeString(outw, source.file.?) catch {};
+        outw.writeAll(",\"target\":") catch {};
+        if (targets.selected) |t| json.writeString(outw, t) catch {} else outw.writeAll("null") catch {};
+        outw.writeAll(",\"targets\":[") catch {};
+        for (targets.names, 0..) |t, i| {
+            if (i > 0) outw.writeByte(',') catch {};
+            json.writeString(outw, t) catch {};
+        }
+        outw.writeAll("]}\n") catch {};
+    } else {
+        for (targets.names) |t| {
+            outw.writeAll(t) catch {};
+            if (targets.selected) |sel| {
+                if (std.mem.eql(u8, sel, t)) outw.writeAll(" *") catch {};
+            }
+            outw.writeByte('\n') catch {};
+        }
+        if (!common.quiet) {
+            term.color.enabled = std.Io.File.stderr().isTty(init.io) catch false;
+            if (targets.names.len == 0)
+                note("{s} defines no clusters", .{source.file.?})
+            else
+                note("clusters from {s}", .{source.file.?});
+        }
+    }
     outw.flush() catch {};
     std.process.exit(0);
 }

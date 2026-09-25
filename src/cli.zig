@@ -15,6 +15,8 @@ pub const Common = struct {
     bootstrap: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
     target: ?[]const u8 = null,
+    /// First spelling that set `target` (`--target NAME` or `@NAME`).
+    target_spelling: ?[]const u8 = null,
 };
 
 pub const ProduceArgs = struct {
@@ -53,9 +55,23 @@ pub const Mode = enum {
     produce,
     consume,
     show_config,
+    list_targets,
+
+    fn flag(m: Mode) []const u8 {
+        return switch (m) {
+            .produce => "",
+            .consume => "--consume",
+            .show_config => "--show-config",
+            .list_targets => "--targets",
+        };
+    }
 };
 
 pub const ShowConfigArgs = struct {
+    common: Common = .{},
+};
+
+pub const ListTargetsArgs = struct {
     common: Common = .{},
 };
 
@@ -90,14 +106,23 @@ pub fn splitMode(alloc: std.mem.Allocator, args: []const []const u8) Result(Mode
             value_follows = false;
             continue;
         }
-        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--consume")) {
-            if (mode == .show_config)
-                return .{ .err = "--show-config cannot be combined with --consume" };
-            mode = .consume;
-        } else if (std.mem.eql(u8, arg, "--show-config")) {
-            if (mode == .consume)
-                return .{ .err = "--show-config cannot be combined with --consume" };
-            mode = .show_config;
+        const wanted: ?Mode = if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--consume"))
+            .consume
+        else if (std.mem.eql(u8, arg, "--show-config"))
+            .show_config
+        else if (std.mem.eql(u8, arg, "--targets"))
+            .list_targets
+        else
+            null;
+        if (wanted) |m| {
+            if (mode != .produce and mode != m) {
+                // Fixed order (later-declared mode first) so the message
+                // reads the same whichever order the flags were given in.
+                const a = if (@intFromEnum(m) > @intFromEnum(mode)) m else mode;
+                const b = if (@intFromEnum(m) > @intFromEnum(mode)) mode else m;
+                return .{ .err = errMsg(alloc, "{s} cannot be combined with {s}", .{ a.flag(), b.flag() }) };
+            }
+            mode = m;
         } else {
             rest.append(alloc, arg) catch return .{ .err = "out of memory" };
             value_follows = takesSeparateValue(arg);
@@ -134,13 +159,14 @@ pub const produce_help =
     "  kite [OPTIONS] TOPIC          Produce stdin lines to TOPIC (default).\n" ++
     "  kite -c [OPTIONS] TOPIC       Consume TOPIC to stdout. See 'kite -c --help'.\n" ++
     "  kite --show-config  Show the effective configuration; never connects.\n" ++
+    "  kite --targets      List the clusters in kite.yaml; never connects.\n" ++
     "\n" ++
     "Options:\n" ++
     "  -c, --consume         Consume instead of produce.\n" ++
     "  -V, --version         Print the version and exit.\n" ++
     "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
     "  --config FILE         Read this properties file instead of searching.\n" ++
-    "  --target NAME         Use cluster NAME from kite.yaml (or\n" ++
+    "  --target NAME, @NAME  Use cluster NAME from kite.yaml (or\n" ++
     "                        $KITE_TARGET).\n" ++
     "  -H HEADER             Add a 'name: value' header (repeatable).\n" ++
     "  --csv                 Read RFC 4180 CSV (same as --format csv).\n" ++
@@ -161,7 +187,7 @@ pub const produce_help =
     "  kite -b localhost:9092 events < examples/data/lines.txt\n" ++
     "  kite -H 'source: import' events < examples/data/headers.tsv\n" ++
     "  kite --csv --key user_id events < examples/data/events.csv\n" ++
-    "  kite --target prod events < examples/data/lines.txt\n" ++
+    "  kite @prod events < examples/data/lines.txt\n" ++
     "  kite -c --json src | kite --json dst\n" ++
     "\n" ++
     config_help;
@@ -175,7 +201,7 @@ pub const consume_help =
     "Options:\n" ++
     "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
     "  --config FILE         Read this properties file instead of searching.\n" ++
-    "  --target NAME         Use cluster NAME from kite.yaml (or\n" ++
+    "  --target NAME, @NAME  Use cluster NAME from kite.yaml (or\n" ++
     "                        $KITE_TARGET).\n" ++
     "  -B, --from-beginning  Start at the earliest available offset.\n" ++
     "  --offset N            Start at offset N in each selected partition.\n" ++
@@ -206,7 +232,7 @@ pub const consume_help =
     "  kite -c -B --idle 3s events\n" ++
     "  kite -c --partition 0 --offset 42 -n 10 --idle 3s events\n" ++
     "  kite -c -B --json events | jq -c .value\n" ++
-    "  kite -c --target prod events\n" ++
+    "  kite -c @prod events\n" ++
     "\n" ++
     config_help;
 
@@ -223,7 +249,7 @@ pub const show_config_help =
     "Options:\n" ++
     "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
     "  --config FILE         Read this properties file instead of searching.\n" ++
-    "  --target NAME         Use cluster NAME from kite.yaml (or\n" ++
+    "  --target NAME, @NAME  Use cluster NAME from kite.yaml (or\n" ++
     "                        $KITE_TARGET).\n" ++
     "  --format FMT          Output shape: json (default: text). --json is\n" ++
     "                        short for --format json.\n" ++
@@ -239,6 +265,40 @@ pub const show_config_help =
     "Examples:\n" ++
     "  kite --show-config\n" ++
     "  kite --show-config --json | jq '.settings[\"bootstrap.servers\"]'\n" ++
+    "\n" ++
+    config_help;
+
+pub const list_targets_usage =
+    "Usage: kite --targets [OPTIONS]\n" ++
+    "Try 'kite --targets --help' for details.\n";
+
+pub const list_targets_help =
+    "kite --targets - List the clusters defined in kite.yaml\n" ++
+    "\n" ++
+    "Usage:\n" ++
+    "  kite --targets [OPTIONS]\n" ++
+    "\n" ++
+    "Options:\n" ++
+    "  --config FILE         Read this config file instead of searching.\n" ++
+    "  --target NAME, @NAME  Mark cluster NAME as selected instead of\n" ++
+    "                        $KITE_TARGET or the file's default.\n" ++
+    "  --format FMT          Output shape: json (default: text). --json is\n" ++
+    "                        short for --format json.\n" ++
+    "  -q, --quiet           Suppress the config-source note on stderr.\n" ++
+    "  -v, --verbose         Write diagnostics to stderr.\n" ++
+    "  -h, --help            Show this help and exit.\n" ++
+    "\n" ++
+    "Prints one cluster name per line, sorted, with '*' after the one that\n" ++
+    "--target/$KITE_TARGET/`default:` selects; the JSON form is\n" ++
+    "{\"file\":..,\"target\":..,\"targets\":[..]}. Only the file's `clusters:` keys\n" ++
+    "are read, so it works even when a cluster is incomplete. kite never\n" ++
+    "connects to a broker. Exits 1 with a message when no config file is\n" ++
+    "found or the selected cluster is not defined.\n" ++
+    "\n" ++
+    "Examples:\n" ++
+    "  kite --targets\n" ++
+    "  kite --targets --json | jq -r '.targets[]'\n" ++
+    "  kite --targets --config kafka-configs.yaml\n" ++
     "\n" ++
     config_help;
 
@@ -303,9 +363,10 @@ pub fn parseHeaderArg(s: []const u8) !protocol.Header {
 const produce_only = [_][]const u8{ "-H", "--csv", "--key" };
 const consume_only = [_][]const u8{ "-B", "--from-beginning", "--offset", "--partition", "-n", "--max", "-t", "--idle", "-f", "--follow" };
 
-const produce_options = [_][]const u8{ "--consume", "--version", "--bootstrap", "--config", "--target", "--format", "--json", "--csv", "--key", "--quiet", "--verbose", "--help", "--show-config" };
+const produce_options = [_][]const u8{ "--consume", "--version", "--bootstrap", "--config", "--target", "--targets", "--format", "--json", "--csv", "--key", "--quiet", "--verbose", "--help", "--show-config" };
 const consume_options = [_][]const u8{ "--consume", "--bootstrap", "--config", "--target", "--from-beginning", "--offset", "--partition", "--max", "--idle", "--follow", "--format", "--json", "--quiet", "--verbose", "--help" };
 const show_config_options = [_][]const u8{ "--show-config", "--bootstrap", "--config", "--target", "--json", "--format", "--quiet", "--verbose", "--help" };
+const list_targets_options = [_][]const u8{ "--targets", "--config", "--target", "--json", "--format", "--quiet", "--verbose", "--help" };
 
 /// Damerau-Levenshtein distance (adjacent transposition counts as one edit).
 /// Inputs are capped so the DP matrix lives on the stack.
@@ -333,6 +394,7 @@ fn suggestOption(mode: Mode, name: []const u8) ?[]const u8 {
         .produce => &produce_options,
         .consume => &consume_options,
         .show_config => &show_config_options,
+        .list_targets => &list_targets_options,
     };
     var best: ?[]const u8 = null;
     var best_dist: usize = 3;
@@ -374,7 +436,7 @@ fn unknownOption(alloc: std.mem.Allocator, mode: Mode, arg: []const u8) []const 
             return errMsg(alloc, "'{s}' is a consume option; use 'kite -c [OPTIONS] TOPIC'", .{name}),
         .consume => if (isOneOf(name, &produce_only))
             return errMsg(alloc, "'{s}' is a produce option and is not valid with -c", .{name}),
-        .show_config => {},
+        .show_config, .list_targets => {},
     }
     if (suggestOption(mode, name)) |candidate|
         return errMsg(alloc, "unknown option '{s}' (did you mean '{s}'?)", .{ arg, candidate });
@@ -418,9 +480,13 @@ fn parseCommon(alloc: std.mem.Allocator, common: *Common, args: []const []const 
     } else if (std.mem.eql(u8, arg, "--target")) {
         i.* += 1;
         if (i.* >= args.len) return .{ .err = "--target requires a value" };
-        common.target = args[i.*];
+        const spelling = std.fmt.allocPrint(alloc, "--target {s}", .{args[i.*]}) catch return .{ .err = "out of memory" };
+        if (setTarget(alloc, common, args[i.*], spelling)) |m| return .{ .err = m };
     } else if (std.mem.startsWith(u8, arg, "--target=")) {
-        common.target = arg["--target=".len..];
+        if (setTarget(alloc, common, arg["--target=".len..], arg)) |m| return .{ .err = m };
+    } else if (arg.len > 0 and arg[0] == '@') {
+        if (arg.len == 1) return .{ .err = "'@' must be followed by a cluster name (e.g. @prod)" };
+        if (setTarget(alloc, common, arg[1..], arg)) |m| return .{ .err = m };
     } else {
         return null;
     }
@@ -437,6 +503,18 @@ fn setFormat(alloc: std.mem.Allocator, common: *Common, format: Format, spelling
     return null;
 }
 
+/// Record a cluster choice; a different cluster already set is a conflict
+/// reported with the user's own spellings.
+fn setTarget(alloc: std.mem.Allocator, common: *Common, name: []const u8, spelling: []const u8) ?[]const u8 {
+    if (common.target) |prev| {
+        if (!std.mem.eql(u8, prev, name))
+            return errMsg(alloc, "{s} cannot be combined with {s}", .{ common.target_spelling.?, spelling });
+    }
+    common.target = name;
+    if (common.target_spelling == null) common.target_spelling = spelling;
+    return null;
+}
+
 fn parseFormatArg(alloc: std.mem.Allocator, common: *Common, value: []const u8, spelling: []const u8) ?[]const u8 {
     const format = format_mod.parse(value) orelse
         return errMsg(alloc, "--format: '{s}' is not a format (want value, tsv, json, or csv)", .{value});
@@ -449,6 +527,30 @@ fn finishCommon(common: Common) ?[]const u8 {
     if (common.config_path) |p| if (p.len == 0) return "--config must not be empty";
     if (common.target) |t| if (t.len == 0) return "--target must not be empty";
     return null;
+}
+
+pub fn parseListTargets(alloc: std.mem.Allocator, args: []const []const u8) Result(ListTargetsArgs) {
+    var parsed: ListTargetsArgs = .{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return .help;
+        if (parseCommon(alloc, &parsed.common, args, &i)) |step| {
+            switch (step) {
+                .err => |m| return .{ .err = m },
+                .ok => continue,
+            }
+        }
+        if (arg.len > 0 and arg[0] == '-')
+            return .{ .err = unknownOption(alloc, .list_targets, arg) };
+        return errorResult(ListTargetsArgs, alloc, "unexpected argument '{s}'", .{arg});
+    }
+    if (parsed.common.bootstrap != null)
+        return errorResult(ListTargetsArgs, alloc, "--bootstrap is not valid with --targets", .{});
+    if (parsed.common.format != .auto and parsed.common.format != .json)
+        return errorResult(ListTargetsArgs, alloc, "--format: only json is valid with --targets", .{});
+    if (finishCommon(parsed.common)) |m| return .{ .err = m };
+    return .{ .ok = parsed };
 }
 
 pub fn parseProduce(alloc: std.mem.Allocator, args: []const []const u8) Result(ProduceArgs) {
@@ -782,6 +884,55 @@ test "show-config mode split and parsing" {
     try expectErr(ShowConfigArgs, parseShowConfig(alloc, &.{ "--format", "tsv" }), "--format: only json is valid with --show-config");
     try expectErr(ShowConfigArgs, parseShowConfig(alloc, &.{"demo"}), "unexpected argument 'demo'");
     try expectErr(ProduceArgs, parseProduce(alloc, &.{"--show-confg"}), "unknown option '--show-confg' (did you mean '--show-config'?)");
+}
+
+test "--targets mode split and parsing" {
+    const alloc = std.heap.page_allocator;
+    switch (splitMode(alloc, &.{ "--targets", "@prod" })) {
+        .ok => |result| {
+            try std.testing.expectEqual(Mode.list_targets, result.mode);
+            try std.testing.expectEqualSlices([]const u8, &.{"@prod"}, result.rest);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try expectErr(ModeSplit, splitMode(alloc, &.{ "--targets", "--show-config" }), "--targets cannot be combined with --show-config");
+    try expectErr(ModeSplit, splitMode(alloc, &.{ "--show-config", "--targets" }), "--targets cannot be combined with --show-config");
+    try expectErr(ModeSplit, splitMode(alloc, &.{ "-c", "--targets" }), "--targets cannot be combined with --consume");
+
+    switch (parseListTargets(alloc, &.{ "--config", "x.yaml", "@prod", "--json", "-q" })) {
+        .ok => |a| {
+            try std.testing.expectEqualStrings("x.yaml", a.common.config_path.?);
+            try std.testing.expectEqualStrings("prod", a.common.target.?);
+            try std.testing.expectEqual(Format.json, a.common.format);
+            try std.testing.expect(a.common.quiet);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try expectErr(ListTargetsArgs, parseListTargets(alloc, &.{ "-b", "h:1" }), "--bootstrap is not valid with --targets");
+    try expectErr(ListTargetsArgs, parseListTargets(alloc, &.{"--csv"}), "unknown option '--csv'");
+    try expectErr(ListTargetsArgs, parseListTargets(alloc, &.{"demo"}), "unexpected argument 'demo'");
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{"--tagets"}), "unknown option '--tagets' (did you mean '--targets'?)");
+}
+
+test "@NAME is short for --target NAME" {
+    const alloc = std.heap.page_allocator;
+    switch (parseProduce(alloc, &.{ "@local-b", "events" })) {
+        .ok => |a| {
+            try std.testing.expectEqualStrings("local-b", a.common.target.?);
+            try std.testing.expectEqualStrings("events", a.topic);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (parseConsume(alloc, &.{ "events", "@prod", "@prod", "--target=prod" })) {
+        .ok => |a| {
+            try std.testing.expectEqualStrings("prod", a.common.target.?);
+            try std.testing.expectEqualStrings("events", a.topic);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{ "@", "events" }), "'@' must be followed by a cluster name (e.g. @prod)");
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{ "@prod", "--target", "dev", "events" }), "@prod cannot be combined with --target dev");
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{ "--target=dev", "@prod", "events" }), "--target=dev cannot be combined with @prod");
 }
 
 test "mode flags are split from arguments" {
