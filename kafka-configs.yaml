@@ -1,0 +1,39 @@
+# Sample multi-cluster configuration for kite.
+#
+# Use it as-is with:   kite --config kafka-configs.yaml --target staging events
+# or copy it to ./kite.yaml (or ~/.config/kite/kite.yaml) so kite finds it
+# automatically and `kite --target NAME` / `KITE_TARGET=NAME` pick a cluster.
+#
+# Keys are the same dotted names kite.properties accepts. Values in a
+# cluster beat environment variables; environment variables beat
+# `defaults:`; -b/--bootstrap beats everything.
+
+# Cluster used when neither --target nor $KITE_TARGET is given.
+default: dev
+
+# Shared settings applied to every cluster.
+defaults:
+  linger.ms: 20
+  batch.size: 1048576
+  enable.idempotence: true
+
+clusters:
+  # Local broker (docker, redpanda, etc.). No auth.
+  dev:
+    bootstrap.servers: localhost:9092
+
+  # Internal cluster over TLS with a custom CA.
+  staging:
+    bootstrap.servers: kafka-1.staging.example.com:9093,kafka-2.staging.example.com:9093
+    security.protocol: SSL
+    ssl.truststore.location: /etc/kite/staging-ca.pem
+
+  # Managed cluster with SASL/PLAIN over TLS. Prefer leaving the secret out
+  # of the file and exporting SASL_PASSWORD in the environment instead;
+  # kite fills any key a cluster omits from the environment.
+  prod:
+    bootstrap.servers: pkc-xyz.us-east-1.aws.confluent.cloud:9092
+    security.protocol: SASL_SSL
+    sasl.mechanism: PLAIN
+    sasl.username: API_KEY
+    sasl.password: API_SECRET

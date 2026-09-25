@@ -545,7 +545,9 @@ the brokers).
 `kite --show-config` prints the selected name on a `target:` line and
 reports `target` as the origin of keys that came from the cluster; the
 JSON form adds `"target"` and `"targets"` (all names defined in the
-file). See [`examples/config/kite.yaml`](examples/config/kite.yaml).
+file). See [`kafka-configs.yaml`](kafka-configs.yaml) for a fuller sample
+(plaintext dev, TLS staging, SASL prod) and
+[`examples/config/kite.yaml`](examples/config/kite.yaml).
 
 ### Inspecting the effective configuration
 
