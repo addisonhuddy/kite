@@ -159,7 +159,10 @@ fn scalarValue(alloc: std.mem.Allocator, s: []const u8, no: usize, diag: *Diag) 
             // Plain scalar: a '#' starts a comment only after whitespace.
             var end = s.len;
             for (s, 0..) |c, i| {
-                if (c == '#' and i > 0 and s[i - 1] == ' ') end = i - 1;
+                if (c == '#' and i > 0 and s[i - 1] == ' ') {
+                    end = i - 1;
+                    break;
+                }
             }
             return std.mem.trim(u8, s[0..end], " ");
         },
@@ -246,7 +249,7 @@ test "hash inside a value without preceding space is kept" {
     defer arena.deinit();
     const gpa = arena.allocator();
     var diag: Diag = .{};
-    const m = try parse(gpa, "a: x#y\nb: v # gone\n", &diag);
+    const m = try parse(gpa, "a: x#y\nb: v # gone # too\n", &diag);
     try std.testing.expectEqualStrings("x#y", scalar(m.get("a").?).?);
     try std.testing.expectEqualStrings("v", scalar(m.get("b").?).?);
 }
