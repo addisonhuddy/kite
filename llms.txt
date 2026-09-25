@@ -25,7 +25,8 @@ SASL_MECHANISM                  PLAIN | SCRAM-SHA-256 | SCRAM-SHA-512
 SASL_USERNAME, SASL_PASSWORD
 SSL_TRUSTSTORE_LOCATION         optional PEM CA bundle
 --config FILE                   config file (also $KAFKA_PROPERTIES, ./kite.yaml, ./kite.properties, ~/.config/kite/)
---target NAME                   named cluster from kite.yaml's `clusters:` (also $KITE_TARGET or the file's `default:`)
+--target NAME, @NAME            named cluster from kite.yaml's `clusters:` (also $KITE_TARGET or the file's `default:`)
+kite --targets [--json]         list clusters in kite.yaml, `*` marks the selected one; reads only cluster names, never connects
 kite --show-config --json       print effective config with provenance; never connects
 
 ## Produce (default mode)

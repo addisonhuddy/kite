@@ -318,6 +318,52 @@ pub fn load(
     overrides: Overrides,
     source: *Source,
 ) LoadError!Config {
+    const doc = try readDoc(io, alloc, env, overrides, source);
+    const cfg = try applyProps(alloc, env, doc, overrides, source);
+    const password_origin = source.origins.get(.sasl_password);
+    if (password_origin == .file or password_origin == .target)
+        warnIfLoosePerms(io, source.file.?);
+    return cfg;
+}
+
+/// The clusters a config file defines, for `kite --targets`.
+pub const Targets = struct {
+    /// Sorted cluster names.
+    names: [][]const u8,
+    /// The cluster --target/$KITE_TARGET/`default:` would select, if any.
+    selected: ?[]const u8,
+};
+
+/// List the clusters in the config file without resolving a Config, so a
+/// file that lacks bootstrap.servers or credentials still lists fine.
+/// Fails with ConfigNotFound when no file exists and UnknownTarget when
+/// the selected name is not defined.
+pub fn listTargets(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+    overrides: Overrides,
+    source: *Source,
+) LoadError!Targets {
+    const doc = (try readDoc(io, alloc, env, overrides, source)) orelse return error.ConfigNotFound;
+    source.targets = try sortedClusterNames(alloc, doc);
+    const selected = selectTarget(env, doc, overrides);
+    source.target = selected;
+    if (selected) |name| {
+        if (!doc.clusters.contains(name)) return error.UnknownTarget;
+    }
+    return .{ .names = source.targets, .selected = selected };
+}
+
+/// Locate and parse the config file (`--config`/`KAFKA_PROPERTIES` or the
+/// first hit on the search path). Null when no file was found.
+fn readDoc(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+    overrides: Overrides,
+    source: *Source,
+) LoadError!?Doc {
     const explicit: ?[]const u8 = overrides.config_path orelse blk: {
         const from_env = env.get("KAFKA_PROPERTIES") orelse break :blk null;
         break :blk if (from_env.len > 0) from_env else null;
@@ -347,28 +393,43 @@ pub fn load(
         }
     }
 
-    var doc: ?Doc = null;
-    if (text) |body| {
-        if (isYamlPath(source.file.?)) {
-            source.file_kind = .yaml;
-            var diag: yaml.Diag = .{};
-            doc = docFromYaml(alloc, body, &diag) catch |err| switch (err) {
-                error.Syntax => {
-                    source.diag = diag;
-                    return error.ConfigSyntax;
-                },
-                error.OutOfMemory => return error.OutOfMemory,
-            };
-        } else {
-            source.file_kind = .properties;
-            doc = .{ .base = try parse(alloc, body) };
-        }
+    const body = text orelse return null;
+    if (isYamlPath(source.file.?)) {
+        source.file_kind = .yaml;
+        var diag: yaml.Diag = .{};
+        return docFromYaml(alloc, body, &diag) catch |err| switch (err) {
+            error.Syntax => {
+                source.diag = diag;
+                return error.ConfigSyntax;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+        };
     }
-    const cfg = try applyProps(alloc, env, doc, overrides, source);
-    const password_origin = source.origins.get(.sasl_password);
-    if (password_origin == .file or password_origin == .target)
-        warnIfLoosePerms(io, source.file.?);
-    return cfg;
+    source.file_kind = .properties;
+    return .{ .base = try parse(alloc, body) };
+}
+
+fn sortedClusterNames(alloc: std.mem.Allocator, doc: Doc) error{OutOfMemory}![][]const u8 {
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    var it = doc.clusters.iterator();
+    while (it.next()) |e| try names.append(alloc, e.key_ptr.*);
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+    return names.items;
+}
+
+/// The cluster name chosen by --target, then $KITE_TARGET, then the
+/// file's `default:`.
+fn selectTarget(env: *std.process.Environ.Map, doc: ?Doc, overrides: Overrides) ?[]const u8 {
+    if (overrides.target) |t| return t;
+    if (env.get("KITE_TARGET")) |t| {
+        if (t.len > 0) return t;
+    }
+    if (doc) |d| return d.default_target;
+    return null;
 }
 
 fn validTargetName(name: []const u8) bool {
@@ -393,27 +454,9 @@ pub fn applyProps(
 ) LoadError!Config {
     var cfg: Config = .{ .bootstrap_servers = &.{} };
 
-    var names: std.ArrayListUnmanaged([]const u8) = .empty;
-    if (doc) |*d| {
-        var it = d.clusters.iterator();
-        while (it.next()) |e| try names.append(alloc, e.key_ptr.*);
-    }
-    std.mem.sort([]const u8, names.items, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
-        }
-    }.lt);
-    source.targets = names.items;
+    if (doc) |d| source.targets = try sortedClusterNames(alloc, d);
 
-    var selected: ?[]const u8 = overrides.target;
-    if (selected == null) {
-        if (env.get("KITE_TARGET")) |t| {
-            if (t.len > 0) selected = t;
-        }
-    }
-    if (selected == null) {
-        if (doc) |*d| selected = d.default_target;
-    }
+    const selected = selectTarget(env, doc, overrides);
     if (selected != null and doc == null) return error.TargetWithoutFile;
     source.target = selected;
     if (selected) |name| {

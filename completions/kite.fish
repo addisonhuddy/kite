@@ -3,6 +3,7 @@
 
 complete -c kite -s c -l consume -d 'Consume instead of produce'
 complete -c kite -l show-config -d 'Show the effective configuration'
+complete -c kite -l targets -d 'List the clusters in kite.yaml'
 complete -c kite -s V -l version -d 'Print the version'
 complete -c kite -s b -l bootstrap -d 'Comma-separated host:port brokers' -x
 complete -c kite -l config -d 'Read this properties file' -rF

@@ -203,6 +203,16 @@ run_case show-config-conflict 1 empty "kite: --show-config cannot be combined wi
 # --target: named clusters in kite.yaml.
 run_case target-missing-value 1 empty "kite: --target requires a value" --target
 run_case target-no-file 1 empty "requires a properties file" --target x demo
+run_case at-target-no-file 1 empty "requires a properties file" @x demo
+run_case at-target-empty 1 empty "'@' must be followed by a cluster name" @ demo
+run_case at-target-conflict 1 empty "kite: @prod cannot be combined with --target dev" @prod --target dev demo
+run_case at-target-repeat 1 empty "requires a properties file" @x @x demo
+run_case targets-help 0 nonempty empty --targets --help
+run_case targets-no-file 1 empty "kite: no config file found" --targets
+run_case targets-conflict 1 empty "kite: --targets cannot be combined with --show-config" --show-config --targets
+run_case targets-consume-conflict 1 empty "kite: --targets cannot be combined with --consume" -c --targets
+run_case targets-topic 1 empty "kite: unexpected argument 'demo'" --targets demo
+run_case targets-bootstrap 1 empty "kite: --bootstrap is not valid with --targets" --targets -b x:1
 cat >"$TMP/work/kite.yaml" <<'EOF'
 defaults:
   linger.ms: 20
@@ -223,6 +233,38 @@ set -e
     echo "FAIL target-unknown"; cat "$TMP/target-unknown.err"; exit 1;
 }
 echo "PASS target-unknown"
+# --targets lists clusters without needing a complete config; '*' marks
+# the selected one, and stderr carries only the source note.
+run_case targets-list 0 nonempty "kite: clusters from ./kite.yaml" --targets
+printf 'dev\nprod\n' | cmp -s - "$TMP/targets-list.out" || {
+    echo "FAIL targets-list: unexpected stdout"; cat "$TMP/targets-list.out"; exit 1;
+}
+run_case targets-at 0 nonempty empty --targets -q @prod
+printf 'dev\nprod *\n' | cmp -s - "$TMP/targets-at.out" || {
+    echo "FAIL targets-at: unexpected stdout"; cat "$TMP/targets-at.out"; exit 1;
+}
+run_case targets-unknown 1 empty "no cluster 'x' in ./kite.yaml (available: dev, prod)" --targets @x
+set +e
+(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" KITE_TARGET=prod "$BIN" --targets --json >"$TMP/targets-json.out" 2>"$TMP/targets-json.err")
+status=$?
+set -e
+[ "$status" -eq 0 ] \
+    && [ "$(cat "$TMP/targets-json.out")" = '{"file":"./kite.yaml","target":"prod","targets":["dev","prod"]}' ] \
+    && [ ! -s "$TMP/targets-json.err" ] || {
+    echo "FAIL targets-json"; cat "$TMP/targets-json.out"; cat "$TMP/targets-json.err"; exit 1;
+}
+echo "PASS targets-json"
+# @NAME selects a cluster exactly like --target NAME.
+set +e
+(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" @prod --show-config --json >"$TMP/at-target-json.out" 2>"$TMP/at-target-json.err")
+status=$?
+set -e
+[ "$status" -eq 0 ] \
+    && grep -Fq '"target":"prod"' "$TMP/at-target-json.out" \
+    && grep -Fq '"bootstrap.servers":{"value":"prod:3","source":"target"}' "$TMP/at-target-json.out" || {
+    echo "FAIL at-target-json"; cat "$TMP/at-target-json.out"; cat "$TMP/at-target-json.err"; exit 1;
+}
+echo "PASS at-target-json"
 set +e
 (cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" KITE_TARGET=prod "$BIN" --show-config --json >"$TMP/target-json.out" 2>"$TMP/target-json.err")
 status=$?
@@ -237,6 +279,7 @@ echo "PASS target-json"
 printf 'bootstrap.servers=base:1\n' >"$TMP/work/kite.properties"
 rm "$TMP/work/kite.yaml"
 run_case target-properties-file 1 empty "properties files define a single cluster" --target dev demo
+run_case targets-properties-file 0 empty "defines no clusters" --targets
 rm "$TMP/work/kite.properties"
 cat >"$TMP/work/kite.yaml" <<'EOF'
 default: dev

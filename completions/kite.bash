@@ -10,8 +10,17 @@ _kite() {
         case "$w" in
             -c | --consume) mode=consume ;;
             --show-config) mode=show-config ;;
+            --targets) mode=targets ;;
         esac
     done
+
+    # @NAME is short for --target NAME.
+    if [[ $cur == @* ]] && [ -f kite.yaml ]; then
+        local names
+        names=$(awk '/^clusters:/{f=1;next} f&&/^[^ ]/{f=0} f&&/^  [A-Za-z0-9_-]+:/{sub(/^  /,"@");sub(/:.*/,"");print}' kite.yaml | sort -u)
+        COMPREPLY=($(compgen -W "$names" -- "$cur"))
+        return
+    fi
 
     case "$prev" in
         --format)
@@ -45,8 +54,11 @@ _kite() {
         show-config)
             opts="--show-config -b --bootstrap --config --target --format --json -q --quiet -v --verbose -h --help"
             ;;
+        targets)
+            opts="--targets --config --target --format --json -q --quiet -v --verbose -h --help"
+            ;;
         *)
-            opts="-c --consume -V --version --show-config \
+            opts="-c --consume -V --version --show-config --targets \
                 -b --bootstrap --config --target --format --json -H --csv --key \
                 -q --quiet -v --verbose -h --help"
             ;;

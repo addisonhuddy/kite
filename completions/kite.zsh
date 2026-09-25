@@ -35,6 +35,16 @@ _kite() {
             '(-t --idle)'{-t,--idle}'[stop after idle duration]:duration:' \
             '(-f --follow)'{-f,--follow}'[never stop on idle]' \
             '*:topic:'
+    elif (( ${words[(I)--targets]} )); then
+        _arguments -s \
+            '--targets[list clusters in kite.yaml]' \
+            '--config[read this config file]:file:_files' \
+            '--target[mark cluster NAME as selected]:name:_kite_targets' \
+            '--format[output shape]:format:(json)' \
+            '--json[JSON output]' \
+            '(-q --quiet)'{-q,--quiet}'[suppress the source note]' \
+            '(-v --verbose)'{-v,--verbose}'[diagnostics]' \
+            '(-h --help)'{-h,--help}'[show help]'
     elif (( ${words[(I)--show-config]} )); then
         _arguments -s \
             '--show-config[show effective configuration]' \
@@ -50,6 +60,7 @@ _kite() {
         _arguments -s $shared \
             '(-c --consume)'{-c,--consume}'[consume mode]' \
             '--show-config[show effective configuration]' \
+            '--targets[list clusters in kite.yaml]' \
             '-H[add a name: value header]:header:' \
             '--csv[read RFC 4180 CSV (same as --format csv)]' \
             '--key[use CSV column as record key]:column:' \

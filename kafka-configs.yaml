@@ -1,8 +1,9 @@
 # Sample multi-cluster configuration for kite.
 #
-# Use it as-is with:   kite --config kafka-configs.yaml --target staging events
+# Use it as-is with:   kite --config kafka-configs.yaml @staging events
 # or copy it to ./kite.yaml (or ~/.config/kite/kite.yaml) so kite finds it
-# automatically and `kite --target NAME` / `KITE_TARGET=NAME` pick a cluster.
+# automatically and `kite @NAME` / `--target NAME` / `KITE_TARGET=NAME` pick
+# a cluster. `kite --targets` lists the names defined here.
 #
 # Keys are the same dotted names kite.properties accepts. Values in a
 # cluster beat environment variables; environment variables beat
