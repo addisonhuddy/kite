@@ -91,7 +91,7 @@ docker run -d --name kite-kafka -p 127.0.0.1:19092:9092 \
   -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
   apache/kafka:4.0.0
 
-until kite -q -b localhost:19092 probe </dev/null 2>/dev/null; do sleep 2; done
+until kite produce -q -b localhost:19092 probe </dev/null 2>/dev/null; do sleep 2; done
 ```
 
 The readiness loop from the previous section will *not* work here:
@@ -129,7 +129,7 @@ docker run -d --name kafka-2 --network kafka-net -p 127.0.0.1:9093:9092 "${commo
   -e KAFKA_ADVERTISED_LISTENERS=INTERNAL://kafka-2:29092,EXTERNAL://localhost:9093 \
   apache/kafka:4.0.0
 
-kite -b localhost:9092,localhost:9093 -c -B events
+kite consume -b localhost:9092,localhost:9093 -B events
 ```
 
 The same rule explains the classic symptoms on any deployment, not just
@@ -138,7 +138,7 @@ private IP, a Kubernetes service name) is reachable for bootstrap through
 a tunnel or port-forward yet fails right after, because kite is being
 sent to an address only the cluster's own network can resolve. The
 error names the advertised address (`connection refused by kafka-1:9092`),
-and `kite -v` logs `connected broker N at HOST:PORT` for each one it
+and `kite produce -v` logs `connected broker N at HOST:PORT` for each one it
 reaches. Fix it on the broker side; a client cannot rewrite those
 addresses.
 
@@ -153,8 +153,8 @@ topic automatically when run from a script or pipe.
 ```sh
 curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh
 export BOOTSTRAP_SERVERS=localhost:9092
-printf 'hello\n' | kite events                       # produce one record
-kite -c -B --idle 3s --json events | jq -r .value    # prints: hello
+printf 'hello\n' | kite produce events               # produce one record
+kite consume -B --idle 3s --json events | jq -r .value  # prints: hello
 ```
 
 What to expect:
@@ -186,7 +186,7 @@ why I think you will love kite.
   `scripts/check-size.sh`). It fits in a container layer, a
   sandbox, or a tool call without anyone noticing.
 - **Unix philosophy.** kite does one thing per invocation and composes with
-  everything else: `tail -f app.log | kite logs`, `kite -c src | jq | kite dst`.
+  everything else: `tail -f app.log | kite produce logs`, `kite consume src | jq | kite produce dst`.
   Records are lines. Diagnostics go to stderr, data goes to stdout.
 - **Fast.** Written in Zig: native code, no garbage collector, no JVM
   startup, starts and exits in milliseconds. Produce runs are batched and
@@ -242,11 +242,11 @@ the facts you need. They are stable across releases.
   Checksums are verified against the release `SHA256SUMS`.
 - **Configure:** `export BOOTSTRAP_SERVERS=host:port` (plus
   `SECURITY_PROTOCOL`, `SASL_MECHANISM`, `SASL_USERNAME`, `SASL_PASSWORD` for
-  hosted clusters) or `-b host:port`. `kite --show-config --json` prints the
+  hosted clusters) or `-b host:port`. `kite config --json` prints the
   effective configuration without connecting.
-- **Produce:** `printf 'value\n' | kite TOPIC`; JSON records with
-  `kite --json TOPIC`; CSV with `kite --csv [--key COL] TOPIC`.
-- **Consume (bounded):** `kite -c -B -n 100 --idle 3s TOPIC` stops after 100
+- **Produce:** `printf 'value\n' | kite produce TOPIC`; JSON records with
+  `kite produce --json TOPIC`; CSV with `kite produce --csv [--key COL] TOPIC`.
+- **Consume (bounded):** `kite consume -B -n 100 --idle 3s TOPIC` stops after 100
   records or 3 s without one, whichever comes first; add `--json` for
   `{topic,partition,offset,timestamp,key,headers,value}` per line. A piped
   read with neither bound stops after 5 s idle; `-n` alone waits for its
@@ -262,8 +262,8 @@ the facts you need. They are stable across releases.
 A tool description you can paste into an agent's tool registry:
 
 ```text
-kite: single-binary Kafka CLI. `kite TOPIC` produces stdin lines (or --json /
---csv records) to TOPIC. `kite -c TOPIC` consumes TOPIC to stdout; use -B for
+kite: single-binary Kafka CLI. `kite produce TOPIC` produces stdin lines (or
+--json / --csv records) to TOPIC. `kite consume TOPIC` reads TOPIC to stdout; use -B for
 history, -n N to cap records, --idle DUR to stop when quiet, --json for full
 metadata. Configure with BOOTSTRAP_SERVERS (and SASL_*/SECURITY_PROTOCOL) or
 -b HOST:PORT. Exit 0 ok, 1 error (message on stderr). A piped consume with
@@ -368,24 +368,23 @@ for every shell present on the machine and asserts that options complete.
 
 ## Command reference
 
-Produce is the default mode. `-c`/`--consume` switches to consume,
-`--show-config` prints the effective configuration, `--targets` lists
-the clusters in kite.yaml. Mode flags may appear anywhere on the command
-line; there are no reserved topic names.
+The first argument is the command. `@NAME` selects a cluster from
+kite.yaml and may appear anywhere among a command's arguments; `p` and
+`c` are short for `produce` and `consume`.
 
 ```text
-kite [OPTIONS] TOPIC          Produce stdin lines to TOPIC (default).
-kite -c [OPTIONS] TOPIC       Consume TOPIC to stdout.
-kite --show-config            Show the effective configuration.
-kite --targets                List the clusters defined in kite.yaml.
-kite --version                Print the version.
+kite produce [OPTIONS] [@CLUSTER] TOPIC   Write stdin lines to TOPIC.
+kite consume [OPTIONS] [@CLUSTER] TOPIC   Read TOPIC to stdout.
+kite config [OPTIONS] [@CLUSTER]          Show the effective configuration.
+kite targets [OPTIONS] [@CLUSTER]         List the clusters in kite.yaml.
+kite --version                            Print the version.
 ```
 
 | Mode | Option | Meaning |
 | --- | --- | --- |
 | produce, consume | `-b`, `--bootstrap HOSTS` | Comma-separated `host:port` brokers (overrides env and file). |
 | produce, consume | `--config FILE` | Read this properties file instead of searching. |
-| produce, consume | `--target NAME`, `@NAME` | Use cluster `NAME` from kite.yaml (or `$KITE_TARGET`). |
+| all | `@NAME` | Use cluster `NAME` from kite.yaml (or `$KITE_TARGET`). |
 | produce, consume | `--format FMT` | Record shape: `value`, `tsv`, `json` (default `auto`). |
 | produce | `--format csv` | RFC 4180 CSV input (produce only); same as `--csv`. |
 | produce, consume | `--json` | Alias for `--format json`. |
@@ -402,8 +401,9 @@ kite --version                Print the version.
 | produce, consume | `-v`, `--verbose` | Connection, retry, and fetch diagnostics on stderr. |
 | all | `-h`, `--help` | Plain-text help for the selected mode. |
 
-`kite --help`, `kite -c --help`, `kite --show-config --help`, and
-`kite --targets --help` print the full pages.
+`kite --help` prints the command overview; `kite produce --help`,
+`kite consume --help`, `kite config --help`, and `kite targets --help`
+print the full pages.
 
 ## Common recipes
 
@@ -411,39 +411,38 @@ The files in [`examples/data/`](examples/data) are ready-to-use inputs.
 
 ```sh
 # plain values, one per line
-kite events < examples/data/lines.txt
+kite produce events < examples/data/lines.txt
 # key<TAB>value
-kite events < examples/data/keyed.tsv
+kite produce events < examples/data/keyed.tsv
 # key<TAB>headers<TAB>value
-kite events < examples/data/headers.tsv
+kite produce events < examples/data/headers.tsv
 # attach a header to every record (-H is repeatable)
-kite -H 'source: import' events < examples/data/lines.txt
+kite produce -H 'source: import' events < examples/data/lines.txt
 # CSV rows as JSON values, optionally keyed by a column
-kite --csv events < examples/data/users.csv
-kite --csv --key user_id events < examples/data/events.csv
+kite produce --csv events < examples/data/users.csv
+kite produce --csv --key user_id events < examples/data/events.csv
 # stream a log as it grows
-tail -f app.log | kite logs
+tail -f app.log | kite produce logs
 # follow new records on a terminal (Ctrl-C to stop; summary printed)
-kite -c events
+kite consume events
 # follow into a pipe (without -f a piped read stops after 5 s idle)
-kite -c -f events | grep ERROR
+kite consume -f events | grep ERROR
 # read one partition from an offset, at most 10 records
-kite -c --partition 0 --offset 42 -n 10 --idle 3s events
+kite consume --partition 0 --offset 42 -n 10 --idle 3s events
 # snapshot a topic into a file for an agent to read (stops after 5 s idle)
-kite -c -B events > events.txt
+kite consume -B events > events.txt
 # structured records with partition/offset/timestamp/headers
-kite -c -B --json events | jq -c 'select(.partition == 0) | .value'
+kite consume -B --json events | jq -c 'select(.partition == 0) | .value'
 # copy a topic, preserving keys and headers
-kite -c -B --json src | kite --json dst
+kite consume -B --json src | kite produce --json dst
 # transform in flight
-kite -c -B raw | jq -c '{id, ts}' | kite clean
+kite consume -B raw | jq -c '{id, ts}' | kite produce clean
 # one-off broker without a config file
-kite -b broker1:9092,broker2:9092 -c -B -n 5 events
+kite consume -b broker1:9092,broker2:9092 -B -n 5 events
 # named cluster from kite.yaml (see "Multiple clusters" below)
-kite @prod events < examples/data/lines.txt
-kite --target prod events < examples/data/lines.txt   # same thing
+kite produce @prod events < examples/data/lines.txt
 # which clusters are there, and which one is selected?
-kite --targets
+kite targets
 ```
 
 The consumer output is in the same textual shape accepted by the producer,
@@ -451,7 +450,7 @@ subject to the format boundaries described below.
 
 ## Consuming
 
-By default, `kite -c` starts at the latest offset and selects all partitions.
+By default, `kite consume` starts at the latest offset and selects all partitions.
 `-B`/`--from-beginning` starts at the earliest available offset; `--offset N`
 starts at offset N in every selected partition and fails with the valid range
 (`valid offsets are 0..334 (next offset 335)`) if N is outside it, rather
@@ -475,12 +474,12 @@ When the read stops depends on stdout:
   exclusive.
 
 For a finite read in automation, give both bounds
-(`kite -c -B -n 100 --idle 3s TOPIC`): the read ends at 100 records or 3 s
+(`kite consume -B -n 100 --idle 3s TOPIC`): the read ends at 100 records or 3 s
 of silence, whichever comes first. Neither flag is an overall deadline; if
 you need one, wrap the command in `timeout`.
 
 An idle-bounded read is not a guarantee of a complete topic snapshot. If the
-downstream process closes the pipe (`kite -c -f events | head`), kite exits
+downstream process closes the pipe (`kite consume -f events | head`), kite exits
 quietly with status 0 instead of dying from SIGPIPE.
 
 ## Input/output format and CSV
@@ -510,8 +509,8 @@ The TAB and newline delimiters are not escaped. Binary data or records
 containing delimiters are therefore not generally safe to roundtrip. Null and
 empty keys, values, and header values may not remain distinct: a null key is
 printed as an empty field, and a null header value as `name: `. Compatible
-textual keys and headers can roundtrip: `kite -c --format tsv src |
-kite --format tsv dst` preserves keys and headers, while `--format json`
+textual keys and headers can roundtrip: `kite consume --format tsv src |
+kite produce --format tsv dst` preserves keys and headers, while `--format json`
 preserves key, headers, and value exactly and `value` drops keys and
 headers. A consume-to-produce pipe does not preserve ordering across
 partitions, offsets, or timestamps.
@@ -524,14 +523,14 @@ JSON fields are strings.
 
 ### JSON records (`--json`, i.e. `--format json`)
 
-`kite -c --json` writes one object per record with full metadata, so bytes
+`kite consume --json` writes one object per record with full metadata, so bytes
 containing TABs or newlines and null-vs-empty distinctions survive:
 
 ```json
 {"topic":"events","partition":1,"offset":7,"timestamp":1789579403024,"key":null,"headers":[{"key":"h","value":"v"}],"value":"line one"}
 ```
 
-`kite --json TOPIC` reads the same shape (only `value` is required):
+`kite produce --json TOPIC` reads the same shape (only `value` is required):
 
 ```json
 {"key":"user-1","value":{"a":1},"headers":{"source":"import"}}
@@ -613,21 +612,22 @@ Only a strict YAML subset is parsed: block mappings, plain and quoted
 scalars, comments. Lists, flow syntax, anchors, and block scalars are
 rejected with a `file:line` error.
 
-The cluster is selected by, in order: `--target NAME`, `$KITE_TARGET`,
-the file's own `default:` key, else no cluster and only `defaults:`/
-unprefixed keys apply. Passing `--target` without any config file is an
-error, as is selecting a name the file does not define — including any
-name on a properties file, which always describes a single cluster.
+The cluster is selected by, in order: the `@NAME` positional,
+`$KITE_TARGET`, the file's own `default:` key, else no cluster and only
+`defaults:`/unprefixed keys apply. Passing `@NAME` without any config
+file is an error, as is selecting a name the file does not define —
+including any name on a properties file, which always describes a
+single cluster.
 
-`@NAME` is short for `--target NAME` and goes anywhere on the command
-line, so switching clusters is one word: `kite @prod events`,
-`kite -c @local-b -B events`. A bare `@` is an error; two different
-clusters on one command line (`@prod --target dev`) are rejected rather
-than letting the last one win. Topics never start with `@`, so there is
-no ambiguity.
+`@NAME` selects a cluster and goes anywhere among a command's
+arguments, so switching clusters is one word: `kite produce @prod
+events`, `kite consume @local-b -B events`. A bare `@` is an error; two
+different clusters on one command line (`@prod @dev`) are rejected
+rather than letting the last one win. Topics never start with `@`, so
+there is no ambiguity.
 
-`kite --targets` lists the clusters, one per line and sorted, with ` *`
-after the one that `--target`/`@NAME`/`$KITE_TARGET`/`default:` would
+`kite targets` lists the clusters, one per line and sorted, with ` *`
+after the one that `@NAME`/`$KITE_TARGET`/`default:` would
 select, and a note on stderr naming the file it read (`-q` drops the
 note). It reads only the `clusters:` keys and never resolves a
 configuration or connects to a broker, so it works even while a cluster
@@ -636,26 +636,26 @@ is still half written or lacks `bootstrap.servers`. `--json` yields
 config file at all or the selected name is not defined.
 
 ```sh
-$ kite --targets
+$ kite targets
 dev *
 prod
 kite: clusters from ./kite.yaml
-$ kite --targets --json | jq -r '.targets[]'
+$ kite targets --json | jq -r '.targets[]'
 dev
 prod
 ```
 
-Shell completion follows suit: after `--target ` or `@`, the Bash
-completion offers the cluster names from `./kite.yaml`.
+Shell completion follows suit: after `@`, the completions offer the
+cluster names from `./kite.yaml`.
 
 Within a cluster, value precedence is: flags > the cluster's keys >
 environment > `defaults:`/base keys > built-in defaults. A named cluster
 is a complete definition, so ambient `BOOTSTRAP_SERVERS` cannot silently
-redirect `--target prod`; environment variables still fill in keys the
+redirect `kite produce @prod`; environment variables still fill in keys the
 cluster omits (for example `SASL_PASSWORD` while the cluster supplies
 the brokers).
 
-`kite --show-config` prints the selected name on a `target:` line and
+`kite config` prints the selected name on a `target:` line and
 reports `target` as the origin of keys that came from the cluster; the
 JSON form adds `"target"` and `"targets"` (all names defined in the
 file). See [`kafka-configs.yaml`](kafka-configs.yaml) for a fuller sample
@@ -664,7 +664,7 @@ file). See [`kafka-configs.yaml`](kafka-configs.yaml) for a fuller sample
 
 ### Inspecting the effective configuration
 
-`kite --show-config` resolves the effective settings — flags over
+`kite config` resolves the effective settings — flags over
 environment over the properties file — and prints each key with its origin,
 without ever connecting to a broker. An invalid or incomplete configuration
 exits 1 with the usual `kite: ...` message; `sasl.password` is redacted.
@@ -681,7 +681,7 @@ sasl.password            ********               env
 For automation there is a stable-schema JSON form:
 
 ```sh
-kite --show-config --json | jq -r '.settings["bootstrap.servers"].value'
+kite config --json | jq -r '.settings["bootstrap.servers"].value'
 ```
 
 ## Output streams and exit codes
@@ -722,6 +722,20 @@ The default stripped binary is under 640 KB (CI-gated by
 `scripts/pack.sh` can produce an optional UPX/LZMA artifact of about 200 KiB.
 
 ## Troubleshooting
+
+### Migrating from 0.1
+
+kite 0.2 replaced the mode flags with subcommands; the old spellings exit
+1 with a migration hint. `@NAME` (or `$KITE_TARGET`) now selects the
+cluster everywhere.
+
+| 0.1 | 0.2 |
+| --- | --- |
+| `kite [OPTIONS] TOPIC` | `kite produce [OPTIONS] [@CLUSTER] TOPIC` |
+| `kite -c/--consume [OPTIONS] TOPIC` | `kite consume [OPTIONS] [@CLUSTER] TOPIC` |
+| `kite --show-config [OPTIONS]` | `kite config [OPTIONS] [@CLUSTER]` |
+| `kite --targets [OPTIONS]` | `kite targets [OPTIONS] [@CLUSTER]` |
+| `kite --target NAME ...` | `kite ... @NAME` |
 
 First run against a local broker:
 
@@ -771,21 +785,21 @@ General:
   next offset; use `-B` for the earliest or omit `--offset` for the latest.
 - **Consumer shows `waiting for records`:** the default starts at latest. Use
   `-B`, `--offset`, or a bounded `--idle` as appropriate.
-- **`kite consume` produced to a topic named `consume`:** modes are flags, not
-  subcommands. Use `kite -c TOPIC`.
+- **`kite -c TOPIC` fails with `'-c' is now a command`:** kite 0.2 turned
+  the mode flags into subcommands. See [Migrating from 0.1](#migrating-from-01).
 
 ## FAQ
 
 **How do I produce a message to Kafka from the command line?**
-`printf 'hello\n' | kite -b localhost:9092 TOPIC`. Each stdin line is one
+`printf 'hello\n' | kite produce -b localhost:9092 TOPIC`. Each stdin line is one
 record; `key<TAB>value` sets a key, `--json` and `--csv` accept structured
 input.
 
 **How do I read the last N messages from a Kafka topic in a script?**
-`kite -c -B -n N --idle 3s TOPIC` reads from the beginning and stops after N
+`kite consume -B -n N --idle 3s TOPIC` reads from the beginning and stops after N
 records or 3 s of silence, whichever comes first (`-n` alone waits until N
-records exist). Without `-n`, a piped `kite -c` stops on its own after 5 s
-without data, so `kite -c -B TOPIC > dump.txt` produces a snapshot rather
+records exist). Without `-n`, a piped `kite consume` stops on its own after 5 s
+without data, so `kite consume -B TOPIC > dump.txt` produces a snapshot rather
 than hanging.
 
 **Does kite work with Confluent Cloud, Redpanda, Amazon MSK, or Aiven?**
@@ -838,7 +852,7 @@ Internals:
 - `src/scram.zig` — SCRAM-SHA-256/512 client
 - `src/config.zig` — `kite.properties` loader
 - `src/csv.zig` — CSV reader and JSON conversion
-- `src/cli.zig` — argument parsing, mode selection, help text
+- `src/cli.zig` — argument parsing, subcommand dispatch, help text
 
 ## License
 

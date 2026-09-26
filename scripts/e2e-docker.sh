@@ -64,11 +64,11 @@ scripts/smoke.sh "$TOPIC"
 # exactly the record just produced (a consume without -B starts at latest and
 # prints nothing).
 QS_TOPIC="kite-quickstart-$(date +%s)-$RANDOM"
-printf 'hello\n' | zig-out/bin/kite "$QS_TOPIC"
+printf 'hello\n' | zig-out/bin/kite produce "$QS_TOPIC"
 if command -v jq >/dev/null 2>&1; then
-    got=$(zig-out/bin/kite -c -B --idle 3s --json "$QS_TOPIC" 2>/dev/null | jq -r .value)
+    got=$(zig-out/bin/kite consume -B --idle 3s --json "$QS_TOPIC" 2>/dev/null | jq -r .value)
 else
-    got=$(zig-out/bin/kite -c -B --idle 3s --json "$QS_TOPIC" 2>/dev/null | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
+    got=$(zig-out/bin/kite consume -B --idle 3s --json "$QS_TOPIC" 2>/dev/null | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
 fi
 [ "$got" = "hello" ] || fail "quickstart: expected 'hello' from the README consume line, got '$got'"
 echo "PASS quickstart"
@@ -80,15 +80,15 @@ docker exec "$NAME" /opt/kafka/bin/kafka-topics.sh \
     --bootstrap-server localhost:9092 --create --topic "$EMPTY_TOPIC" \
     --partitions 1 --replication-factor 1 >/dev/null
 set +e
-timeout 3s zig-out/bin/kite -c -B -n 1 "$EMPTY_TOPIC" >/dev/null 2>&1
+timeout 3s zig-out/bin/kite consume -B -n 1 "$EMPTY_TOPIC" >/dev/null 2>&1
 rc=$?
 set -e
-[ "$rc" -eq 124 ] || fail "bounds: 'kite -c -n 1' on an empty topic exited $rc within 3s; -n should only bound records"
+[ "$rc" -eq 124 ] || fail "bounds: 'kite consume -n 1' on an empty topic exited $rc within 3s; -n should only bound records"
 set +e
-timeout 10s zig-out/bin/kite -c -B -n 1 --idle 500ms "$EMPTY_TOPIC" >/dev/null 2>&1
+timeout 10s zig-out/bin/kite consume -B -n 1 --idle 500ms "$EMPTY_TOPIC" >/dev/null 2>&1
 rc=$?
 set -e
-[ "$rc" -eq 0 ] || fail "bounds: 'kite -c -n 1 --idle 500ms' on an empty topic exited $rc; expected a clean idle stop"
+[ "$rc" -eq 0 ] || fail "bounds: 'kite consume -n 1 --idle 500ms' on an empty topic exited $rc; expected a clean idle stop"
 echo "PASS bounds"
 
 # CSV over a pipe must yield the same records as file redirection (a pipe's
@@ -104,7 +104,7 @@ csv_topic() {
 # One JSON line per record with the per-topic/per-run fields dropped so two
 # topics can be compared (values with embedded newlines stay on one line).
 csv_dump() {
-    timeout 20s zig-out/bin/kite -c -B --idle 2s --json "$1" 2>/dev/null \
+    timeout 20s zig-out/bin/kite consume -B --idle 2s --json "$1" 2>/dev/null \
         | sed -E 's/^\{"topic":"[^"]*","partition":[0-9]+,"offset":([0-9]+),"timestamp":[0-9]+,/{"offset":\1,/'
 }
 for fixture in users events; do
@@ -113,13 +113,13 @@ for fixture in users events; do
     t_file=$(csv_topic "file-$fixture")
     t_pipe=$(csv_topic "pipe-$fixture")
     t_slow=$(csv_topic "slow-$fixture")
-    zig-out/bin/kite --csv "${keyopt[@]}" "$t_file" <"$file"
-    cat "$file" | timeout 20s zig-out/bin/kite --csv "${keyopt[@]}" "$t_pipe" \
-        || fail "csv-pipe: 'cat $file | kite --csv' exited $?"
+    zig-out/bin/kite produce --csv "${keyopt[@]}" "$t_file" <"$file"
+    cat "$file" | timeout 20s zig-out/bin/kite produce --csv "${keyopt[@]}" "$t_pipe" \
+        || fail "csv-pipe: 'cat $file | kite produce --csv' exited $?"
     while IFS= read -r line || [ -n "$line" ]; do
         printf '%s\n' "$line"
         sleep 0.2
-    done <"$file" | timeout 30s zig-out/bin/kite --csv "${keyopt[@]}" "$t_slow" \
+    done <"$file" | timeout 30s zig-out/bin/kite produce --csv "${keyopt[@]}" "$t_slow" \
         || fail "csv-pipe: slow chunked pipe for $file exited $?"
     want=$(csv_dump "$t_file")
     n=$(printf '%s\n' "$want" | grep -c .)
@@ -137,10 +137,10 @@ echo "PASS csv-pipe"
 # exit 0 without SIGPIPE noise on stderr (README: status 0).
 err=$(mktemp)
 set +e
-zig-out/bin/kite -c -B -t 5s "$TOPIC" 2>"$err" | head -n 1 >/dev/null
+zig-out/bin/kite consume -B -t 5s "$TOPIC" 2>"$err" | head -n 1 >/dev/null
 rc=${PIPESTATUS[0]}
 set -e
-[ "$rc" -eq 0 ] || fail "early-pipe: kite -c exited $rc after head closed the pipe"
+[ "$rc" -eq 0 ] || fail "early-pipe: kite consume exited $rc after head closed the pipe"
 if grep -qiE 'sigpipe|broken pipe' "$err"; then
     cat "$err"
     fail "early-pipe: SIGPIPE noise on stderr"
@@ -152,10 +152,10 @@ echo "PASS early-pipe"
 if [ -w /dev/full ] && ! echo probe >/dev/full 2>/dev/null; then
     err=$(mktemp)
     set +e
-    zig-out/bin/kite -c -B -t 5s "$TOPIC" >/dev/full 2>"$err"
+    zig-out/bin/kite consume -B -t 5s "$TOPIC" >/dev/full 2>"$err"
     rc=$?
     set -e
-    [ "$rc" -ne 0 ] || fail "dev-full: kite -c exited 0 despite full sink"
+    [ "$rc" -ne 0 ] || fail "dev-full: kite consume exited 0 despite full sink"
     grep -q "kite: cannot write stdout" "$err" || {
         cat "$err"
         fail "dev-full: no 'cannot write stdout' error line"

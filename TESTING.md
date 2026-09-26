@@ -31,8 +31,8 @@ For each of bash, zsh, and fish that is installed (others are skipped), the
 script installs the completion file into a temporary `HOME` exactly as the
 README "Shell completions" snippets do, then drives the shell's real
 completion machinery (`_kite` under bash, `compinit` + a zpty-driven widget
-under zsh, `complete -C` under fish) and asserts that `kite -c --fr` offers
-`--from-beginning` and `kite --cs` offers `--csv`.
+under zsh, `complete -C` under fish) and asserts that `kite consume --fr` offers
+`--from-beginning` and `kite produce --cs` offers `--csv`.
 
 ## Binary size
 
@@ -93,11 +93,11 @@ This runs in CI as the `e2e` job (blocking, after the unit job).
 Behaviours worth checking by hand on a terminal (not covered by the scripts):
 
 ```sh
-kite -c EXISTING_TOPIC                 # 'waiting for records' line, Ctrl-C -> summary, exit 130
-kite -c -B EXISTING_TOPIC | head -2    # exits 0 promptly once head closes the pipe
-kite -c -B EXISTING_TOPIC | wc -l      # stops after 5 s idle without -t/--idle/-f
-seq 1 100000 | kite EXISTING_TOPIC     # live rate line, then produce summary with per-partition offsets
-kite -b 127.0.0.1:1 -c EXISTING_TOPIC  # 'connection refused by 127.0.0.1:1'
+kite consume EXISTING_TOPIC           # 'waiting for records' line, Ctrl-C -> summary, exit 130
+kite consume -B EXISTING_TOPIC | head -2   # exits 0 promptly once head closes the pipe
+kite consume -B EXISTING_TOPIC | wc -l     # stops after 5 s idle without -t/--idle/-f
+seq 1 100000 | kite produce EXISTING_TOPIC # live rate line, then produce summary with per-partition offsets
+kite consume -b 127.0.0.1:1 EXISTING_TOPIC # 'connection refused by 127.0.0.1:1'
 ```
 
 For consumer compression coverage, produce batches with another client using
@@ -105,7 +105,7 @@ For consumer compression coverage, produce batches with another client using
 `UnsupportedCompression`), then compare:
 
 ```sh
-zig-out/bin/kite -c --from-beginning -t 3000 EXISTING_TOPIC | sort
+zig-out/bin/kite consume --from-beginning -t 3000 EXISTING_TOPIC | sort
 ```
 
 ## Debugging
@@ -113,5 +113,5 @@ zig-out/bin/kite -c --from-beginning -t 3000 EXISTING_TOPIC | sort
 Set `KITE_DEBUG=1` to dump frames and TLS details to stderr:
 
 ```sh
-KITE_DEBUG=1 sh -c 'echo hi | ./zig-out/bin/kite EXISTING_TOPIC'
+KITE_DEBUG=1 sh -c 'echo hi | ./zig-out/bin/kite produce EXISTING_TOPIC'
 ```

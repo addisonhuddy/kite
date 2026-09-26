@@ -2,7 +2,7 @@
 # One file, several clusters. `clusters:` maps each name to its settings
 # (the same dotted keys kite.properties uses). `defaults:` holds shared
 # settings applied to every cluster. `default:` picks the cluster used
-# when neither --target nor $KITE_TARGET is given.
+# when neither @NAME nor $KITE_TARGET is given.
 
 default: dev
 
