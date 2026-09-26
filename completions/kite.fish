@@ -1,24 +1,22 @@
 # fish completion for kite — install with
 #   mkdir -p ~/.config/fish/completions && cp completions/kite.fish ~/.config/fish/completions/
 
-set -l cmds produce p consume c targets config
-
-# First word: the four commands (plus the p/c aliases).
-complete -c kite -n 'test (count (commandline -opc)[2..-1]) -eq 0' -f -a 'produce p consume c targets config'
+# First word: the commands (plus the p/c aliases).
+complete -c kite -n 'test (count (commandline -opc)[2..-1]) -eq 0' -f -a 'produce p consume c cluster'
 
 # Cluster names from kite.yaml for @NAME positionals.
 complete -c kite -f -a '(begin; test -f kite.yaml; and awk "/^clusters:/{f=1;next} f&&/^[^ ]/{f=0} f&&/^  [A-Za-z0-9_-]+:/{sub(/^  /,\"@\");sub(/:.*/,\"\");print}" kite.yaml | sort -u; end)'
 
 # Options valid for every command.
-complete -c kite -n '__fish_seen_subcommand_from produce p consume c targets config' -s q -l quiet -d 'Suppress summary and progress lines'
-complete -c kite -n '__fish_seen_subcommand_from produce p consume c targets config' -s v -l verbose -d 'Diagnostics on stderr'
-complete -c kite -n '__fish_seen_subcommand_from produce p consume c targets config' -s h -l help -d 'Show help'
+complete -c kite -n '__fish_seen_subcommand_from produce p consume c cluster' -s q -l quiet -d 'Suppress summary and progress lines'
+complete -c kite -n '__fish_seen_subcommand_from produce p consume c cluster' -s v -l verbose -d 'Diagnostics on stderr'
+complete -c kite -n '__fish_seen_subcommand_from produce p consume c cluster' -s h -l help -d 'Show help'
 
 # produce and consume.
 complete -c kite -n '__fish_seen_subcommand_from produce p consume c' -s b -l bootstrap -d 'Comma-separated host:port brokers' -x
-complete -c kite -n '__fish_seen_subcommand_from produce p consume c targets config' -l config -d 'Read this properties file' -rF
-complete -c kite -n '__fish_seen_subcommand_from produce p consume c targets config' -l format -d 'Record shape' -xa 'value tsv json csv'
-complete -c kite -n '__fish_seen_subcommand_from produce p consume c targets config' -l json -d 'One JSON object per record (--format json)'
+complete -c kite -n '__fish_seen_subcommand_from produce p consume c cluster' -l config -d 'Read this properties file' -rF
+complete -c kite -n '__fish_seen_subcommand_from produce p consume c' -l format -d 'Record shape' -xa 'value tsv json csv'
+complete -c kite -n '__fish_seen_subcommand_from produce p consume c' -l json -d 'One JSON object per record (--format json)'
 
 # produce only.
 complete -c kite -n '__fish_seen_subcommand_from produce p' -s H -d 'Add a name: value header' -x
@@ -32,3 +30,10 @@ complete -c kite -n '__fish_seen_subcommand_from consume c' -l partition -d 'Rea
 complete -c kite -n '__fish_seen_subcommand_from consume c' -s n -l max -d 'Stop after MAX records' -x
 complete -c kite -n '__fish_seen_subcommand_from consume c' -s t -l idle -d 'Stop after idle duration' -x
 complete -c kite -n '__fish_seen_subcommand_from consume c' -s f -l follow -d 'Never stop on idle'
+
+# cluster.
+complete -c kite -n '__fish_seen_subcommand_from cluster; and test (count (commandline -opc)[2..-1]) -eq 0' -f -a 'list set'
+complete -c kite -n '__fish_seen_subcommand_from cluster' -l format -d 'Output shape' -xa 'json'
+complete -c kite -n '__fish_seen_subcommand_from cluster' -l json -d 'JSON output'
+# kite cluster set NAME completes cluster names from kite.yaml.
+complete -c kite -n '__fish_seen_subcommand_from cluster; and __fish_seen_subcommand_from set' -f -a '(begin; test -f kite.yaml; and awk "/^clusters:/{f=1;next} f&&/^[^ ]/{f=0} f&&/^  [A-Za-z0-9_-]+:/{sub(/^  /,\"\");sub(/:.*/,\"\");print}" kite.yaml | sort -u; end)'

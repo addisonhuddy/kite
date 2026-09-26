@@ -5,7 +5,7 @@
 #   # in ~/.zshrc: fpath=(~/.zfunc $fpath); autoload -Uz compinit && compinit
 
 # Complete the cluster names under `clusters:` in ./kite.yaml.
-_kite_targets() {
+_kite_clusters() {
     local -a names
     names=(${(f)"$(awk '/^clusters:/{f=1;next} f&&/^[^ ]/{f=0} f&&/^  [A-Za-z0-9_-]+:/{sub(/^  /,"");sub(/:.*/,"");print}' kite.yaml 2>/dev/null | sort -u)"})
     compadd -a names
@@ -34,7 +34,7 @@ _kite() {
         _arguments -s \
             '(-V --version)'{-V,--version}'[print version]' \
             '(-h --help)'{-h,--help}'[show help]' \
-            '1:command:(produce p consume c targets config)'
+            '1:command:(produce p consume c cluster)'
         return
     fi
 
@@ -49,26 +49,22 @@ _kite() {
                 '(-f --follow)'{-f,--follow}'[never stop on idle]' \
                 '*:arg:_kite_at_targets'
             ;;
-        config)
-            _arguments -s \
-                '(-b --bootstrap)'{-b,--bootstrap}'[comma-separated host:port brokers]:hosts:' \
-                '--config[read this properties file]:file:_files' \
-                '--format[output shape]:format:(json)' \
-                '--json[JSON output]' \
-                '(-q --quiet)'{-q,--quiet}'[suppress progress lines]' \
-                '(-v --verbose)'{-v,--verbose}'[diagnostics]' \
-                '(-h --help)'{-h,--help}'[show help]' \
-                '*:cluster:_kite_at_targets'
-            ;;
-        targets)
-            _arguments -s \
-                '--config[read this config file]:file:_files' \
-                '--format[output shape]:format:(json)' \
-                '--json[JSON output]' \
-                '(-q --quiet)'{-q,--quiet}'[suppress the source note]' \
-                '(-v --verbose)'{-v,--verbose}'[diagnostics]' \
-                '(-h --help)'{-h,--help}'[show help]' \
-                '*:cluster:_kite_at_targets'
+        cluster)
+            if (( CURRENT == 3 )); then
+                _arguments -s \
+                    '--config[read this config file]:file:_files' \
+                    '1:action:(list set)'
+            elif (( CURRENT == 4 )) && [[ "$words[3]" == set ]]; then
+                _kite_clusters
+            else
+                _arguments -s \
+                    '--config[read this config file]:file:_files' \
+                    '--format[output shape]:format:(json)' \
+                    '--json[JSON output]' \
+                    '(-q --quiet)'{-q,--quiet}'[suppress the source note]' \
+                    '(-v --verbose)'{-v,--verbose}'[diagnostics]' \
+                    '(-h --help)'{-h,--help}'[show help]'
+            fi
             ;;
         produce | p)
             _arguments -s $shared \

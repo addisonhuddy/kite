@@ -56,9 +56,8 @@ cmp -s "$TMP/root-help.out" "$TMP/consume-help.out" && {
     exit 1
 }
 run_case produce-help 0 nonempty empty produce --help
-run_case targets-help 0 nonempty empty targets --help
-run_case config-help 0 nonempty empty config --help
-for page in "$TMP/root-help.out" "$TMP/consume-help.out" "$TMP/produce-help.out" "$TMP/targets-help.out" "$TMP/config-help.out"; do
+run_case cluster-help 0 nonempty empty cluster --help
+for page in "$TMP/root-help.out" "$TMP/consume-help.out" "$TMP/produce-help.out" "$TMP/cluster-help.out"; do
     if awk 'length($0) > 80 { bad=1 } END { exit bad }' "$page"; then :; else
         echo "FAIL help line exceeds 80 columns"; exit 1
     fi
@@ -119,8 +118,10 @@ run_case typo-suggest 1 empty "did you mean '--from-beginning'?" consume --from-
 # 0.1 spellings get migration errors, not silent reinterpretation.
 run_case migrate-dash-c 1 empty "kite: '-c' is now a command: kite consume [@CLUSTER] TOPIC" -c demo
 run_case migrate-consume 1 empty "kite: '--consume' is now a command: kite consume [@CLUSTER] TOPIC" --consume demo
-run_case migrate-show-config 1 empty "kite: '--show-config' is now: kite config" --show-config
-run_case migrate-targets 1 empty "kite: '--targets' is now: kite targets" --targets
+run_case migrate-show-config 1 empty "kite: '--show-config' was removed; use 'kite cluster list' to see the selected cluster" --show-config
+run_case migrate-config 1 empty "kite: 'kite config' was removed; use 'kite cluster list' to see the selected cluster" config
+run_case migrate-targets 1 empty "kite: '--targets' is now: kite cluster list" --targets
+run_case migrate-targets-cmd 1 empty "kite: 'kite targets' is now: kite cluster list" targets
 run_case migrate-target 1 empty "kite: '--target NAME' was replaced by the @NAME positional (e.g. @prod)" --target x produce demo
 run_case migrate-target-eq 1 empty "kite: '--target NAME' was replaced by the @NAME positional (e.g. @prod)" --target=prod
 run_case migrate-target-mid 1 empty "kite: '--target NAME' was replaced by the @NAME positional (e.g. @prod)" produce --target x events
@@ -162,69 +163,23 @@ printf 'security.protocol=PLAINTEXT\n' >"$TMP/work/kite.properties"
 run_case file-without-bootstrap 1 empty "has no bootstrap.servers; add it, or pass -b HOST:PORT / set BOOTSTRAP_SERVERS" produce demo
 rm "$TMP/work/kite.properties"
 
-# kite config: offline config inspection.
-set +e
-(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" BOOTSTRAP_SERVERS=h:1 "$BIN" config >"$TMP/show-config-text.out" 2>"$TMP/show-config-text.err")
-status=$?
-set -e
-[ "$status" -eq 0 ] \
-    && grep -Eq '^bootstrap\.servers +h:1 +env$' "$TMP/show-config-text.out" \
-    && grep -Eq '^security\.protocol +PLAINTEXT +default$' "$TMP/show-config-text.out" \
-    && [ ! -s "$TMP/show-config-text.err" ] || {
-    echo "FAIL show-config-text"; cat "$TMP/show-config-text.out"; cat "$TMP/show-config-text.err"; exit 1;
-}
-echo "PASS show-config-text"
-
-printf 'security.protocol=SASL_PLAINTEXT\nsasl.mechanism=PLAIN\nsasl.username=u\nsasl.password=hunter2\nbootstrap.servers=f:2\n' >"$TMP/work/kite.properties"
-set +e
-(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" config >"$TMP/show-config-redact.out" 2>&1)
-status=$?
-set -e
-[ "$status" -eq 0 ] && grep -Fq '********' "$TMP/show-config-redact.out" \
-    && ! grep -Fq hunter2 "$TMP/show-config-redact.out" || {
-    echo "FAIL show-config-redact"; cat "$TMP/show-config-redact.out"; exit 1;
-}
-echo "PASS show-config-redact"
-
-set +e
-(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" config --json -b h:1 >"$TMP/show-config-json.out" 2>"$TMP/show-config-json.err")
-status=$?
-set -e
-[ "$status" -eq 0 ] \
-    && grep -Fq '{"file":' "$TMP/show-config-json.out" \
-    && grep -Fq '"sasl.password":{"value":"********","source":"file","redacted":true}' "$TMP/show-config-json.out" \
-    && grep -Fq '"bootstrap.servers":{"value":"h:1","source":"flag"}' "$TMP/show-config-json.out" \
-    || { echo "FAIL show-config-json"; cat "$TMP/show-config-json.out"; exit 1; }
-if command -v jq >/dev/null 2>&1; then
-    jq -e '.settings' "$TMP/show-config-json.out" >/dev/null || {
-        echo "FAIL show-config-json: jq rejected .settings"; exit 1;
-    }
-fi
-echo "PASS show-config-json"
-
-printf 'security.protocol=bogus\nbootstrap.servers=f:2\n' >"$TMP/work/kite.properties"
-set +e
-(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" config >"$TMP/show-config-invalid.out" 2>"$TMP/show-config-invalid.err")
-status=$?
-set -e
-[ "$status" -eq 1 ] && [ ! -s "$TMP/show-config-invalid.out" ] \
-    && grep -Fq "invalid security.protocol" "$TMP/show-config-invalid.err" || {
-    echo "FAIL show-config-invalid"; cat "$TMP/show-config-invalid.err"; exit 1;
-}
-echo "PASS show-config-invalid"
-rm "$TMP/work/kite.properties"
-
-run_case show-config-topic 1 empty "kite: unexpected argument 'demo'" config demo
-run_case show-config-format 1 empty "kite: --format: only json is valid with kite config" config --format tsv
+# kite cluster: pick, list, or persistently select the current cluster.
+# In a script (no TTY) bare `kite cluster` prints the same list as `list`.
+run_case cluster-no-file 1 empty "kite: no config file found" cluster list
+run_case cluster-bad-action 1 empty "kite: unexpected argument 'demo'" cluster demo
+run_case cluster-topic 1 empty "kite: unexpected argument 'demo'" cluster list demo
+run_case cluster-bootstrap 1 empty "kite: --bootstrap is not valid with kite cluster" cluster -b x:1
+run_case cluster-at 1 empty "use 'kite cluster set NAME' to switch clusters" cluster @prod
+run_case cluster-set-missing 1 empty "kite: missing NAME" cluster set
+run_case cluster-set-extra 1 empty "kite: unexpected argument 'b'" cluster set a b
+run_case cluster-json-set 1 empty "kite: --json is only valid with kite cluster list" cluster set prod --json
+run_case cluster-format 1 empty "kite: --format: only json is valid with kite cluster list" cluster list --format tsv
 
 # @NAME: named clusters in kite.yaml.
 run_case at-target-no-file 1 empty "requires a properties file" produce @x demo
 run_case at-target-empty 1 empty "'@' must be followed by a cluster name" produce @ demo
 run_case at-target-conflict 1 empty "kite: @prod cannot be combined with @dev" produce @prod @dev demo
 run_case at-target-repeat 1 empty "requires a properties file" produce @x @x demo
-run_case targets-no-file 1 empty "kite: no config file found" targets
-run_case targets-topic 1 empty "kite: unexpected argument 'demo'" targets demo
-run_case targets-bootstrap 1 empty "kite: --bootstrap is not valid with kite targets" targets -b x:1
 cat >"$TMP/work/kite.yaml" <<'EOF'
 defaults:
   linger.ms: 20
@@ -235,63 +190,69 @@ clusters:
   prod:
     bootstrap.servers: prod:3
 EOF
+# `kite cluster list` lists clusters without needing a complete config;
+# '*' marks the effective one, and stderr carries only the source note.
+run_case cluster-list 0 nonempty "kite: clusters from ./kite.yaml" cluster list
+printf 'dev\nprod\n' | cmp -s - "$TMP/cluster-list.out" || {
+    echo "FAIL cluster-list: unexpected stdout"; cat "$TMP/cluster-list.out"; exit 1;
+}
+run_case cluster-set 0 empty "kite: cluster set to 'prod'" cluster set prod
+[ "$(cat "$TMP/xdg/kite/current")" = prod ] || {
+    echo "FAIL cluster-set: current file"; cat "$TMP/xdg/kite/current" 2>/dev/null; exit 1;
+}
+echo "PASS cluster-set writes current file"
+run_case cluster-list-after-set 0 nonempty empty cluster list -q
+printf 'dev\nprod *\n' | cmp -s - "$TMP/cluster-list-after-set.out" || {
+    echo "FAIL cluster-list-after-set: unexpected stdout"; cat "$TMP/cluster-list-after-set.out"; exit 1;
+}
+# Non-TTY stdin: bare `kite cluster` falls back to the list.
+run_case cluster-fallback 0 nonempty empty cluster -q
+printf 'dev\nprod *\n' | cmp -s - "$TMP/cluster-fallback.out" || {
+    echo "FAIL cluster-fallback: unexpected stdout"; cat "$TMP/cluster-fallback.out"; exit 1;
+}
+run_case cluster-set-unknown 1 empty "no cluster 'nope' in ./kite.yaml (available: dev, prod)" cluster set nope
+# KITE_TARGET beats the stored current name.
 set +e
-(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" config @x >"$TMP/target-unknown.out" 2>"$TMP/target-unknown.err")
+(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" KITE_TARGET=dev "$BIN" cluster list -q >"$TMP/cluster-env.out" 2>"$TMP/cluster-env.err")
+status=$?
+set -e
+[ "$status" -eq 0 ] && printf 'dev *\nprod\n' | cmp -s - "$TMP/cluster-env.out" || {
+    echo "FAIL cluster-env"; cat "$TMP/cluster-env.out"; exit 1;
+}
+echo "PASS cluster-env"
+set +e
+(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" cluster list --json >"$TMP/cluster-json.out" 2>"$TMP/cluster-json.err")
+status=$?
+set -e
+[ "$status" -eq 0 ] \
+    && [ "$(cat "$TMP/cluster-json.out")" = '{"file":"./kite.yaml","current":"prod","clusters":["dev","prod"]}' ] \
+    && [ ! -s "$TMP/cluster-json.err" ] || {
+    echo "FAIL cluster-json"; cat "$TMP/cluster-json.out"; cat "$TMP/cluster-json.err"; exit 1;
+}
+echo "PASS cluster-json"
+# A current name missing from the doc warns and falls back to `default:`.
+printf 'gone\n' >"$TMP/xdg/kite/current"
+run_case cluster-stale 0 nonempty "current cluster 'gone' is not defined" cluster list
+printf 'dev\nprod\n' | cmp -s - "$TMP/cluster-stale.out" || {
+    echo "FAIL cluster-stale: unexpected stdout"; cat "$TMP/cluster-stale.out"; exit 1;
+}
+rm -f "$TMP/xdg/kite/current"
+# @NAME on produce writes the current file before the connection attempt.
+set +e
+(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" produce @dev demo </dev/null >"$TMP/at-write.out" 2>"$TMP/at-write.err")
 status=$?
 set -e
 [ "$status" -eq 1 ] \
-    && grep -Fq "no cluster 'x'" "$TMP/target-unknown.err" \
-    && grep -Fq "available: dev, prod" "$TMP/target-unknown.err" || {
-    echo "FAIL target-unknown"; cat "$TMP/target-unknown.err"; exit 1;
+    && [ "$(cat "$TMP/xdg/kite/current")" = dev ] \
+    && grep -Fq "now pointing at cluster 'dev'" "$TMP/at-write.err" || {
+    echo "FAIL at-write"; cat "$TMP/at-write.err"; exit 1;
 }
-echo "PASS target-unknown"
-# `kite targets` lists clusters without needing a complete config; '*' marks
-# the selected one, and stderr carries only the source note.
-run_case targets-list 0 nonempty "kite: clusters from ./kite.yaml" targets
-printf 'dev\nprod\n' | cmp -s - "$TMP/targets-list.out" || {
-    echo "FAIL targets-list: unexpected stdout"; cat "$TMP/targets-list.out"; exit 1;
-}
-run_case targets-at 0 nonempty empty targets -q @prod
-printf 'dev\nprod *\n' | cmp -s - "$TMP/targets-at.out" || {
-    echo "FAIL targets-at: unexpected stdout"; cat "$TMP/targets-at.out"; exit 1;
-}
-run_case targets-unknown 1 empty "no cluster 'x' in ./kite.yaml (available: dev, prod)" targets @x
-set +e
-(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" KITE_TARGET=prod "$BIN" targets --json >"$TMP/targets-json.out" 2>"$TMP/targets-json.err")
-status=$?
-set -e
-[ "$status" -eq 0 ] \
-    && [ "$(cat "$TMP/targets-json.out")" = '{"file":"./kite.yaml","target":"prod","targets":["dev","prod"]}' ] \
-    && [ ! -s "$TMP/targets-json.err" ] || {
-    echo "FAIL targets-json"; cat "$TMP/targets-json.out"; cat "$TMP/targets-json.err"; exit 1;
-}
-echo "PASS targets-json"
-# @NAME selects a cluster for `kite config` exactly like $KITE_TARGET.
-set +e
-(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" config @prod --json >"$TMP/at-target-json.out" 2>"$TMP/at-target-json.err")
-status=$?
-set -e
-[ "$status" -eq 0 ] \
-    && grep -Fq '"target":"prod"' "$TMP/at-target-json.out" \
-    && grep -Fq '"bootstrap.servers":{"value":"prod:3","source":"target"}' "$TMP/at-target-json.out" || {
-    echo "FAIL at-target-json"; cat "$TMP/at-target-json.out"; cat "$TMP/at-target-json.err"; exit 1;
-}
-echo "PASS at-target-json"
-set +e
-(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" KITE_TARGET=prod "$BIN" config --json >"$TMP/target-json.out" 2>"$TMP/target-json.err")
-status=$?
-set -e
-[ "$status" -eq 0 ] \
-    && grep -Fq '"target":"prod"' "$TMP/target-json.out" \
-    && grep -Fq '"bootstrap.servers":{"value":"prod:3","source":"target"}' "$TMP/target-json.out" \
-    && grep -Fq '"linger.ms":{"value":"20","source":"file"}' "$TMP/target-json.out" || {
-    echo "FAIL target-json"; cat "$TMP/target-json.out"; cat "$TMP/target-json.err"; exit 1;
-}
-echo "PASS target-json"
+echo "PASS at-write"
+rm -f "$TMP/xdg/kite/current"
 printf 'bootstrap.servers=base:1\n' >"$TMP/work/kite.properties"
 rm "$TMP/work/kite.yaml"
 run_case target-properties-file 1 empty "properties files define a single cluster" produce @dev demo
-run_case targets-properties-file 0 empty "defines no clusters" targets
+run_case cluster-properties-file 0 empty "defines no clusters" cluster list
 rm "$TMP/work/kite.properties"
 cat >"$TMP/work/kite.yaml" <<'EOF'
 default: dev
@@ -299,16 +260,10 @@ clusters:
   dev:
     bootstrap.servers: dev:2
 EOF
-set +e
-(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" config --json >"$TMP/target-default.out" 2>"$TMP/target-default.err")
-status=$?
-set -e
-[ "$status" -eq 0 ] \
-    && grep -Fq '"target":"dev"' "$TMP/target-default.out" \
-    && grep -Fq '"bootstrap.servers":{"value":"dev:2","source":"target"}' "$TMP/target-default.out" || {
-    echo "FAIL target-default"; cat "$TMP/target-default.out"; cat "$TMP/target-default.err"; exit 1;
+run_case cluster-default 0 nonempty empty cluster list -q
+printf 'dev *\n' | cmp -s - "$TMP/cluster-default.out" || {
+    echo "FAIL cluster-default: unexpected stdout"; cat "$TMP/cluster-default.out"; exit 1;
 }
-echo "PASS target-default"
 printf 'default: dev\nclusters\n  dev:\n' >"$TMP/work/kite.yaml"
 run_case target-yaml-syntax 1 empty "kite.yaml:2: missing ':'" produce demo
 cat >"$TMP/work/foo.yml" <<'EOF'
@@ -317,16 +272,11 @@ clusters:
     bootstrap.servers: prod:3
 EOF
 rm "$TMP/work/kite.yaml"
-set +e
-(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" config --config foo.yml @prod --json >"$TMP/target-yml.out" 2>"$TMP/target-yml.err")
-status=$?
-set -e
-[ "$status" -eq 0 ] \
-    && grep -Fq '"target":"prod"' "$TMP/target-yml.out" \
-    && grep -Fq '"bootstrap.servers":{"value":"prod:3","source":"target"}' "$TMP/target-yml.out" || {
-    echo "FAIL target-yml"; cat "$TMP/target-yml.out"; cat "$TMP/target-yml.err"; exit 1;
+run_case cluster-yml 0 nonempty empty cluster list -q --config foo.yml
+printf 'prod\n' | cmp -s - "$TMP/cluster-yml.out" || {
+    echo "FAIL cluster-yml: unexpected stdout"; cat "$TMP/cluster-yml.out"; exit 1;
 }
-echo "PASS target-yml"
+rm "$TMP/work/foo.yml"
 
 grep -Fq "Try 'kite --help' for the list of commands." "$TMP/unknown-option-first.err"
 grep -Fq "Try 'kite --help' for the list of commands." "$TMP/migrate-dash-c.err"

@@ -64,8 +64,12 @@ if command -v bash >/dev/null; then
         _kite && printf "%s\n" "${COMPREPLY[@]}"
         COMP_WORDS=(kite produce @local); COMP_CWORD=2; COMP_LINE="kite produce @local"; COMP_POINT=${#COMP_LINE}
         _kite && printf "%s\n" "${COMPREPLY[@]}"
+        COMP_WORDS=(kite clu); COMP_CWORD=1; COMP_LINE="kite clu"; COMP_POINT=${#COMP_LINE}
+        _kite && printf "%s\n" "${COMPREPLY[@]}"
+        COMP_WORDS=(kite cluster s); COMP_CWORD=2; COMP_LINE="kite cluster s"; COMP_POINT=${#COMP_LINE}
+        _kite && printf "%s\n" "${COMPREPLY[@]}"
     ') || fail "bash: completion script did not load"
-    expect bash "$out" --from-beginning --csv consume config @local-b
+    expect bash "$out" --from-beginning --csv consume @local-b cluster set
 else
     echo "SKIP bash"
 fi
@@ -132,10 +136,10 @@ for line in "$@"; do
 done
 zpty -w kite_zsh 'exit'
 EOF
-    raw=$(HOME=$H TERM=dumb timeout 60s zsh -f "$TMP/zsh-driver.zsh" 'kite consume --fr' 'kite produce --cs' 'kite con' 2>"$TMP/zsh-transcript") || true
+    raw=$(HOME=$H TERM=dumb timeout 60s zsh -f "$TMP/zsh-driver.zsh" 'kite consume --fr' 'kite produce --cs' 'kite con' 'kite clu' 2>"$TMP/zsh-transcript") || true
     out=$(tr -d '\r' <<<"$raw" | sed -n '/<</,/>>/p' | sed 's/.*<<//; s/>>.*//' | tr -d ' ' | grep -v '^$') || true
     [ -n "$out" ] || { echo "--- zsh transcript:" >&2; cat -v "$TMP/zsh-transcript" >&2; echo >&2; }
-    expect zsh "$out" --from-beginning --csv consume config
+    expect zsh "$out" --from-beginning --csv consume cluster
 else
     echo "SKIP zsh"
 fi
@@ -148,8 +152,8 @@ if command -v fish >/dev/null; then
         set -q __fish_config_dir; or set __fish_config_dir ~/.config/fish
         mkdir -p $__fish_config_dir/completions
         cp '"$ROOT"'/completions/kite.fish $__fish_config_dir/completions/'
-    out=$(HOME=$H XDG_CONFIG_HOME= fish -c 'complete -C "kite consume --fr"; complete -C "kite produce --cs"; complete -C "kite con"' | cut -f1)
-    expect fish "$out" --from-beginning --csv consume config
+    out=$(HOME=$H XDG_CONFIG_HOME= fish -c 'complete -C "kite consume --fr"; complete -C "kite produce --cs"; complete -C "kite con"; complete -C "kite clu"' | cut -f1)
+    expect fish "$out" --from-beginning --csv consume cluster
 else
     echo "SKIP fish"
 fi
