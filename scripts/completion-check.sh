@@ -20,7 +20,7 @@ else
     chmod +x "$TMP/bin/kite"
 fi
 export PATH="$TMP/bin:$PATH"
-# A kite.yaml in the cwd, so @NAME / --target complete cluster names.
+# A kite.yaml in the cwd, so @NAME completes cluster names.
 mkdir -p "$TMP/work"
 printf 'clusters:\n  local-a:\n    bootstrap.servers: a:1\n  local-b:\n    bootstrap.servers: b:1\n' >"$TMP/work/kite.yaml"
 cd "$TMP/work"
@@ -56,16 +56,16 @@ if command -v bash >/dev/null; then
     out=$(HOME=$H bash --noprofile --norc -c '
         source ~/.local/share/bash-completion/completions/kite
         complete -p kite >/dev/null || exit 1
-        COMP_WORDS=(kite -c --fr); COMP_CWORD=2; COMP_LINE="kite -c --fr"; COMP_POINT=${#COMP_LINE}
+        COMP_WORDS=(kite consume --fr); COMP_CWORD=2; COMP_LINE="kite consume --fr"; COMP_POINT=${#COMP_LINE}
         _kite && printf "%s\n" "${COMPREPLY[@]}"
-        COMP_WORDS=(kite --cs); COMP_CWORD=1; COMP_LINE="kite --cs"; COMP_POINT=${#COMP_LINE}
+        COMP_WORDS=(kite produce --cs); COMP_CWORD=2; COMP_LINE="kite produce --cs"; COMP_POINT=${#COMP_LINE}
         _kite && printf "%s\n" "${COMPREPLY[@]}"
-        COMP_WORDS=(kite --targ); COMP_CWORD=1; COMP_LINE="kite --targ"; COMP_POINT=${#COMP_LINE}
+        COMP_WORDS=(kite con); COMP_CWORD=1; COMP_LINE="kite con"; COMP_POINT=${#COMP_LINE}
         _kite && printf "%s\n" "${COMPREPLY[@]}"
-        COMP_WORDS=(kite @local); COMP_CWORD=1; COMP_LINE="kite @local"; COMP_POINT=${#COMP_LINE}
+        COMP_WORDS=(kite produce @local); COMP_CWORD=2; COMP_LINE="kite produce @local"; COMP_POINT=${#COMP_LINE}
         _kite && printf "%s\n" "${COMPREPLY[@]}"
     ') || fail "bash: completion script did not load"
-    expect bash "$out" --from-beginning --csv --targets @local-b
+    expect bash "$out" --from-beginning --csv consume config @local-b
 else
     echo "SKIP bash"
 fi
@@ -132,10 +132,10 @@ for line in "$@"; do
 done
 zpty -w kite_zsh 'exit'
 EOF
-    raw=$(HOME=$H TERM=dumb timeout 60s zsh -f "$TMP/zsh-driver.zsh" 'kite -c --fr' 'kite --cs' 'kite --targ' 2>"$TMP/zsh-transcript") || true
+    raw=$(HOME=$H TERM=dumb timeout 60s zsh -f "$TMP/zsh-driver.zsh" 'kite consume --fr' 'kite produce --cs' 'kite con' 2>"$TMP/zsh-transcript") || true
     out=$(tr -d '\r' <<<"$raw" | sed -n '/<</,/>>/p' | sed 's/.*<<//; s/>>.*//' | tr -d ' ' | grep -v '^$') || true
     [ -n "$out" ] || { echo "--- zsh transcript:" >&2; cat -v "$TMP/zsh-transcript" >&2; echo >&2; }
-    expect zsh "$out" --from-beginning --csv --targets
+    expect zsh "$out" --from-beginning --csv consume config
 else
     echo "SKIP zsh"
 fi
@@ -148,8 +148,8 @@ if command -v fish >/dev/null; then
         set -q __fish_config_dir; or set __fish_config_dir ~/.config/fish
         mkdir -p $__fish_config_dir/completions
         cp '"$ROOT"'/completions/kite.fish $__fish_config_dir/completions/'
-    out=$(HOME=$H XDG_CONFIG_HOME= fish -c 'complete -C "kite -c --fr"; complete -C "kite --cs"; complete -C "kite --targ"' | cut -f1)
-    expect fish "$out" --from-beginning --csv --targets
+    out=$(HOME=$H XDG_CONFIG_HOME= fish -c 'complete -C "kite consume --fr"; complete -C "kite produce --cs"; complete -C "kite con"' | cut -f1)
+    expect fish "$out" --from-beginning --csv consume config
 else
     echo "SKIP fish"
 fi
