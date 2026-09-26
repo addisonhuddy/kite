@@ -1,5 +1,5 @@
 //! kite — ultra-lightweight Kafka CLI.
-//! `kite <topic> < file` sends each stdin line as one record value.
+//! `kite produce <topic> < file` sends each stdin line as one record value.
 
 const std = @import("std");
 const config = @import("config.zig");
@@ -126,28 +126,35 @@ pub fn main(init: std.process.Init) !void {
         writeText(init, std.Io.File.stdout(), "kite " ++ cli_args.version ++ "\n");
         return;
     }
-    const split = cli_args.splitMode(alloc, args[1..]);
-    const mode_args = switch (split) {
-        .err => |message| parseFatal(init, message, cli_args.produce_usage),
+    const split = cli_args.splitCommand(alloc, args[1..]);
+    const command_args = switch (split) {
+        .err => |message| parseFatal(init, message, cli_args.overview_usage),
         .ok => |value| value,
-        .help => unreachable,
+        .help => {
+            if (term.detect(io, std.Io.File.stdout(), init.environ_map)) {
+                term.color.enabled = true;
+                const page = term.renderHelp(alloc, cli_args.overview_help) catch fatal("out of memory", .{});
+                writeText(init, std.Io.File.stdout(), page);
+            } else writeText(init, std.Io.File.stdout(), cli_args.overview_help);
+            return;
+        },
     };
-    switch (mode_args.mode) {
+    switch (command_args.command) {
         .consume => {
-            runConsume(init, mode_args.rest, alloc);
+            runConsume(init, command_args.rest, alloc);
             return;
         },
-        .show_config => {
-            runShowConfig(init, mode_args.rest, alloc);
+        .config => {
+            runShowConfig(init, command_args.rest, alloc);
             return;
         },
-        .list_targets => {
-            runListTargets(init, mode_args.rest, alloc);
+        .targets => {
+            runListTargets(init, command_args.rest, alloc);
             return;
         },
         .produce => {},
     }
-    const parsed = cli_args.parseProduce(alloc, mode_args.rest);
+    const parsed = cli_args.parseProduce(alloc, command_args.rest);
     const produce = switch (parsed) {
         .help => {
             if (term.detect(io, std.Io.File.stdout(), init.environ_map)) {
@@ -434,7 +441,7 @@ fn loadConfig(init: std.process.Init, alloc: std.mem.Allocator, common: cli_args
         error.MissingSaslMechanism => fatal("security.protocol=SASL_* requires sasl.mechanism", .{}),
         error.MissingSaslCredentials => fatal("sasl.mechanism set but sasl.username/sasl.password missing", .{}),
         error.TargetWithoutFile => fatal(
-            "--target requires a properties file (searched {s})",
+            "@NAME requires a properties file (searched {s})",
             .{search_path_hint},
         ),
         error.ConfigSyntax => fatal("{s}:{d}: {s}", .{ source.file.?, source.diag.line, source.diag.msg }),
@@ -719,7 +726,7 @@ fn runShowConfig(init: std.process.Init, args: []const []const u8, alloc: std.me
     std.process.exit(0);
 }
 
-/// `kite --targets`: list the clusters in the config file without
+/// `kite targets`: list the clusters in the config file without
 /// resolving an effective Config, so incomplete clusters still list.
 fn runListTargets(init: std.process.Init, args: []const []const u8, alloc: std.mem.Allocator) noreturn {
     const parsed = cli_args.parseListTargets(alloc, args);
@@ -784,7 +791,7 @@ fn runListTargets(init: std.process.Init, args: []const []const u8, alloc: std.m
     std.process.exit(0);
 }
 
-/// Idle bound applied to `kite -c` when stdout is not a terminal and no
+/// Idle bound applied to `kite consume` when stdout is not a terminal and no
 /// --max/--idle/--follow was given.
 const default_idle_ms: u64 = 5000;
 

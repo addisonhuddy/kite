@@ -41,7 +41,7 @@ pub const LoadError = error{
     MissingSaslCredentials,
     /// A target was selected but the file defines no such cluster.
     UnknownTarget,
-    /// --target/KITE_TARGET was given but no config file was found.
+    /// @NAME/KITE_TARGET was given but no config file was found.
     TargetWithoutFile,
     /// The config file failed to parse (see source.diag).
     ConfigSyntax,
@@ -52,7 +52,7 @@ pub const LoadError = error{
 pub const Overrides = struct {
     bootstrap: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
-    /// --target NAME: pick the named cluster from the config file.
+    /// @NAME: pick the named cluster from the config file.
     target: ?[]const u8 = null,
 };
 
@@ -72,7 +72,7 @@ pub const Source = struct {
     file_kind: FileKind = .none,
     /// Parse diagnostic when load fails with error.ConfigSyntax.
     diag: yaml.Diag = .{},
-    /// Per-key provenance for --show-config.
+    /// Per-key provenance for `kite config`.
     origins: std.EnumArray(Key, Origin) = .initFill(.default),
 };
 
@@ -326,11 +326,11 @@ pub fn load(
     return cfg;
 }
 
-/// The clusters a config file defines, for `kite --targets`.
+/// The clusters a config file defines, for `kite targets`.
 pub const Targets = struct {
     /// Sorted cluster names.
     names: [][]const u8,
-    /// The cluster --target/$KITE_TARGET/`default:` would select, if any.
+    /// The cluster @NAME/$KITE_TARGET/`default:` would select, if any.
     selected: ?[]const u8,
 };
 
@@ -421,7 +421,7 @@ fn sortedClusterNames(alloc: std.mem.Allocator, doc: Doc) error{OutOfMemory}![][
     return names.items;
 }
 
-/// The cluster name chosen by --target, then $KITE_TARGET, then the
+/// The cluster name chosen by @NAME, then $KITE_TARGET, then the
 /// file's `default:`.
 fn selectTarget(env: *std.process.Environ.Map, doc: ?Doc, overrides: Overrides) ?[]const u8 {
     if (overrides.target) |t| return t;
@@ -444,7 +444,7 @@ fn validTargetName(name: []const u8) bool {
 /// the environment map, and overrides. `doc` is null when no file was
 /// found. Value precedence, highest first: flags, the selected cluster's
 /// keys, environment, shared/base file keys, defaults. A cluster is
-/// chosen by --target, then $KITE_TARGET, then the file's `default`.
+/// chosen by @NAME, then $KITE_TARGET, then the file's `default`.
 pub fn applyProps(
     alloc: std.mem.Allocator,
     env: *std.process.Environ.Map,
@@ -482,7 +482,7 @@ pub fn applyProps(
 
     // The selected cluster's keys override ambient env vars: a named
     // cluster is a complete definition, so e.g. BOOTSTRAP_SERVERS must
-    // not silently redirect `--target prod`, but env still fills keys
+    // not silently redirect `@prod`, but env still fills keys
     // the cluster omits.
     if (selected) |name| {
         var it = doc.?.clusters.get(name).?.iterator();

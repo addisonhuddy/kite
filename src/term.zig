@@ -42,10 +42,14 @@ pub fn renderHelp(alloc: std.mem.Allocator, page: []const u8) ![]u8 {
             try appendStyled(&out, alloc, color.enabled, bold, line);
         } else if (std.mem.startsWith(u8, line, "  ")) {
             const prefix_len: usize = 2;
-            const word: []const u8 = if (std.mem.startsWith(u8, line[prefix_len..], "kite -c"))
-                "kite -c"
-            else if (std.mem.startsWith(u8, line[prefix_len..], "kite -i"))
-                "kite -i"
+            const word: []const u8 = if (std.mem.startsWith(u8, line[prefix_len..], "kite produce"))
+                "kite produce"
+            else if (std.mem.startsWith(u8, line[prefix_len..], "kite consume"))
+                "kite consume"
+            else if (std.mem.startsWith(u8, line[prefix_len..], "kite targets"))
+                "kite targets"
+            else if (std.mem.startsWith(u8, line[prefix_len..], "kite config"))
+                "kite config"
             else if (std.mem.startsWith(u8, line[prefix_len..], "kite"))
                 "kite"
             else
