@@ -53,15 +53,14 @@ pub const version = "0.2.0";
 pub const Command = enum {
     produce,
     consume,
-    targets,
-    config,
+    cluster,
 };
 
-pub const ShowConfigArgs = struct {
-    common: Common = .{},
-};
+pub const ClusterAction = enum { pick, list, set };
 
-pub const ListTargetsArgs = struct {
+pub const ClusterArgs = struct {
+    action: ClusterAction = .pick,
+    name: ?[]const u8 = null,
     common: Common = .{},
 };
 
@@ -73,12 +72,11 @@ pub const CommandSplit = struct {
 fn matchCommand(arg: []const u8) ?Command {
     if (std.mem.eql(u8, arg, "produce") or std.mem.eql(u8, arg, "p")) return .produce;
     if (std.mem.eql(u8, arg, "consume") or std.mem.eql(u8, arg, "c")) return .consume;
-    if (std.mem.eql(u8, arg, "targets")) return .targets;
-    if (std.mem.eql(u8, arg, "config")) return .config;
+    if (std.mem.eql(u8, arg, "cluster")) return .cluster;
     return null;
 }
 
-const command_names = [_][]const u8{ "produce", "consume", "targets", "config" };
+const command_names = [_][]const u8{ "produce", "consume", "cluster" };
 
 /// Closest command name when exactly one is within distance 2.
 fn suggestCommand(name: []const u8) ?[]const u8 {
@@ -118,18 +116,22 @@ pub fn splitCommand(alloc: std.mem.Allocator, args: []const []const u8) Result(C
         return .{ .err = firstArgError(alloc, arg) };
     }
     if (want_help) return .help;
-    return .{ .err = "missing command (want produce, consume, targets, or config)" };
+    return .{ .err = "missing command (want produce, consume, or cluster)" };
 }
 
-/// Migration errors for the 0.1 flag-mode spellings, then the generic
-/// unknown-option/unknown-command diagnostics.
+/// Migration errors for the 0.1 flag-mode spellings and the removed
+/// config/targets commands, then the generic diagnostics.
 fn firstArgError(alloc: std.mem.Allocator, arg: []const u8) []const u8 {
     if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--consume"))
         return errMsg(alloc, "'{s}' is now a command: kite consume [@CLUSTER] TOPIC", .{arg});
     if (std.mem.eql(u8, arg, "--show-config"))
-        return "'--show-config' is now: kite config";
+        return "'--show-config' was removed; use 'kite cluster list' to see the selected cluster";
+    if (std.mem.eql(u8, arg, "config"))
+        return "'kite config' was removed; use 'kite cluster list' to see the selected cluster";
     if (std.mem.eql(u8, arg, "--targets"))
-        return "'--targets' is now: kite targets";
+        return "'--targets' is now: kite cluster list";
+    if (std.mem.eql(u8, arg, "targets"))
+        return "'kite targets' is now: kite cluster list";
     if (std.mem.eql(u8, arg, "--target") or std.mem.startsWith(u8, arg, "--target="))
         return "'--target NAME' was replaced by the @NAME positional (e.g. @prod)";
     if (arg.len > 0 and arg[0] == '-')
@@ -170,20 +172,23 @@ pub const overview_help =
     "Usage:\n" ++
     "  kite produce [OPTIONS] [@CLUSTER] TOPIC   Write stdin records to TOPIC.\n" ++
     "  kite consume [OPTIONS] [@CLUSTER] TOPIC   Read TOPIC to stdout.\n" ++
-    "  kite targets [OPTIONS] [@CLUSTER]         List clusters in kite.yaml.\n" ++
-    "  kite config [OPTIONS] [@CLUSTER]          Show the effective config.\n" ++
+    "  kite cluster [list|set NAME]   Pick, list, or set the cluster kite uses.\n" ++
     "  kite --help                               Show this help.\n" ++
     "  kite --version                            Print the version.\n" ++
     "\n" ++
     "'p' and 'c' are short for 'produce' and 'consume'. @NAME picks a\n" ++
-    "cluster from kite.yaml and may appear anywhere among the arguments.\n" ++
+    "cluster from kite.yaml for this run and makes it the current cluster.\n" ++
     "\n" ++
     "Examples:\n" ++
     "  kite produce events < examples/data/lines.txt\n" ++
     "  kite consume -B --idle 3s events\n" ++
-    "  kite consume --json @prod src | kite produce --json dst\n" ++
-    "  kite targets\n" ++
-    "  kite config @prod\n" ++
+    "  kite consume @prod events\n" ++
+    "  kite cluster\n" ++
+    "  kite cluster set prod\n" ++
+    "\n" ++
+    "  'kite cluster set NAME' and @NAME store the current cluster in\n" ++
+    "  $XDG_CONFIG_HOME/kite/current (default ~/.config/kite/current).\n" ++
+    "  Precedence: @NAME, KITE_TARGET, current, then kite.yaml `default:`.\n" ++
     "\n" ++
     config_help;
 
@@ -196,8 +201,8 @@ pub const produce_help =
     "Options:\n" ++
     "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
     "  --config FILE         Read this properties file instead of searching.\n" ++
-    "  @NAME                 Use cluster NAME from kite.yaml (or\n" ++
-    "                        $KITE_TARGET).\n" ++
+    "  @NAME                 Use cluster NAME from kite.yaml and make it\n" ++
+    "                        current (or $KITE_TARGET for this run only).\n" ++
     "  -H HEADER             Add a 'name: value' header (repeatable).\n" ++
     "  --csv                 Read RFC 4180 CSV (same as --format csv).\n" ++
     "  --key COL             Use CSV column COL as the record key; requires --csv.\n" ++
@@ -231,8 +236,8 @@ pub const consume_help =
     "Options:\n" ++
     "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
     "  --config FILE         Read this properties file instead of searching.\n" ++
-    "  @NAME                 Use cluster NAME from kite.yaml (or\n" ++
-    "                        $KITE_TARGET).\n" ++
+    "  @NAME                 Use cluster NAME from kite.yaml and make it\n" ++
+    "                        current (or $KITE_TARGET for this run only).\n" ++
     "  -B, --from-beginning  Start at the earliest available offset.\n" ++
     "  --offset N            Start at offset N in each selected partition.\n" ++
     "                        Cannot be combined with --from-beginning.\n" ++
@@ -266,71 +271,42 @@ pub const consume_help =
     "\n" ++
     config_help;
 
-pub const show_config_usage =
-    "Usage: kite config [OPTIONS] [@CLUSTER]\n" ++
-    "Try 'kite config --help' for details.\n";
+pub const cluster_usage =
+    "Usage: kite cluster [list|set NAME] [OPTIONS]\n" ++
+    "Try 'kite cluster --help' for details.\n";
 
-pub const show_config_help =
-    "kite config - Print the effective configuration\n" ++
+pub const cluster_help =
+    "kite cluster - Pick, list, or set the cluster kite uses\n" ++
     "\n" ++
     "Usage:\n" ++
-    "  kite config [OPTIONS] [@CLUSTER]\n" ++
-    "\n" ++
-    "Options:\n" ++
-    "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
-    "  --config FILE         Read this properties file instead of searching.\n" ++
-    "  @NAME                 Use cluster NAME from kite.yaml (or\n" ++
-    "                        $KITE_TARGET).\n" ++
-    "  --format FMT          Output shape: json (default: text). --json is\n" ++
-    "                        short for --format json.\n" ++
-    "  -q, --quiet           Suppress the config-source note on stderr.\n" ++
-    "  -v, --verbose         Write diagnostics to stderr.\n" ++
-    "  -h, --help            Show this help and exit.\n" ++
-    "\n" ++
-    "Each setting prints with its origin: default, file, env, or flag\n" ++
-    "(flags override the environment, which overrides the file).\n" ++
-    "sasl.password is always redacted. kite never connects to a broker;\n" ++
-    "invalid or incomplete configuration exits 1 with a message.\n" ++
-    "\n" ++
-    "Examples:\n" ++
-    "  kite config\n" ++
-    "  kite config --json | jq '.settings[\"bootstrap.servers\"]'\n" ++
-    "  kite config @prod\n" ++
-    "\n" ++
-    config_help;
-
-pub const list_targets_usage =
-    "Usage: kite targets [OPTIONS] [@CLUSTER]\n" ++
-    "Try 'kite targets --help' for details.\n";
-
-pub const list_targets_help =
-    "kite targets - List the clusters defined in kite.yaml\n" ++
-    "\n" ++
-    "Usage:\n" ++
-    "  kite targets [OPTIONS] [@CLUSTER]\n" ++
+    "  kite cluster                  Interactive picker (terminals only).\n" ++
+    "  kite cluster list             Print the clusters in kite.yaml.\n" ++
+    "  kite cluster set NAME         Make NAME the current cluster.\n" ++
     "\n" ++
     "Options:\n" ++
     "  --config FILE         Read this config file instead of searching.\n" ++
-    "  @NAME                 Mark cluster NAME as selected instead of\n" ++
-    "                        $KITE_TARGET or the file's default.\n" ++
-    "  --format FMT          Output shape: json (default: text). --json is\n" ++
-    "                        short for --format json.\n" ++
-    "  -q, --quiet           Suppress the config-source note on stderr.\n" ++
+    "  --json                JSON output (list only).\n" ++
+    "  -q, --quiet           Suppress notes on stderr.\n" ++
     "  -v, --verbose         Write diagnostics to stderr.\n" ++
     "  -h, --help            Show this help and exit.\n" ++
     "\n" ++
-    "Prints one cluster name per line, sorted, with '*' after the one that\n" ++
-    "@NAME/$KITE_TARGET/`default:` selects; the JSON form is\n" ++
-    "{\"file\":..,\"target\":..,\"targets\":[..]}. Only the file's `clusters:` keys\n" ++
-    "are read, so it works even when a cluster is incomplete. kite never\n" ++
-    "connects to a broker. Exits 1 with a message when no config file is\n" ++
-    "found or the selected cluster is not defined.\n" ++
+    "With no subcommand on a terminal, kite draws a picker (arrows or j/k,\n" ++
+    "Enter to choose, q to quit); when stdin or stderr is not a terminal it\n" ++
+    "behaves like 'kite cluster list' so scripts never hang. 'list' prints\n" ++
+    "one cluster name per line, sorted, with '*' after the current one; the\n" ++
+    "JSON form is {\"file\":..,\"current\":..,\"clusters\":[..]}. Only the file's\n" ++
+    "`clusters:` keys are read, so it works even when a cluster is\n" ++
+    "incomplete; kite never connects to a broker.\n" ++
+    "\n" ++
+    "The current cluster is stored in $XDG_CONFIG_HOME/kite/current\n" ++
+    "(default ~/.config/kite/current) and is used when neither @NAME nor\n" ++
+    "$KITE_TARGET selects one; it wins over the file's `default:`.\n" ++
     "\n" ++
     "Examples:\n" ++
-    "  kite targets\n" ++
-    "  kite targets --json | jq -r '.targets[]'\n" ++
-    "  kite targets @prod\n" ++
-    "  kite targets --config kafka-configs.yaml\n" ++
+    "  kite cluster\n" ++
+    "  kite cluster list\n" ++
+    "  kite cluster list --json | jq -r '.clusters[]'\n" ++
+    "  kite cluster set prod\n" ++
     "\n" ++
     config_help;
 
@@ -397,8 +373,7 @@ const consume_only = [_][]const u8{ "-B", "--from-beginning", "--offset", "--par
 
 const produce_options = [_][]const u8{ "--bootstrap", "--config", "--format", "--json", "--csv", "--key", "--quiet", "--verbose", "--help" };
 const consume_options = [_][]const u8{ "--bootstrap", "--config", "--from-beginning", "--offset", "--partition", "--max", "--idle", "--follow", "--format", "--json", "--quiet", "--verbose", "--help" };
-const config_options = [_][]const u8{ "--bootstrap", "--config", "--json", "--format", "--quiet", "--verbose", "--help" };
-const targets_options = [_][]const u8{ "--config", "--json", "--format", "--quiet", "--verbose", "--help" };
+const cluster_options = [_][]const u8{ "--config", "--json", "--format", "--quiet", "--verbose", "--help" };
 
 /// Damerau-Levenshtein distance (adjacent transposition counts as one edit).
 /// Inputs are capped so the DP matrix lives on the stack.
@@ -425,8 +400,7 @@ fn suggestOption(command: Command, name: []const u8) ?[]const u8 {
     const candidates: []const []const u8 = switch (command) {
         .produce => &produce_options,
         .consume => &consume_options,
-        .config => &config_options,
-        .targets => &targets_options,
+        .cluster => &cluster_options,
     };
     var best: ?[]const u8 = null;
     var best_dist: usize = 3;
@@ -468,7 +442,7 @@ fn unknownOption(alloc: std.mem.Allocator, command: Command, arg: []const u8) []
             return errMsg(alloc, "'{s}' is a consume option; use 'kite consume [OPTIONS] TOPIC'", .{name}),
         .consume => if (isOneOf(name, &produce_only))
             return errMsg(alloc, "'{s}' is a produce option; use 'kite produce [OPTIONS] TOPIC'", .{name}),
-        .config, .targets => {},
+        .cluster => {},
     }
     if (suggestOption(command, name)) |candidate|
         return errMsg(alloc, "unknown option '{s}' (did you mean '{s}'?)", .{ arg, candidate });
@@ -554,12 +528,14 @@ fn finishCommon(common: Common) ?[]const u8 {
     return null;
 }
 
-pub fn parseListTargets(alloc: std.mem.Allocator, args: []const []const u8) Result(ListTargetsArgs) {
-    var parsed: ListTargetsArgs = .{};
+pub fn parseCluster(alloc: std.mem.Allocator, args: []const []const u8) Result(ClusterArgs) {
+    var parsed: ClusterArgs = .{};
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return .help;
+        if (arg.len > 0 and arg[0] == '@')
+            return .{ .err = "use 'kite cluster set NAME' to switch clusters" };
         if (parseCommon(alloc, &parsed.common, args, &i)) |step| {
             switch (step) {
                 .err => |m| return .{ .err = m },
@@ -567,13 +543,37 @@ pub fn parseListTargets(alloc: std.mem.Allocator, args: []const []const u8) Resu
             }
         }
         if (arg.len > 0 and arg[0] == '-')
-            return .{ .err = unknownOption(alloc, .targets, arg) };
-        return errorResult(ListTargetsArgs, alloc, "unexpected argument '{s}'", .{arg});
+            return .{ .err = unknownOption(alloc, .cluster, arg) };
+        switch (parsed.action) {
+            .pick => {
+                if (std.mem.eql(u8, arg, "list")) {
+                    parsed.action = .list;
+                } else if (std.mem.eql(u8, arg, "set")) {
+                    parsed.action = .set;
+                } else {
+                    return errorResult(ClusterArgs, alloc, "unexpected argument '{s}'", .{arg});
+                }
+            },
+            .list => return errorResult(ClusterArgs, alloc, "unexpected argument '{s}'", .{arg}),
+            .set => if (parsed.name == null) {
+                parsed.name = arg;
+            } else {
+                return errorResult(ClusterArgs, alloc, "unexpected argument '{s}'", .{arg});
+            },
+        }
     }
     if (parsed.common.bootstrap != null)
-        return errorResult(ListTargetsArgs, alloc, "--bootstrap is not valid with kite targets", .{});
-    if (parsed.common.format != .auto and parsed.common.format != .json)
-        return errorResult(ListTargetsArgs, alloc, "--format: only json is valid with kite targets", .{});
+        return errorResult(ClusterArgs, alloc, "--bootstrap is not valid with kite cluster", .{});
+    switch (parsed.action) {
+        .list => if (parsed.common.format != .auto and parsed.common.format != .json)
+            return errorResult(ClusterArgs, alloc, "--format: only json is valid with kite cluster list", .{}),
+        else => if (parsed.common.format != .auto)
+            return errorResult(ClusterArgs, alloc, "--json is only valid with kite cluster list", .{}),
+    }
+    if (parsed.action == .set and parsed.name == null)
+        return errorResult(ClusterArgs, alloc, "missing NAME", .{});
+    if (parsed.action == .set and parsed.name.?.len == 0)
+        return errorResult(ClusterArgs, alloc, "NAME must not be empty", .{});
     if (finishCommon(parsed.common)) |m| return .{ .err = m };
     return .{ .ok = parsed };
 }
@@ -759,28 +759,6 @@ pub fn parseConsume(alloc: std.mem.Allocator, args: []const []const u8) Result(C
     return .{ .ok = parsed };
 }
 
-pub fn parseShowConfig(alloc: std.mem.Allocator, args: []const []const u8) Result(ShowConfigArgs) {
-    var parsed: ShowConfigArgs = .{};
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return .help;
-        if (parseCommon(alloc, &parsed.common, args, &i)) |step| {
-            switch (step) {
-                .err => |m| return .{ .err = m },
-                .ok => continue,
-            }
-        }
-        if (arg.len > 0 and arg[0] == '-')
-            return .{ .err = unknownOption(alloc, .config, arg) };
-        return errorResult(ShowConfigArgs, alloc, "unexpected argument '{s}'", .{arg});
-    }
-    if (parsed.common.format != .auto and parsed.common.format != .json)
-        return errorResult(ShowConfigArgs, alloc, "--format: only json is valid with kite config", .{});
-    if (finishCommon(parsed.common)) |m| return .{ .err = m };
-    return .{ .ok = parsed };
-}
-
 fn expectErr(comptime T: type, result: Result(T), expected: []const u8) !void {
     switch (result) {
         .err => |message| try std.testing.expectEqualStrings(expected, message),
@@ -885,52 +863,46 @@ test "misspelled long options get a suggestion" {
     try expectErr(ProduceArgs, parseProduce(alloc, &.{ "--version", "demo" }), "unknown option '--version'");
 }
 
-test "config command split and parsing" {
+test "cluster command split and parsing" {
     const alloc = std.heap.page_allocator;
-    const split = splitCommand(alloc, &.{"config"});
-    switch (split) {
+    switch (splitCommand(alloc, &.{ "cluster", "list" })) {
         .ok => |result| {
-            try std.testing.expectEqual(Command.config, result.command);
-            try std.testing.expectEqualSlices([]const u8, &.{}, result.rest);
+            try std.testing.expectEqual(Command.cluster, result.command);
+            try std.testing.expectEqualSlices([]const u8, &.{"list"}, result.rest);
         },
         else => return error.TestUnexpectedResult,
     }
 
-    const ok = parseShowConfig(alloc, &.{ "-b", "h:1", "--config", "x.properties", "--json" });
-    switch (ok) {
+    switch (parseCluster(alloc, &.{ "--config", "x.yaml", "list", "--json", "-q" })) {
         .ok => |a| {
-            try std.testing.expectEqualStrings("h:1", a.common.bootstrap.?);
-            try std.testing.expectEqual(Format.json, a.common.format);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-    try expectErr(ShowConfigArgs, parseShowConfig(alloc, &.{ "--format", "tsv" }), "--format: only json is valid with kite config");
-    try expectErr(ShowConfigArgs, parseShowConfig(alloc, &.{"demo"}), "unexpected argument 'demo'");
-    try expectErr(ShowConfigArgs, parseShowConfig(alloc, &.{ "@prod", "demo" }), "unexpected argument 'demo'");
-}
-
-test "targets command split and parsing" {
-    const alloc = std.heap.page_allocator;
-    switch (splitCommand(alloc, &.{ "targets", "@prod" })) {
-        .ok => |result| {
-            try std.testing.expectEqual(Command.targets, result.command);
-            try std.testing.expectEqualSlices([]const u8, &.{"@prod"}, result.rest);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
-    switch (parseListTargets(alloc, &.{ "--config", "x.yaml", "@prod", "--json", "-q" })) {
-        .ok => |a| {
+            try std.testing.expectEqual(ClusterAction.list, a.action);
             try std.testing.expectEqualStrings("x.yaml", a.common.config_path.?);
-            try std.testing.expectEqualStrings("prod", a.common.target.?);
             try std.testing.expectEqual(Format.json, a.common.format);
             try std.testing.expect(a.common.quiet);
         },
         else => return error.TestUnexpectedResult,
     }
-    try expectErr(ListTargetsArgs, parseListTargets(alloc, &.{ "-b", "h:1" }), "--bootstrap is not valid with kite targets");
-    try expectErr(ListTargetsArgs, parseListTargets(alloc, &.{"--csv"}), "unknown option '--csv'");
-    try expectErr(ListTargetsArgs, parseListTargets(alloc, &.{"demo"}), "unexpected argument 'demo'");
+    switch (parseCluster(alloc, &.{ "set", "prod" })) {
+        .ok => |a| {
+            try std.testing.expectEqual(ClusterAction.set, a.action);
+            try std.testing.expectEqualStrings("prod", a.name.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (parseCluster(alloc, &.{})) {
+        .ok => |a| try std.testing.expectEqual(ClusterAction.pick, a.action),
+        else => return error.TestUnexpectedResult,
+    }
+    try expectErr(ClusterArgs, parseCluster(alloc, &.{"set"}), "missing NAME");
+    try expectErr(ClusterArgs, parseCluster(alloc, &.{ "set", "a", "b" }), "unexpected argument 'b'");
+    try expectErr(ClusterArgs, parseCluster(alloc, &.{ "list", "demo" }), "unexpected argument 'demo'");
+    try expectErr(ClusterArgs, parseCluster(alloc, &.{"demo"}), "unexpected argument 'demo'");
+    try expectErr(ClusterArgs, parseCluster(alloc, &.{"@prod"}), "use 'kite cluster set NAME' to switch clusters");
+    try expectErr(ClusterArgs, parseCluster(alloc, &.{ "-b", "h:1", "list" }), "--bootstrap is not valid with kite cluster");
+    try expectErr(ClusterArgs, parseCluster(alloc, &.{ "list", "--format", "tsv" }), "--format: only json is valid with kite cluster list");
+    try expectErr(ClusterArgs, parseCluster(alloc, &.{ "set", "prod", "--json" }), "--json is only valid with kite cluster list");
+    try expectErr(ClusterArgs, parseCluster(alloc, &.{"--json"}), "--json is only valid with kite cluster list");
+    try expectErr(ClusterArgs, parseCluster(alloc, &.{"--csv"}), "unknown option '--csv'");
 }
 
 test "@NAME positional selects the cluster" {
@@ -961,8 +933,7 @@ test "the first argument names the command" {
         .{ .args = &.{ "p", "events" }, .command = .produce, .rest = &.{"events"} },
         .{ .args = &.{ "consume", "-B", "events" }, .command = .consume, .rest = &.{ "-B", "events" } },
         .{ .args = &.{ "c", "events" }, .command = .consume, .rest = &.{"events"} },
-        .{ .args = &.{ "targets", "--json" }, .command = .targets, .rest = &.{"--json"} },
-        .{ .args = &.{ "config", "@prod" }, .command = .config, .rest = &.{"@prod"} },
+        .{ .args = &.{ "cluster", "set", "prod" }, .command = .cluster, .rest = &.{ "set", "prod" } },
         .{ .args = &.{ "produce", "@prod", "events" }, .command = .produce, .rest = &.{ "@prod", "events" } },
     };
     for (cases) |case| {
@@ -977,22 +948,24 @@ test "the first argument names the command" {
     // -h / --help with no command asks for the top-level overview.
     try std.testing.expectEqual(Result(CommandSplit).help, splitCommand(alloc, &.{"--help"}));
     try std.testing.expectEqual(Result(CommandSplit).help, splitCommand(alloc, &.{"-h"}));
-    try expectErr(CommandSplit, splitCommand(alloc, &.{}), "missing command (want produce, consume, targets, or config)");
+    try expectErr(CommandSplit, splitCommand(alloc, &.{}), "missing command (want produce, consume, or cluster)");
 }
 
 test "0.1 spellings report migration errors" {
     const alloc = std.heap.page_allocator;
     try expectErr(CommandSplit, splitCommand(alloc, &.{ "-c", "events" }), "'-c' is now a command: kite consume [@CLUSTER] TOPIC");
     try expectErr(CommandSplit, splitCommand(alloc, &.{ "--consume", "events" }), "'--consume' is now a command: kite consume [@CLUSTER] TOPIC");
-    try expectErr(CommandSplit, splitCommand(alloc, &.{"--show-config"}), "'--show-config' is now: kite config");
-    try expectErr(CommandSplit, splitCommand(alloc, &.{"--targets"}), "'--targets' is now: kite targets");
+    try expectErr(CommandSplit, splitCommand(alloc, &.{"--show-config"}), "'--show-config' was removed; use 'kite cluster list' to see the selected cluster");
+    try expectErr(CommandSplit, splitCommand(alloc, &.{"config"}), "'kite config' was removed; use 'kite cluster list' to see the selected cluster");
+    try expectErr(CommandSplit, splitCommand(alloc, &.{"--targets"}), "'--targets' is now: kite cluster list");
+    try expectErr(CommandSplit, splitCommand(alloc, &.{"targets"}), "'kite targets' is now: kite cluster list");
     try expectErr(CommandSplit, splitCommand(alloc, &.{ "--target", "prod", "events" }), "'--target NAME' was replaced by the @NAME positional (e.g. @prod)");
     try expectErr(CommandSplit, splitCommand(alloc, &.{"--target=prod"}), "'--target NAME' was replaced by the @NAME positional (e.g. @prod)");
     try expectErr(CommandSplit, splitCommand(alloc, &.{ "--bogus", "events" }), "unknown option '--bogus'");
     // --target is a migration error mid-command too, wherever it appears.
     try expectErr(ProduceArgs, parseProduce(alloc, &.{ "--target", "prod", "events" }), "'--target NAME' was replaced by the @NAME positional (e.g. @prod)");
     try expectErr(ConsumeArgs, parseConsume(alloc, &.{ "events", "--target=prod" }), "'--target NAME' was replaced by the @NAME positional (e.g. @prod)");
-    try expectErr(ListTargetsArgs, parseListTargets(alloc, &.{"--target=x"}), "'--target NAME' was replaced by the @NAME positional (e.g. @prod)");
+    try expectErr(ClusterArgs, parseCluster(alloc, &.{"--target=x"}), "'--target NAME' was replaced by the @NAME positional (e.g. @prod)");
 }
 
 test "unknown first argument names a command or gets a hint" {
@@ -1044,16 +1017,6 @@ test "@NAME parses into common.target" {
     }
     const consume = parseConsume(alloc, &.{ "events", "@prod" });
     switch (consume) {
-        .ok => |args| try std.testing.expectEqualStrings("prod", args.common.target.?),
-        else => return error.TestUnexpectedResult,
-    }
-    const show = parseShowConfig(alloc, &.{"@prod"});
-    switch (show) {
-        .ok => |args| try std.testing.expectEqualStrings("prod", args.common.target.?),
-        else => return error.TestUnexpectedResult,
-    }
-    const targets = parseListTargets(alloc, &.{"@prod"});
-    switch (targets) {
         .ok => |args| try std.testing.expectEqualStrings("prod", args.common.target.?),
         else => return error.TestUnexpectedResult,
     }
@@ -1127,9 +1090,9 @@ test "help is detected in argument order" {
 
 test "help text stays plain and narrow" {
     try std.testing.expect(produce_help.len != consume_help.len);
-    for ([_][]const u8{ produce_help, consume_help, show_config_help, list_targets_help }) |page|
+    for ([_][]const u8{ produce_help, consume_help, cluster_help }) |page|
         try std.testing.expect(std.mem.indexOf(u8, page, "-h, --help") != null);
-    for ([_][]const u8{ overview_help, produce_help, consume_help, show_config_help, list_targets_help }) |page| {
+    for ([_][]const u8{ overview_help, produce_help, consume_help, cluster_help }) |page| {
         var lines = std.mem.splitScalar(u8, page, '\n');
         while (lines.next()) |line| {
             try std.testing.expect(line.len <= 80);

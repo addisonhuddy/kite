@@ -242,8 +242,8 @@ the facts you need. They are stable across releases.
   Checksums are verified against the release `SHA256SUMS`.
 - **Configure:** `export BOOTSTRAP_SERVERS=host:port` (plus
   `SECURITY_PROTOCOL`, `SASL_MECHANISM`, `SASL_USERNAME`, `SASL_PASSWORD` for
-  hosted clusters) or `-b host:port`. `kite config --json` prints the
-  effective configuration without connecting.
+  hosted clusters) or `-b host:port`. `kite -v` prints which config sources
+  were used; `kite cluster list` shows the clusters in kite.yaml.
 - **Produce:** `printf 'value\n' | kite produce TOPIC`; JSON records with
   `kite produce --json TOPIC`; CSV with `kite produce --csv [--key COL] TOPIC`.
 - **Consume (bounded):** `kite consume -B -n 100 --idle 3s TOPIC` stops after 100
@@ -375,16 +375,15 @@ kite.yaml and may appear anywhere among a command's arguments; `p` and
 ```text
 kite produce [OPTIONS] [@CLUSTER] TOPIC   Write stdin lines to TOPIC.
 kite consume [OPTIONS] [@CLUSTER] TOPIC   Read TOPIC to stdout.
-kite config [OPTIONS] [@CLUSTER]          Show the effective configuration.
-kite targets [OPTIONS] [@CLUSTER]         List the clusters in kite.yaml.
+kite cluster [list|set NAME]              Pick, list, or set the current cluster.
 kite --version                            Print the version.
 ```
 
 | Mode | Option | Meaning |
 | --- | --- | --- |
 | produce, consume | `-b`, `--bootstrap HOSTS` | Comma-separated `host:port` brokers (overrides env and file). |
-| produce, consume | `--config FILE` | Read this properties file instead of searching. |
-| all | `@NAME` | Use cluster `NAME` from kite.yaml (or `$KITE_TARGET`). |
+| all | `--config FILE` | Read this properties file instead of searching. |
+| produce, consume | `@NAME` | Use cluster `NAME` from kite.yaml and make it current (also `$KITE_TARGET`). |
 | produce, consume | `--format FMT` | Record shape: `value`, `tsv`, `json` (default `auto`). |
 | produce | `--format csv` | RFC 4180 CSV input (produce only); same as `--csv`. |
 | produce, consume | `--json` | Alias for `--format json`. |
@@ -397,13 +396,12 @@ kite --version                            Print the version.
 | consume | `-n`, `--max MAX` | Stop after MAX records. |
 | consume | `-t`, `--idle DUR` | Stop after DUR without a record (`3s`, `500ms`, `1m`; bare number = ms). |
 | consume | `-f`, `--follow` | Never stop on idle, even when stdout is a pipe. |
-| produce, consume | `-q`, `--quiet` | Suppress the summary and progress lines on stderr. |
+| all | `-q`, `--quiet` | Suppress the summary and progress lines on stderr. |
 | produce, consume | `-v`, `--verbose` | Connection, retry, and fetch diagnostics on stderr. |
 | all | `-h`, `--help` | Plain-text help for the selected mode. |
 
 `kite --help` prints the command overview; `kite produce --help`,
-`kite consume --help`, `kite config --help`, and `kite targets --help`
-print the full pages.
+`kite consume --help`, and `kite cluster --help` print the full pages.
 
 ## Common recipes
 
@@ -442,7 +440,7 @@ kite consume -b broker1:9092,broker2:9092 -B -n 5 events
 # named cluster from kite.yaml (see "Multiple clusters" below)
 kite produce @prod events < examples/data/lines.txt
 # which clusters are there, and which one is selected?
-kite targets
+kite cluster list
 ```
 
 The consumer output is in the same textual shape accepted by the producer,
@@ -584,7 +582,7 @@ Templates are in [`examples/config/`](examples/config). Idempotence means
 broker deduplication of retried batches, not end-to-end exactly-once
 processing.
 
-### Multiple clusters (targets)
+### Multiple clusters
 
 `kite.yaml` holds several clusters. `clusters:` maps each name to its
 settings (any key from the table above); `defaults:` holds shared
@@ -613,34 +611,35 @@ scalars, comments. Lists, flow syntax, anchors, and block scalars are
 rejected with a `file:line` error.
 
 The cluster is selected by, in order: the `@NAME` positional,
-`$KITE_TARGET`, the file's own `default:` key, else no cluster and only
-`defaults:`/unprefixed keys apply. Passing `@NAME` without any config
-file is an error, as is selecting a name the file does not define —
-including any name on a properties file, which always describes a
-single cluster.
+`$KITE_TARGET`, the stored *current cluster* (see below), the file's
+own `default:` key, else no cluster and only `defaults:`/unprefixed
+keys apply. Passing `@NAME` without any config file is an error, as is
+selecting a name the file does not define — including any name on a
+properties file, which always describes a single cluster.
 
 `@NAME` selects a cluster and goes anywhere among a command's
 arguments, so switching clusters is one word: `kite produce @prod
-events`, `kite consume @local-b -B events`. A bare `@` is an error; two
-different clusters on one command line (`@prod @dev`) are rejected
-rather than letting the last one win. Topics never start with `@`, so
-there is no ambiguity.
+events`, `kite consume @local-b -B events`. `@NAME` also stores the
+name as the current cluster. A bare `@` is an error; two different
+clusters on one command line (`@prod @dev`) are rejected rather than
+letting the last one win. Topics never start with `@`, so there is no
+ambiguity.
 
-`kite targets` lists the clusters, one per line and sorted, with ` *`
-after the one that `@NAME`/`$KITE_TARGET`/`default:` would
-select, and a note on stderr naming the file it read (`-q` drops the
-note). It reads only the `clusters:` keys and never resolves a
-configuration or connects to a broker, so it works even while a cluster
-is still half written or lacks `bootstrap.servers`. `--json` yields
-`{"file":..,"target":..,"targets":[..]}`. It exits 1 when there is no
-config file at all or the selected name is not defined.
+`kite cluster list` lists the clusters, one per line and sorted, with
+` *` after the effective one (the same selection order as above), and
+a note on stderr naming the file it read (`-q` drops the note). It
+reads only the `clusters:` keys and never resolves a configuration or
+connects to a broker, so it works even while a cluster is still half
+written or lacks `bootstrap.servers`. `--json` yields
+`{"file":..,"current":..,"clusters":[..]}`. It exits 1 when there is
+no config file at all.
 
 ```sh
-$ kite targets
+$ kite cluster list
 dev *
 prod
 kite: clusters from ./kite.yaml
-$ kite targets --json | jq -r '.targets[]'
+$ kite cluster list --json | jq -r '.clusters[]'
 dev
 prod
 ```
@@ -655,34 +654,34 @@ redirect `kite produce @prod`; environment variables still fill in keys the
 cluster omits (for example `SASL_PASSWORD` while the cluster supplies
 the brokers).
 
-`kite config` prints the selected name on a `target:` line and
-reports `target` as the origin of keys that came from the cluster; the
-JSON form adds `"target"` and `"targets"` (all names defined in the
-file). See [`kafka-configs.yaml`](kafka-configs.yaml) for a fuller sample
+See [`kafka-configs.yaml`](kafka-configs.yaml) for a fuller sample
 (plaintext dev, TLS staging, SASL prod) and
 [`examples/config/kite.yaml`](examples/config/kite.yaml).
 
-### Inspecting the effective configuration
+### Switching clusters
 
-`kite config` resolves the effective settings — flags over
-environment over the properties file — and prints each key with its origin,
-without ever connecting to a broker. An invalid or incomplete configuration
-exits 1 with the usual `kite: ...` message; `sasl.password` is redacted.
-
-```text
-config file: /home/me/kite.properties
-target: prod
-bootstrap.servers        localhost:9092          flag
-security.protocol        PLAINTEXT               default
-sasl.password            ********               env
-...
-```
-
-For automation there is a stable-schema JSON form:
+The *current cluster* is the name kite uses when `@NAME` and
+`$KITE_TARGET` are absent. It lives in
+`$XDG_CONFIG_HOME/kite/current` (or `~/.config/kite/current` when
+XDG_CONFIG_HOME is unset) and is written by `kite cluster set` and by
+`@NAME` on produce/consume.
 
 ```sh
-kite config --json | jq -r '.settings["bootstrap.servers"].value'
+kite cluster            # interactive picker (arrows/j/k, Enter, q to quit)
+kite cluster list       # names, with ` *` after the effective cluster
+kite cluster set prod   # store 'prod' as the current cluster
+kite produce @prod t    # same switch, for this run and onwards
 ```
+
+On a terminal with both stdin and stderr attached, bare `kite cluster`
+opens a picker drawn on stderr (stdout stays clean); without a terminal
+it prints the same output as `kite cluster list`. A stored name that the
+config file no longer defines is ignored with a warning, and kite falls
+back to `default:`.
+
+To see which settings are actually in effect — flags over environment
+over the config file — run any command with `-v`: it prints the config
+sources on stderr before connecting.
 
 ## Output streams and exit codes
 
@@ -733,9 +732,9 @@ cluster everywhere.
 | --- | --- |
 | `kite [OPTIONS] TOPIC` | `kite produce [OPTIONS] [@CLUSTER] TOPIC` |
 | `kite -c/--consume [OPTIONS] TOPIC` | `kite consume [OPTIONS] [@CLUSTER] TOPIC` |
-| `kite --show-config [OPTIONS]` | `kite config [OPTIONS] [@CLUSTER]` |
-| `kite --targets [OPTIONS]` | `kite targets [OPTIONS] [@CLUSTER]` |
-| `kite --target NAME ...` | `kite ... @NAME` |
+| `kite --show-config [OPTIONS]` | removed; use `kite -v` / `kite cluster list` |
+| `kite --targets [OPTIONS]` | `kite cluster list` |
+| `kite --target NAME ...` | `kite ... @NAME` or `kite cluster set NAME` |
 
 First run against a local broker:
 

@@ -54,6 +54,10 @@ pub const Overrides = struct {
     config_path: ?[]const u8 = null,
     /// @NAME: pick the named cluster from the config file.
     target: ?[]const u8 = null,
+    /// The stored current cluster (`kite cluster` state file); sits between
+    /// $KITE_TARGET and the file's `default:` in precedence. `load` and
+    /// `listTargets` fill this from the file so applyProps stays pure.
+    current: ?[]const u8 = null,
 };
 
 /// Where the effective configuration came from, for `-v` and error messages.
@@ -72,7 +76,7 @@ pub const Source = struct {
     file_kind: FileKind = .none,
     /// Parse diagnostic when load fails with error.ConfigSyntax.
     diag: yaml.Diag = .{},
-    /// Per-key provenance for `kite config`.
+    /// Per-key provenance (where each effective value came from).
     origins: std.EnumArray(Key, Origin) = .initFill(.default),
 };
 
@@ -319,14 +323,16 @@ pub fn load(
     source: *Source,
 ) LoadError!Config {
     const doc = try readDoc(io, alloc, env, overrides, source);
-    const cfg = try applyProps(alloc, env, doc, overrides, source);
+    var ov = overrides;
+    ov.current = validatedCurrent(io, alloc, env, doc, source);
+    const cfg = try applyProps(alloc, env, doc, ov, source);
     const password_origin = source.origins.get(.sasl_password);
     if (password_origin == .file or password_origin == .target)
         warnIfLoosePerms(io, source.file.?);
     return cfg;
 }
 
-/// The clusters a config file defines, for `kite targets`.
+/// The clusters a config file defines, for `kite cluster`.
 pub const Targets = struct {
     /// Sorted cluster names.
     names: [][]const u8,
@@ -347,7 +353,9 @@ pub fn listTargets(
 ) LoadError!Targets {
     const doc = (try readDoc(io, alloc, env, overrides, source)) orelse return error.ConfigNotFound;
     source.targets = try sortedClusterNames(alloc, doc);
-    const selected = selectTarget(env, doc, overrides);
+    var ov = overrides;
+    ov.current = validatedCurrent(io, alloc, env, doc, source);
+    const selected = selectTarget(env, doc, ov);
     source.target = selected;
     if (selected) |name| {
         if (!doc.clusters.contains(name)) return error.UnknownTarget;
@@ -421,15 +429,59 @@ fn sortedClusterNames(alloc: std.mem.Allocator, doc: Doc) error{OutOfMemory}![][
     return names.items;
 }
 
-/// The cluster name chosen by @NAME, then $KITE_TARGET, then the
-/// file's `default:`.
+/// The cluster name chosen by @NAME, then $KITE_TARGET, then the stored
+/// current cluster, then the file's `default:`.
 fn selectTarget(env: *std.process.Environ.Map, doc: ?Doc, overrides: Overrides) ?[]const u8 {
     if (overrides.target) |t| return t;
     if (env.get("KITE_TARGET")) |t| {
         if (t.len > 0) return t;
     }
+    if (overrides.current) |t| return t;
     if (doc) |d| return d.default_target;
     return null;
+}
+
+/// Path of the file storing the current cluster name:
+/// $XDG_CONFIG_HOME/kite/current, else ~/.config/kite/current.
+pub fn currentClusterPath(alloc: std.mem.Allocator, env: *std.process.Environ.Map) ![]const u8 {
+    if (env.get("XDG_CONFIG_HOME")) |xdg| {
+        if (xdg.len > 0) return std.fmt.allocPrint(alloc, "{s}/kite/current", .{xdg});
+    }
+    if (env.get("HOME")) |home| {
+        if (home.len > 0) return std.fmt.allocPrint(alloc, "{s}/.config/kite/current", .{home});
+    }
+    return error.NoHomeDirectory;
+}
+
+/// The stored current cluster name, or null when the file is missing,
+/// empty, or unreadable.
+pub fn readCurrentCluster(io: std.Io, alloc: std.mem.Allocator, env: *std.process.Environ.Map) ?[]const u8 {
+    const path = currentClusterPath(alloc, env) catch return null;
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 16)) catch return null;
+    const name = std.mem.trim(u8, text, " \t\r\n");
+    return if (name.len == 0) null else name;
+}
+
+/// Store the current cluster name (one line); creates the config dir.
+pub fn writeCurrentCluster(io: std.Io, alloc: std.mem.Allocator, env: *std.process.Environ.Map, name: []const u8) !void {
+    const path = try currentClusterPath(alloc, env);
+    if (std.fs.path.dirname(path)) |dir|
+        std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    const contents = try std.fmt.allocPrint(alloc, "{s}\n", .{name});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
+}
+
+/// The stored current cluster when it names a cluster the loaded doc
+/// defines; warns and returns null when it does not. Only @NAME and
+/// $KITE_TARGET are hard errors; a stale current name is ignored.
+fn validatedCurrent(io: std.Io, alloc: std.mem.Allocator, env: *std.process.Environ.Map, doc: ?Doc, source: *Source) ?[]const u8 {
+    const name = readCurrentCluster(io, alloc, env) orelse return null;
+    const d = doc orelse return null;
+    if (!d.clusters.contains(name)) {
+        warn("current cluster '{s}' is not defined in {s}; ignoring (kite cluster set)", .{ name, source.file.? });
+        return null;
+    }
+    return name;
 }
 
 fn validTargetName(name: []const u8) bool {
@@ -756,6 +808,39 @@ test "applyProps: no target selected behaves like before" {
     try std.testing.expectEqualStrings("b:1", cfg.bootstrap_servers[0]);
     try std.testing.expectEqual(Origin.file, src.origins.get(.bootstrap_servers));
     try std.testing.expectEqual(@as(u64, 30), cfg.linger_ms);
+}
+
+test "applyProps: current cluster beats default, env and @NAME beat it" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const doc = try testDoc(gpa, "", "dev", &.{
+        .{ "dev", "bootstrap.servers=dev:2\n" },
+        .{ "prod", "bootstrap.servers=prod:3\n" },
+        .{ "staging", "bootstrap.servers=staging:4\n" },
+    });
+    // current beats the file's `default:`.
+    var env = try testEnv(alloc, &.{});
+    defer env.deinit();
+    var src: Source = .{};
+    const cfg = try applyProps(gpa, &env, doc, .{ .current = "staging" }, &src);
+    try std.testing.expectEqualStrings("staging:4", cfg.bootstrap_servers[0]);
+    try std.testing.expectEqualStrings("staging", src.target.?);
+    // KITE_TARGET beats the stored current cluster.
+    var env2 = try testEnv(alloc, &.{
+        .{ "KITE_TARGET", "prod" },
+    });
+    defer env2.deinit();
+    var src2: Source = .{};
+    const cfg2 = try applyProps(gpa, &env2, doc, .{ .current = "staging" }, &src2);
+    try std.testing.expectEqualStrings("prod:3", cfg2.bootstrap_servers[0]);
+    try std.testing.expectEqualStrings("prod", src2.target.?);
+    // @NAME beats everything.
+    var src3: Source = .{};
+    const cfg3 = try applyProps(gpa, &env2, doc, .{ .current = "staging", .target = "dev" }, &src3);
+    try std.testing.expectEqualStrings("dev:2", cfg3.bootstrap_servers[0]);
+    try std.testing.expectEqualStrings("dev", src3.target.?);
 }
 
 test "applyProps: -b flag still beats the cluster" {

@@ -1,15 +1,15 @@
 # Sample multi-cluster configuration for kite.
 #
-# Use it as-is with:   kite --config kafka-configs.yaml @staging events
+# Use it as-is with:   kite consume --config kafka-configs.yaml @staging events
 # or copy it to ./kite.yaml (or ~/.config/kite/kite.yaml) so kite finds it
-# automatically and `kite @NAME` / `--target NAME` / `KITE_TARGET=NAME` pick
-# a cluster. `kite --targets` lists the names defined here.
+# automatically and `@NAME` / `KITE_TARGET=NAME` / `kite cluster set NAME`
+# pick a cluster. `kite cluster list` lists the names defined here.
 #
 # Keys are the same dotted names kite.properties accepts. Values in a
 # cluster beat environment variables; environment variables beat
 # `defaults:`; -b/--bootstrap beats everything.
 
-# Cluster used when neither --target nor $KITE_TARGET is given.
+# Cluster used when @NAME, KITE_TARGET, and `kite cluster set` are absent.
 default: dev
 
 # Shared settings applied to every cluster.

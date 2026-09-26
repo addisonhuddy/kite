@@ -144,12 +144,8 @@ pub fn main(init: std.process.Init) !void {
             runConsume(init, command_args.rest, alloc);
             return;
         },
-        .config => {
-            runShowConfig(init, command_args.rest, alloc);
-            return;
-        },
-        .targets => {
-            runListTargets(init, command_args.rest, alloc);
+        .cluster => {
+            runCluster(init, command_args.rest, alloc);
             return;
         },
         .produce => {},
@@ -177,6 +173,7 @@ pub fn main(init: std.process.Init) !void {
     const csv_key_col = produce.key_col;
 
     var cfg = loadConfig(init, alloc, produce.common, &dummy_source);
+    persistCurrentCluster(init, alloc, produce.common);
     var cli = client.Client.init(alloc, io, init.environ_map, &cfg);
     connectAndResolve(&cli, topic, "write", quiet, true);
 
@@ -570,6 +567,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     const quiet = consume.common.quiet;
 
     var cfg = loadConfig(init, alloc, consume.common, &dummy_source);
+    persistCurrentCluster(init, alloc, consume.common);
     var cli = client.Client.init(alloc, init.io, init.environ_map, &cfg);
     connectAndResolve(&cli, topic_name, "read", quiet, false);
 
@@ -656,97 +654,43 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     std.process.exit(if (stopped_by_signal) 130 else 0);
 }
 
-fn runShowConfig(init: std.process.Init, args: []const []const u8, alloc: std.mem.Allocator) noreturn {
-    const parsed = cli_args.parseShowConfig(alloc, args);
-    const common = switch (parsed) {
-        .help => {
-            if (term.detect(init.io, std.Io.File.stdout(), init.environ_map)) {
-                term.color.enabled = true;
-                const page = term.renderHelp(alloc, cli_args.show_config_help) catch fatal("out of memory", .{});
-                writeText(init, std.Io.File.stdout(), page);
-            } else writeText(init, std.Io.File.stdout(), cli_args.show_config_help);
-            std.process.exit(0);
-        },
-        .err => |message| parseFatal(init, message, cli_args.show_config_usage),
-        .ok => |value| value.common,
+/// @NAME on produce/consume also stores the cluster as the current one,
+/// so plain `kite produce` keeps talking to it. Runs before connecting.
+fn persistCurrentCluster(init: std.process.Init, alloc: std.mem.Allocator, common: cli_args.Common) void {
+    const name = common.target orelse return;
+    const prev = config.readCurrentCluster(init.io, alloc, init.environ_map);
+    if (prev) |p| {
+        if (std.mem.eql(u8, p, name)) return;
+    }
+    config.writeCurrentCluster(init.io, alloc, init.environ_map, name) catch |err| {
+        note("warning: cannot store current cluster ({s})", .{@errorName(err)});
+        return;
     };
-
-    var source: config.Source = .{};
-    const cfg = loadConfig(init, alloc, common, &source);
-
-    var stdout_buf: [4096]u8 = undefined;
-    var w = std.Io.File.stdout().writer(init.io, &stdout_buf);
-    const outw = &w.interface;
-    const json_mode = common.format == .json;
-    if (json_mode) {
-        outw.writeAll("{\"file\":") catch {};
-        if (source.file) |f| json.writeString(outw, f) catch {} else outw.writeAll("null") catch {};
-        outw.writeAll(",\"target\":") catch {};
-        if (source.target) |t| json.writeString(outw, t) catch {} else outw.writeAll("null") catch {};
-        outw.writeAll(",\"targets\":[") catch {};
-        for (source.targets, 0..) |t, i| {
-            if (i > 0) outw.writeByte(',') catch {};
-            json.writeString(outw, t) catch {};
-        }
-        outw.writeAll("],\"settings\":{") catch {};
-    } else {
-        outw.writeAll("config file: ") catch {};
-        outw.writeAll(source.file orelse "(none)") catch {};
-        outw.writeAll("\ntarget: ") catch {};
-        outw.writeAll(source.target orelse "(none)") catch {};
-        outw.writeByte('\n') catch {};
-    }
-    var first = true;
-    for (std.enums.values(config.Key)) |key| {
-        const name = config.key_names.get(key);
-        const value = config.valueString(&cfg, alloc, key) catch fatal("out of memory", .{});
-        if (json_mode) {
-            if (!first) outw.writeByte(',') catch {};
-            first = false;
-            json.writeString(outw, name) catch {};
-            outw.writeAll(":{\"value\":") catch {};
-            if (value.len == 0) outw.writeAll("null") catch {} else json.writeString(outw, value) catch {};
-            outw.writeAll(",\"source\":\"") catch {};
-            outw.writeAll(@tagName(source.origins.get(key))) catch {};
-            outw.writeByte('"') catch {};
-            if (config.isSecret(key)) outw.writeAll(",\"redacted\":true") catch {};
-            outw.writeByte('}') catch {};
-        } else {
-            const shown = if (value.len == 0) "(unset)" else value;
-            outw.writeAll(name) catch {};
-            outw.writeAll("                        "[0 .. 24 - @min(name.len, 23)]) catch {};
-            outw.writeAll(shown) catch {};
-            outw.writeAll("                        "[0 .. 24 - @min(shown.len, 23)]) catch {};
-            outw.writeAll(@tagName(source.origins.get(key))) catch {};
-            outw.writeByte('\n') catch {};
-        }
-    }
-    if (json_mode) outw.writeAll("}}\n") catch {};
-    outw.flush() catch {};
-    std.process.exit(0);
+    if (!common.quiet) note("now pointing at cluster '{s}'", .{name});
 }
 
-/// `kite targets`: list the clusters in the config file without
-/// resolving an effective Config, so incomplete clusters still list.
-fn runListTargets(init: std.process.Init, args: []const []const u8, alloc: std.mem.Allocator) noreturn {
-    const parsed = cli_args.parseListTargets(alloc, args);
-    const common = switch (parsed) {
+/// `kite cluster [list|set NAME]`: pick, list, or persistently select the
+/// cluster other commands talk to. Lists without resolving a full Config
+/// so incomplete clusters still show.
+fn runCluster(init: std.process.Init, args: []const []const u8, alloc: std.mem.Allocator) noreturn {
+    const parsed = cli_args.parseCluster(alloc, args);
+    const cluster = switch (parsed) {
         .help => {
             if (term.detect(init.io, std.Io.File.stdout(), init.environ_map)) {
                 term.color.enabled = true;
-                const page = term.renderHelp(alloc, cli_args.list_targets_help) catch fatal("out of memory", .{});
+                const page = term.renderHelp(alloc, cli_args.cluster_help) catch fatal("out of memory", .{});
                 writeText(init, std.Io.File.stdout(), page);
-            } else writeText(init, std.Io.File.stdout(), cli_args.list_targets_help);
+            } else writeText(init, std.Io.File.stdout(), cli_args.cluster_help);
             std.process.exit(0);
         },
-        .err => |message| parseFatal(init, message, cli_args.list_targets_usage),
-        .ok => |value| value.common,
+        .err => |message| parseFatal(init, message, cli_args.cluster_usage),
+        .ok => |value| value,
     };
+    const common = cluster.common;
 
     var source: config.Source = .{};
     const targets = config.listTargets(init.io, alloc, init.environ_map, .{
         .config_path = common.config_path,
-        .target = common.target,
     }, &source) catch |err| switch (err) {
         error.ConfigNotFound => fatal("no config file found (searched {s}); see 'kite --help' for the file format", .{search_path_hint}),
         error.ConfigFileNotFound => fatal("config file '{s}' not found", .{source.requested.?}),
@@ -757,15 +701,46 @@ fn runListTargets(init: std.process.Init, args: []const []const u8, alloc: std.m
         else => unreachable,
     };
 
+    switch (cluster.action) {
+        .list => {},
+        .set => {
+            setCurrentCluster(init, alloc, common, cluster.name.?, &source, targets.names);
+            std.process.exit(0);
+        },
+        .pick => {
+            if (targets.names.len == 0)
+                fatal("{s} defines no clusters", .{source.file.?});
+            const stdin_tty = std.Io.File.stdin().isTty(init.io) catch false;
+            const stderr_tty = std.Io.File.stderr().isTty(init.io) catch false;
+            if (stdin_tty and stderr_tty) {
+                var initial: usize = 0;
+                if (targets.selected) |sel| {
+                    for (targets.names, 0..) |t, i| {
+                        if (std.mem.eql(u8, t, sel)) {
+                            initial = i;
+                            break;
+                        }
+                    }
+                }
+                const choice = term.pick(init.io, alloc, targets.names, initial) catch
+                    fatal("cannot read terminal", .{});
+                const idx = choice orelse fatal("no cluster selected", .{});
+                setCurrentCluster(init, alloc, common, targets.names[idx], &source, targets.names);
+                std.process.exit(0);
+            }
+            // Non-interactive (piped) stdin/stderr: list instead of picking.
+        },
+    }
+
     var stdout_buf: [4096]u8 = undefined;
     var w = std.Io.File.stdout().writer(init.io, &stdout_buf);
     const outw = &w.interface;
     if (common.format == .json) {
         outw.writeAll("{\"file\":") catch {};
         json.writeString(outw, source.file.?) catch {};
-        outw.writeAll(",\"target\":") catch {};
+        outw.writeAll(",\"current\":") catch {};
         if (targets.selected) |t| json.writeString(outw, t) catch {} else outw.writeAll("null") catch {};
-        outw.writeAll(",\"targets\":[") catch {};
+        outw.writeAll(",\"clusters\":[") catch {};
         for (targets.names, 0..) |t, i| {
             if (i > 0) outw.writeByte(',') catch {};
             json.writeString(outw, t) catch {};
@@ -789,6 +764,28 @@ fn runListTargets(init: std.process.Init, args: []const []const u8, alloc: std.m
     }
     outw.flush() catch {};
     std.process.exit(0);
+}
+
+/// Store NAME as the current cluster; NAME must exist in the loaded doc.
+fn setCurrentCluster(
+    init: std.process.Init,
+    alloc: std.mem.Allocator,
+    common: cli_args.Common,
+    name: []const u8,
+    source: *config.Source,
+    names: []const []const u8,
+) void {
+    var known = false;
+    for (names) |t| {
+        if (std.mem.eql(u8, t, name)) known = true;
+    }
+    if (!known) {
+        source.target = name;
+        unknownTargetFatal(alloc, source);
+    }
+    config.writeCurrentCluster(init.io, alloc, init.environ_map, name) catch |err|
+        fatal("cannot store current cluster ({s})", .{@errorName(err)});
+    if (!common.quiet) note("cluster set to '{s}'", .{name});
 }
 
 /// Idle bound applied to `kite consume` when stdout is not a terminal and no

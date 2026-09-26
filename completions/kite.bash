@@ -2,20 +2,36 @@
 # /etc/bash_completion.d/ (or ~/.local/share/bash-completion/completions/).
 
 _kite() {
-    local cur prev cmd w
+    local cur prev cmd w sub
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD - 1]}"
     cmd=""
+    sub=""
     for w in "${COMP_WORDS[@]:1:COMP_CWORD-1}"; do
         case "$w" in
-            produce | p | consume | c | targets | config) cmd=$w ;;
+            produce | p | consume | c | cluster) cmd=$w ;;
         esac
     done
+    if [ "$cmd" = cluster ]; then
+        for w in "${COMP_WORDS[@]:2:COMP_CWORD-2}"; do
+            case "$w" in
+                list | set) sub=$w ;;
+            esac
+        done
+    fi
 
     # @NAME picks a cluster from kite.yaml.
     if [[ $cur == @* ]] && [ -f kite.yaml ]; then
         local names
         names=$(awk '/^clusters:/{f=1;next} f&&/^[^ ]/{f=0} f&&/^  [A-Za-z0-9_-]+:/{sub(/^  /,"@");sub(/:.*/,"");print}' kite.yaml | sort -u)
+        COMPREPLY=($(compgen -W "$names" -- "$cur"))
+        return
+    fi
+
+    # kite cluster set NAME completes cluster names from kite.yaml.
+    if [ "$cmd" = cluster ] && [ "$sub" = set ] && [ -f kite.yaml ]; then
+        local names
+        names=$(awk '/^clusters:/{f=1;next} f&&/^[^ ]/{f=0} f&&/^  [A-Za-z0-9_-]+:/{sub(/^  /,"");sub(/:.*/,"");print}' kite.yaml | sort -u)
         COMPREPLY=($(compgen -W "$names" -- "$cur"))
         return
     fi
@@ -41,18 +57,19 @@ _kite() {
                 -B --from-beginning --offset --partition -n --max -t --idle \
                 -f --follow -q --quiet -v --verbose -h --help"
             ;;
-        config)
-            opts="-b --bootstrap --config --format --json -q --quiet -v --verbose -h --help"
-            ;;
-        targets)
-            opts="--config --format --json -q --quiet -v --verbose -h --help"
+        cluster)
+            if [ -z "$sub" ]; then
+                opts="list set --config --json -q --quiet -v --verbose -h --help"
+            else
+                opts="--config --format --json -q --quiet -v --verbose -h --help"
+            fi
             ;;
         produce | p)
             opts="-b --bootstrap --config --format --json -H --csv --key \
                 -q --quiet -v --verbose -h --help"
             ;;
         *)
-            opts="produce p consume c targets config \
+            opts="produce p consume c cluster \
                 -V --version -h --help"
             ;;
     esac
