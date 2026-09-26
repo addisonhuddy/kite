@@ -2,7 +2,7 @@
 # Smoke test: produce → consume roundtrip against any Kafka 4.0+ broker.
 # Needs a broker configured (-b is not used here, so set BOOTSTRAP_SERVERS
 # or put a kite.properties on the search path; see README "Configuration")
-# and a topic — kite's produce mode creates a missing one automatically when
+# and a topic — kite produce creates a missing one automatically when
 # not on a terminal (consume never does; a missing topic is an error).
 #
 #   scripts/smoke.sh <topic>
@@ -23,12 +23,12 @@ trap 'rm -rf "$TMP"' EXIT
 } >"$TMP/in"
 
 echo "== produce =="
-"$K" "$TOPIC" <"$TMP/in"
+"$K" produce "$TOPIC" <"$TMP/in"
 
 echo "== ack latency =="
 # Stdin stalls for 2s, but avg ack latency measures send-to-ack only and
 # must stay well under that.
-(sleep 2; printf '%s-slow\n' "$M") | "$K" "$TOPIC" 2>"$TMP/lat.err"
+(sleep 2; printf '%s-slow\n' "$M") | "$K" produce "$TOPIC" 2>"$TMP/lat.err"
 printf '%s-slow\n' "$M" >>"$TMP/in"
 grep -Fq "avg ack latency" "$TMP/lat.err" || { echo "FAIL: no avg ack latency"; cat "$TMP/lat.err"; exit 1; }
 ! grep -Fq "avg per request" "$TMP/lat.err" || { echo "FAIL: stale 'avg per request' label"; cat "$TMP/lat.err"; exit 1; }
@@ -38,20 +38,20 @@ awk -v ms="$ms" 'BEGIN { exit !(ms + 0 < 1000) }' || {
 }
 
 echo "== consume roundtrip =="
-"$K" -c --from-beginning -t 5000 "$TOPIC" | grep "^$M" | sort >"$TMP/out"
+"$K" consume --from-beginning -t 5000 "$TOPIC" | grep "^$M" | sort >"$TMP/out"
 sort "$TMP/in" >"$TMP/expected"
 diff -u "$TMP/expected" "$TMP/out"
 
 echo "== json roundtrip =="
-printf '{"key":"%s-jk","value":{"m":"%s","n":1},"headers":{"h":"v"}}\n' "$M" "$M" | "$K" --json "$TOPIC"
-"$K" -c -B --json "$TOPIC" | grep -F "\"key\":\"$M-jk\"" >"$TMP/json"
+printf '{"key":"%s-jk","value":{"m":"%s","n":1},"headers":{"h":"v"}}\n' "$M" "$M" | "$K" produce --json "$TOPIC"
+"$K" consume -B --json "$TOPIC" | grep -F "\"key\":\"$M-jk\"" >"$TMP/json"
 [ "$(wc -l <"$TMP/json")" -eq 1 ] || { echo "FAIL: expected one json record"; cat "$TMP/json"; exit 1; }
 grep -Fq "\"headers\":[{\"key\":\"h\",\"value\":\"v\"}]" "$TMP/json" || { echo "FAIL: headers"; cat "$TMP/json"; exit 1; }
 grep -Fq "\"value\":\"{\\\"m\\\":\\\"$M\\\",\\\"n\\\":1}\"" "$TMP/json" || { echo "FAIL: value"; cat "$TMP/json"; exit 1; }
 
 echo "== offset out of range =="
 set +e
-"$K" -c --partition 0 --offset 9223372036854775806 --idle 1s "$TOPIC" >"$TMP/oor.out" 2>"$TMP/oor.err"
+"$K" consume --partition 0 --offset 9223372036854775806 --idle 1s "$TOPIC" >"$TMP/oor.out" 2>"$TMP/oor.err"
 status=$?
 set -e
 [ "$status" -eq 1 ] && [ ! -s "$TMP/oor.out" ] && grep -q "is out of range for partition 0" "$TMP/oor.err" || {
