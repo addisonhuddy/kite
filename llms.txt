@@ -25,13 +25,13 @@ SASL_MECHANISM                  PLAIN | SCRAM-SHA-256 | SCRAM-SHA-512
 SASL_USERNAME, SASL_PASSWORD
 SSL_TRUSTSTORE_LOCATION         optional PEM CA bundle
 --config FILE                   config file (also $KAFKA_PROPERTIES, ./kite.yaml, ./kite.properties, ~/.config/kite/)
---target NAME, @NAME            named cluster from kite.yaml's `clusters:` (also $KITE_TARGET or the file's `default:`)
-kite --targets [--json]         list clusters in kite.yaml, `*` marks the selected one; reads only cluster names, never connects
-kite --show-config --json       print effective config with provenance; never connects
+@NAME                           named cluster from kite.yaml's `clusters:` (also $KITE_TARGET or the file's `default:`)
+kite targets [--json]           list clusters in kite.yaml, `*` marks the selected one; reads only cluster names, never connects
+kite config --json              print effective config with provenance; never connects
 
-## Produce (default mode)
+## Produce
 
-kite [OPTIONS] TOPIC            one stdin line = one record
+kite produce [OPTIONS] [@CLUSTER] TOPIC   one stdin line = one record
   value                         plain value
   key<TAB>value                 keyed record
   key<TAB>name: v<TAB>value     with headers
@@ -42,7 +42,7 @@ Produce is batched and idempotent by default. stdout is never written.
 
 ## Consume
 
-kite -c [OPTIONS] TOPIC         records on stdout
+kite consume [OPTIONS] [@CLUSTER] TOPIC   records on stdout
 -B, --from-beginning            earliest offset (default: latest)
 --offset N  --partition P       start offset / single partition
 -n, --max N                     stop after N records
@@ -60,12 +60,12 @@ No interactive prompts. No color unless a TTY (NO_COLOR / KITE_COLOR honored). N
 
 ## Examples
 
-printf 'hello\n' | kite -b localhost:9092 events
-kite -c -B -n 100 --idle 3s events
-kite -c -B --json events | jq -c .value
-kite -c -B --json src | kite --json dst
-kite --csv --key user_id events < users.csv
-tail -f app.log | kite logs
+printf 'hello\n' | kite produce -b localhost:9092 events
+kite consume -B -n 100 --idle 3s events
+kite consume -B --json events | jq -c .value
+kite consume -B --json src | kite produce --json dst
+kite produce --csv --key user_id events < users.csv
+tail -f app.log | kite produce logs
 
 ## Docs
 
