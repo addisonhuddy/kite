@@ -932,9 +932,15 @@ fn askSecret(r: *std.Io.Reader, alloc: std.mem.Allocator, comptime fmt: []const 
                 out("\n", .{});
                 return std.mem.trim(u8, buf.items, " \t");
             },
-            0x04 => if (buf.items.len == 0) {
-                out("\n", .{});
-                return null;
+            0x04 => {
+                if (buf.items.len == 0) {
+                    out("\n", .{});
+                    return null;
+                }
+                if (n == 0) {
+                    out("\n", .{});
+                    return std.mem.trim(u8, buf.items, " \t");
+                }
             },
             0x03 => {
                 std.posix.tcsetattr(fd, .NOW, saved) catch {};
