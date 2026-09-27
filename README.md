@@ -620,11 +620,11 @@ properties file, which always describes a single cluster.
 
 `@NAME` selects a cluster and goes anywhere among a command's
 arguments, so switching clusters is one word: `kite produce @prod
-events`, `kite consume @local-b -B events`. `@NAME` selects a cluster for this run only and never changes the stored
-current cluster; use `kite cluster set` for that. A bare `@` is an error; two different
-clusters on one command line (`@prod @dev`) are rejected rather than
-letting the last one win. Topics never start with `@`, so there is no
-ambiguity.
+events`, `kite consume @local-b -B events`. `@NAME` applies to this run
+only and never changes the stored current cluster; use `kite cluster
+set` for that. A bare `@` is an error; two different clusters on one
+command line (`@prod @dev`) are rejected rather than letting the last
+one win. Topics never start with `@`, so there is no ambiguity.
 
 `kite cluster list` lists the clusters, one per line and sorted, with
 ` *` after the effective one (the same selection order as above), and
