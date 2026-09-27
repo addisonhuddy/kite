@@ -3,7 +3,7 @@
 # on your PATH.
 #
 #   curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh
-#   curl -fsSL ... | sh -s -- --bin-dir ~/.local/bin --version v0.1.0
+#   curl -fsSL ... | sh -s -- --bin-dir ~/.local/bin --version v0.2.0
 #
 # Options:
 #   -b, --bin-dir DIR    Install into DIR (default: $KITE_BIN_DIR or /usr/local/bin).

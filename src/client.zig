@@ -8,6 +8,7 @@ const transport = @import("transport.zig");
 const scram = @import("scram.zig");
 const term = @import("term.zig");
 const stats = @import("stats.zig");
+const cli = @import("cli.zig");
 
 const Encoder = protocol.Encoder;
 const Decoder = protocol.Decoder;
@@ -331,7 +332,7 @@ pub const Client = struct {
         const body = struct {
             fn f(e: *Encoder, _: Ctx) protocol.ProtoError!void {
                 try e.compactString("kite");
-                try e.compactString("0.1.0");
+                try e.compactString(cli.version);
                 try e.tagBuffer();
             }
         }.f;
