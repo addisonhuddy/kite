@@ -173,7 +173,6 @@ pub fn main(init: std.process.Init) !void {
     const csv_key_col = produce.key_col;
 
     var cfg = loadConfig(init, alloc, produce.common, &dummy_source);
-    persistCurrentCluster(init, alloc, produce.common);
     var cli = client.Client.init(alloc, io, init.environ_map, &cfg);
     connectAndResolve(&cli, topic, "write", quiet, true);
 
@@ -495,7 +494,7 @@ fn shouldCreateTopic(io: std.Io, topic: []const u8) bool {
 /// its partition->leader table (a fresh topic reports no leader briefly).
 fn createAndResolve(cli: *client.Client, topic: []const u8, access: []const u8, quiet: bool) void {
     if (!shouldCreateTopic(cli.io, topic))
-        fatal("topic '{s}' does not exist", .{topic});
+        fatal("topic '{s}' does not exist and was not created (answer y to create it, or create it with your admin tooling)", .{topic});
     cli.createTopic(topic) catch |err| switch (err) {
         error.TopicAuthorizationFailed => fatal(
             "not authorized to create topic '{s}' (check ACLs for this principal)",
@@ -567,7 +566,6 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     const quiet = consume.common.quiet;
 
     var cfg = loadConfig(init, alloc, consume.common, &dummy_source);
-    persistCurrentCluster(init, alloc, consume.common);
     var cli = client.Client.init(alloc, init.io, init.environ_map, &cfg);
     connectAndResolve(&cli, topic_name, "read", quiet, false);
 
@@ -650,23 +648,10 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
             std.debug.print("{d} record(s) consumed from '{s}'{s}\n", .{ consumed, topic_name, reason });
         stats.finish();
     }
+    if (consumed == 0 and consume.start == .latest and !stats.live and !quiet)
+        note("no records arrived; consume starts at the latest offset, use -B to read existing records", .{});
     cli.deinit();
     std.process.exit(if (stopped_by_signal) 130 else 0);
-}
-
-/// @NAME on produce/consume also stores the cluster as the current one,
-/// so plain `kite produce` keeps talking to it. Runs before connecting.
-fn persistCurrentCluster(init: std.process.Init, alloc: std.mem.Allocator, common: cli_args.Common) void {
-    const name = common.target orelse return;
-    const prev = config.readCurrentCluster(init.io, alloc, init.environ_map);
-    if (prev) |p| {
-        if (std.mem.eql(u8, p, name)) return;
-    }
-    config.writeCurrentCluster(init.io, alloc, init.environ_map, name) catch |err| {
-        note("warning: cannot store current cluster ({s})", .{@errorName(err)});
-        return;
-    };
-    if (!common.quiet) note("now pointing at cluster '{s}'", .{name});
 }
 
 /// `kite cluster [list|set NAME]`: pick, list, or persistently select the

@@ -177,16 +177,16 @@ pub const overview_help =
     "  kite --version                            Print the version.\n" ++
     "\n" ++
     "'p' and 'c' are short for 'produce' and 'consume'. @NAME picks a\n" ++
-    "cluster from kite.yaml for this run and makes it the current cluster.\n" ++
+    "cluster from kite.yaml for this run only.\n" ++
     "\n" ++
     "Examples:\n" ++
     "  kite produce events < examples/data/lines.txt\n" ++
-    "  kite consume -B --idle 3s events\n" ++
+    "  kite consume -B -n 1 --idle 3s events\n" ++
     "  kite consume @prod events\n" ++
     "  kite cluster\n" ++
     "  kite cluster set prod\n" ++
     "\n" ++
-    "  'kite cluster set NAME' and @NAME store the current cluster in\n" ++
+    "  'kite cluster set NAME' stores the current cluster in\n" ++
     "  $XDG_CONFIG_HOME/kite/current (default ~/.config/kite/current).\n" ++
     "  Precedence: @NAME, KITE_TARGET, current, then kite.yaml `default:`.\n" ++
     "\n" ++
@@ -201,8 +201,8 @@ pub const produce_help =
     "Options:\n" ++
     "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
     "  --config FILE         Read this properties file instead of searching.\n" ++
-    "  @NAME                 Use cluster NAME from kite.yaml and make it\n" ++
-    "                        current (or $KITE_TARGET for this run only).\n" ++
+    "  @NAME                 Use cluster NAME from kite.yaml for this\n" ++
+    "                        run only (also $KITE_TARGET).\n" ++
     "  -H HEADER             Add a 'name: value' header (repeatable).\n" ++
     "  --csv                 Read RFC 4180 CSV (same as --format csv).\n" ++
     "  --key COL             Use CSV column COL as the record key; requires --csv.\n" ++
@@ -236,8 +236,8 @@ pub const consume_help =
     "Options:\n" ++
     "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
     "  --config FILE         Read this properties file instead of searching.\n" ++
-    "  @NAME                 Use cluster NAME from kite.yaml and make it\n" ++
-    "                        current (or $KITE_TARGET for this run only).\n" ++
+    "  @NAME                 Use cluster NAME from kite.yaml for this\n" ++
+    "                        run only (also $KITE_TARGET).\n" ++
     "  -B, --from-beginning  Start at the earliest available offset.\n" ++
     "  --offset N            Start at offset N in each selected partition.\n" ++
     "                        Cannot be combined with --from-beginning.\n" ++
@@ -264,7 +264,7 @@ pub const consume_help =
     "\n" ++
     "Examples:\n" ++
     "  kite consume events\n" ++
-    "  kite consume -B --idle 3s events\n" ++
+    "  kite consume -B -n 1 --idle 3s events\n" ++
     "  kite consume --partition 0 --offset 42 -n 10 --idle 3s events\n" ++
     "  kite consume -B --json events | jq -c .value\n" ++
     "  kite consume @prod events\n" ++

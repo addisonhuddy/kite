@@ -237,17 +237,17 @@ printf 'dev\nprod\n' | cmp -s - "$TMP/cluster-stale.out" || {
     echo "FAIL cluster-stale: unexpected stdout"; cat "$TMP/cluster-stale.out"; exit 1;
 }
 rm -f "$TMP/xdg/kite/current"
-# @NAME on produce writes the current file before the connection attempt.
+# @NAME is one-shot: it never writes the current file.
 set +e
-(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" produce @dev demo </dev/null >"$TMP/at-write.out" 2>"$TMP/at-write.err")
+(cd "$TMP/work" && HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" produce @dev demo </dev/null >"$TMP/at-oneshot.out" 2>"$TMP/at-oneshot.err")
 status=$?
 set -e
 [ "$status" -eq 1 ] \
-    && [ "$(cat "$TMP/xdg/kite/current")" = dev ] \
-    && grep -Fq "now pointing at cluster 'dev'" "$TMP/at-write.err" || {
-    echo "FAIL at-write"; cat "$TMP/at-write.err"; exit 1;
+    && [ ! -e "$TMP/xdg/kite/current" ] \
+    && ! grep -Fq "now pointing" "$TMP/at-oneshot.err" || {
+    echo "FAIL at-oneshot"; cat "$TMP/at-oneshot.err"; exit 1;
 }
-echo "PASS at-write"
+echo "PASS at-oneshot"
 rm -f "$TMP/xdg/kite/current"
 printf 'bootstrap.servers=base:1\n' >"$TMP/work/kite.properties"
 rm "$TMP/work/kite.yaml"
