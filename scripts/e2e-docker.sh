@@ -60,15 +60,15 @@ echo "== smoke.sh =="
 scripts/smoke.sh "$TOPIC"
 
 # README Quickstart, verbatim apart from the topic name: a fresh topic is
-# auto-created by produce, and `-B --idle 3s --json | jq -r .value` must print
+# auto-created by produce, and `-B -n 1 --idle 3s --json | jq -r .value` must print
 # exactly the record just produced (a consume without -B starts at latest and
 # prints nothing).
 QS_TOPIC="kite-quickstart-$(date +%s)-$RANDOM"
 printf 'hello\n' | zig-out/bin/kite produce "$QS_TOPIC"
 if command -v jq >/dev/null 2>&1; then
-    got=$(zig-out/bin/kite consume -B --idle 3s --json "$QS_TOPIC" 2>/dev/null | jq -r .value)
+    got=$(zig-out/bin/kite consume -B -n 1 --idle 3s --json "$QS_TOPIC" 2>/dev/null | jq -r .value)
 else
-    got=$(zig-out/bin/kite consume -B --idle 3s --json "$QS_TOPIC" 2>/dev/null | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
+    got=$(zig-out/bin/kite consume -B -n 1 --idle 3s --json "$QS_TOPIC" 2>/dev/null | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
 fi
 [ "$got" = "hello" ] || fail "quickstart: expected 'hello' from the README consume line, got '$got'"
 echo "PASS quickstart"

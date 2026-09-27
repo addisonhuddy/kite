@@ -154,7 +154,7 @@ topic automatically when run from a script or pipe.
 curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh
 export BOOTSTRAP_SERVERS=localhost:9092
 printf 'hello\n' | kite produce events               # produce one record
-kite consume -B --idle 3s --json events | jq -r .value  # prints: hello
+kite consume -B -n 1 --idle 3s --json events | jq -r .value  # prints: hello
 ```
 
 What to expect:
@@ -165,8 +165,9 @@ What to expect:
   `| jq` only ever sees records.
 - **`-B` is required here.** Without `--from-beginning` a consumer starts at
   the *latest* offset and would skip the record produced before it started.
-- **`--idle 3s`** stops the read 3 s after the last record; otherwise a piped
-  consume stops after 5 s idle.
+- **`-n 1 --idle 3s`** stops the read as soon as the one record arrives, so the
+  run takes milliseconds; `--idle 3s` is the fallback that ends it if nothing
+  arrives. Without either, a piped consume stops after 5 s idle.
 - **`jq` is optional.** It only extracts `.value` from the JSON record; drop
   `--json | jq -r .value` to print plain values.
 - **Topic creation depends on the broker.** kite asks the broker to create a
@@ -383,7 +384,7 @@ kite --version                            Print the version.
 | --- | --- | --- |
 | produce, consume | `-b`, `--bootstrap HOSTS` | Comma-separated `host:port` brokers (overrides env and file). |
 | all | `--config FILE` | Read this properties file instead of searching. |
-| produce, consume | `@NAME` | Use cluster `NAME` from kite.yaml and make it current (also `$KITE_TARGET`). |
+| produce, consume | `@NAME` | Use cluster `NAME` from kite.yaml for this run only (also `$KITE_TARGET`). |
 | produce, consume | `--format FMT` | Record shape: `value`, `tsv`, `json` (default `auto`). |
 | produce | `--format csv` | RFC 4180 CSV input (produce only); same as `--csv`. |
 | produce, consume | `--json` | Alias for `--format json`. |
@@ -619,8 +620,8 @@ properties file, which always describes a single cluster.
 
 `@NAME` selects a cluster and goes anywhere among a command's
 arguments, so switching clusters is one word: `kite produce @prod
-events`, `kite consume @local-b -B events`. `@NAME` also stores the
-name as the current cluster. A bare `@` is an error; two different
+events`, `kite consume @local-b -B events`. `@NAME` selects a cluster for this run only and never changes the stored
+current cluster; use `kite cluster set` for that. A bare `@` is an error; two different
 clusters on one command line (`@prod @dev`) are rejected rather than
 letting the last one win. Topics never start with `@`, so there is no
 ambiguity.
@@ -663,14 +664,14 @@ See [`kafka-configs.yaml`](kafka-configs.yaml) for a fuller sample
 The *current cluster* is the name kite uses when `@NAME` and
 `$KITE_TARGET` are absent. It lives in
 `$XDG_CONFIG_HOME/kite/current` (or `~/.config/kite/current` when
-XDG_CONFIG_HOME is unset) and is written by `kite cluster set` and by
-`@NAME` on produce/consume.
+XDG_CONFIG_HOME is unset) and is written by `kite cluster set` (or the
+picker).
 
 ```sh
 kite cluster            # interactive picker (arrows/j/k, Enter, q to quit)
 kite cluster list       # names, with ` *` after the effective cluster
 kite cluster set prod   # store 'prod' as the current cluster
-kite produce @prod t    # same switch, for this run and onwards
+kite produce @prod t    # use 'prod' for this run only
 ```
 
 On a terminal with both stdin and stderr attached, bare `kite cluster`
@@ -814,8 +815,11 @@ No. kite is one static binary with no runtime dependencies.
 The stripped binary is under 640 KB (CI-gated) and starts in milliseconds.
 
 **Can kite create topics or manage consumer groups?**
-No. kite only produces to and consumes from existing topics. It does not join
-consumer groups or commit offsets; each consume run is stateless.
+`kite produce` creates a missing topic — after a y/N prompt on a terminal,
+automatically from a script or pipe (a broker policy or missing ACL can
+refuse). Declining the prompt exits 1 without creating it. `kite consume`
+never creates topics. kite does not delete or reconfigure topics, join
+consumer groups, or commit offsets; each consume run is stateless.
 
 **Is kite safe to call from an AI agent or CI job?**
 Yes: it never prompts, never hangs in a pipe, writes data only to stdout and
