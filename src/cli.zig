@@ -56,7 +56,7 @@ pub const Command = enum {
     cluster,
 };
 
-pub const ClusterAction = enum { pick, list, set };
+pub const ClusterAction = enum { pick, list, set, init };
 
 pub const ClusterArgs = struct {
     action: ClusterAction = .pick,
@@ -172,7 +172,7 @@ pub const overview_help =
     "Usage:\n" ++
     "  kite produce [OPTIONS] [@CLUSTER] TOPIC   Write stdin records to TOPIC.\n" ++
     "  kite consume [OPTIONS] [@CLUSTER] TOPIC   Read TOPIC to stdout.\n" ++
-    "  kite cluster [list|set NAME]   Pick, list, or set the cluster kite uses.\n" ++
+    "  kite cluster [list|set NAME|init]   Pick or set the current cluster.\n" ++
     "  kite --help                               Show this help.\n" ++
     "  kite --version                            Print the version.\n" ++
     "\n" ++
@@ -272,7 +272,7 @@ pub const consume_help =
     config_help;
 
 pub const cluster_usage =
-    "Usage: kite cluster [list|set NAME] [OPTIONS]\n" ++
+    "Usage: kite cluster [list|set NAME|init] [OPTIONS]\n" ++
     "Try 'kite cluster --help' for details.\n";
 
 pub const cluster_help =
@@ -282,6 +282,7 @@ pub const cluster_help =
     "  kite cluster                  Interactive picker (terminals only).\n" ++
     "  kite cluster list             Print the clusters in kite.yaml.\n" ++
     "  kite cluster set NAME         Make NAME the current cluster.\n" ++
+    "  kite cluster init             Add a cluster by answering questions.\n" ++
     "\n" ++
     "Options:\n" ++
     "  --config FILE         Read this config file instead of searching.\n" ++
@@ -298,6 +299,11 @@ pub const cluster_help =
     "`clusters:` keys are read, so it works even when a cluster is\n" ++
     "incomplete; kite never connects to a broker.\n" ++
     "\n" ++
+    "'init' asks for a name, bootstrap servers, security protocol and\n" ++
+    "credentials on stderr, then splices the new cluster into kite.yaml\n" ++
+    "without disturbing the rest of the file (an existing name may be\n" ++
+    "overwritten after confirmation); it can also mark it current.\n" ++
+    "\n" ++
     "The current cluster is stored in $XDG_CONFIG_HOME/kite/current\n" ++
     "(default ~/.config/kite/current) and is used when neither @NAME nor\n" ++
     "$KITE_TARGET selects one; it wins over the file's `default:`.\n" ++
@@ -307,6 +313,7 @@ pub const cluster_help =
     "  kite cluster list\n" ++
     "  kite cluster list --json | jq -r '.clusters[]'\n" ++
     "  kite cluster set prod\n" ++
+    "  kite cluster init\n" ++
     "\n" ++
     config_help;
 
@@ -550,11 +557,13 @@ pub fn parseCluster(alloc: std.mem.Allocator, args: []const []const u8) Result(C
                     parsed.action = .list;
                 } else if (std.mem.eql(u8, arg, "set")) {
                     parsed.action = .set;
+                } else if (std.mem.eql(u8, arg, "init")) {
+                    parsed.action = .init;
                 } else {
                     return errorResult(ClusterArgs, alloc, "unexpected argument '{s}'", .{arg});
                 }
             },
-            .list => return errorResult(ClusterArgs, alloc, "unexpected argument '{s}'", .{arg}),
+            .list, .init => return errorResult(ClusterArgs, alloc, "unexpected argument '{s}'", .{arg}),
             .set => if (parsed.name == null) {
                 parsed.name = arg;
             } else {
@@ -895,6 +904,11 @@ test "cluster command split and parsing" {
     }
     try expectErr(ClusterArgs, parseCluster(alloc, &.{"set"}), "missing NAME");
     try expectErr(ClusterArgs, parseCluster(alloc, &.{ "set", "a", "b" }), "unexpected argument 'b'");
+    switch (parseCluster(alloc, &.{"init"})) {
+        .ok => |a| try std.testing.expectEqual(ClusterAction.init, a.action),
+        else => return error.TestUnexpectedResult,
+    }
+    try expectErr(ClusterArgs, parseCluster(alloc, &.{ "init", "x" }), "unexpected argument 'x'");
     try expectErr(ClusterArgs, parseCluster(alloc, &.{ "list", "demo" }), "unexpected argument 'demo'");
     try expectErr(ClusterArgs, parseCluster(alloc, &.{"demo"}), "unexpected argument 'demo'");
     try expectErr(ClusterArgs, parseCluster(alloc, &.{"@prod"}), "use 'kite cluster set NAME' to switch clusters");

@@ -53,7 +53,7 @@ _kite() {
             if (( CURRENT == 3 )); then
                 _arguments -s \
                     '--config[read this config file]:file:_files' \
-                    '1:action:(list set)'
+                    '1:action:(list set init)'
             elif (( CURRENT == 4 )) && [[ "$words[3]" == set ]]; then
                 _kite_clusters
             else

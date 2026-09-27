@@ -29,6 +29,7 @@ SSL_TRUSTSTORE_LOCATION         optional PEM CA bundle
 kite cluster                    interactive picker (TTY) or the same output as `list`
 kite cluster list [--json]      list clusters, `*` marks the effective one; never connects
 kite cluster set NAME           store NAME as the current cluster (beats `default:`)
+kite cluster init               wizard: add a cluster to kite.yaml by answering questions
 kite -v                         verbose: prints which config sources were used
 
 ## Produce

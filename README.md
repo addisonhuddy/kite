@@ -157,6 +157,9 @@ printf 'hello\n' | kite produce events               # produce one record
 kite consume -B -n 1 --idle 3s --json events | jq -r .value  # prints: hello
 ```
 
+For a named cluster you can reuse across commands, `kite cluster init`
+writes one into kite.yaml (see [Multiple clusters](#multiple-clusters)).
+
 What to expect:
 
 - **stdout is data, stderr is diagnostics.** The produce line prints a short
@@ -376,7 +379,7 @@ kite.yaml and may appear anywhere among a command's arguments; `p` and
 ```text
 kite produce [OPTIONS] [@CLUSTER] TOPIC   Write stdin lines to TOPIC.
 kite consume [OPTIONS] [@CLUSTER] TOPIC   Read TOPIC to stdout.
-kite cluster [list|set NAME]              Pick, list, or set the current cluster.
+kite cluster [list|set NAME|init]         Pick, list, or set the current cluster.
 kite --version                            Print the version.
 ```
 
@@ -673,6 +676,18 @@ kite cluster list       # names, with ` *` after the effective cluster
 kite cluster set prod   # store 'prod' as the current cluster
 kite produce @prod t    # use 'prod' for this run only
 ```
+
+### Adding a cluster
+
+`kite cluster init` asks a few questions on stderr — cluster name,
+bootstrap servers, security protocol, SASL credentials when needed, and
+whether to make it the current cluster — and writes the answers as a new
+entry under `clusters:` in kite.yaml. The rest of the file (comments,
+`default:`, `defaults:`, other clusters) is left untouched; an existing
+name is replaced only after confirmation. The target is the config file
+kite would read (`--config` picks another), or
+`$XDG_CONFIG_HOME/kite/kite.yaml` when none exists. Answers can also be
+piped, so scripts can run the wizard non-interactively.
 
 On a terminal with both stdin and stderr attached, bare `kite cluster`
 opens a picker drawn on stderr (stdout stays clean); without a terminal
