@@ -680,14 +680,17 @@ kite produce @prod t    # use 'prod' for this run only
 ### Adding a cluster
 
 `kite cluster init` asks a few questions on stderr — cluster name,
-bootstrap servers, security protocol, SASL credentials when needed, and
-whether to make it the current cluster — and writes the answers as a new
-entry under `clusters:` in kite.yaml. The rest of the file (comments,
-`default:`, `defaults:`, other clusters) is left untouched; an existing
-name is replaced only after confirmation. The target is the config file
-kite would read (`--config` picks another), or
-`$XDG_CONFIG_HOME/kite/kite.yaml` when none exists. Answers can also be
-piped, so scripts can run the wizard non-interactively.
+bootstrap servers, and SASL credentials — and writes the answers as a
+new entry under `clusters:` in kite.yaml, then makes it the current
+cluster. Entering a SASL username produces a Confluent Cloud-style
+`SASL_SSL`/`PLAIN` cluster; leaving it empty produces a `PLAINTEXT` one.
+Other protocols, SCRAM mechanisms, and CA bundle paths are set by
+editing kite.yaml directly. The rest of the file (comments, `default:`,
+`defaults:`, other clusters) is left untouched; an existing name is
+replaced only after confirmation. The target is the config file kite
+would read (`--config` picks another), or `$XDG_CONFIG_HOME/kite/
+kite.yaml` when none exists. Answers can also be piped, so scripts can
+run the wizard non-interactively.
 
 On a terminal with both stdin and stderr attached, bare `kite cluster`
 opens a picker drawn on stderr (stdout stays clean); without a terminal
