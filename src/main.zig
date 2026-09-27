@@ -902,23 +902,63 @@ fn ask(r: *std.Io.Reader, alloc: std.mem.Allocator, comptime fmt: []const u8, ar
     return std.mem.trim(u8, line, " \t");
 }
 
-/// Like `ask` but turns off terminal echo while the answer is typed.
+/// Like `ask` but echoes '*' per character on a terminal.
 fn askSecret(r: *std.Io.Reader, alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ?[]const u8 {
     printPrompt(fmt, args);
     const fd = std.posix.STDIN_FILENO;
-    const saved: ?std.posix.termios = std.posix.tcgetattr(fd) catch null;
-    if (saved) |t| {
-        var raw = t;
-        raw.lflag.ECHO = false;
-        std.posix.tcsetattr(fd, .NOW, raw) catch {};
+    const saved = std.posix.tcgetattr(fd) catch {
+        // Not a terminal (piped): plain line read, nothing echoed.
+        const line = nextLine(r, alloc) catch fatal("failed reading stdin", .{}) orelse return null;
+        return std.mem.trim(u8, line, " \t");
+    };
+    var raw = saved;
+    raw.lflag.ECHO = false;
+    raw.lflag.ICANON = false;
+    raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+    raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+    std.posix.tcsetattr(fd, .NOW, raw) catch {};
+    defer std.posix.tcsetattr(fd, .NOW, saved) catch {};
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    var ch: [1]u8 = undefined;
+    while (true) {
+        const n = std.posix.read(fd, &ch) catch {
+            std.posix.tcsetattr(fd, .NOW, saved) catch {};
+            fatal("failed reading stdin", .{});
+        };
+        const b = if (n == 0) 0x04 else ch[0];
+        switch (b) {
+            '\n', '\r' => {
+                out("\n", .{});
+                return std.mem.trim(u8, buf.items, " \t");
+            },
+            0x04 => if (buf.items.len == 0) {
+                out("\n", .{});
+                return null;
+            },
+            0x03 => {
+                std.posix.tcsetattr(fd, .NOW, saved) catch {};
+                out("\n", .{});
+                fatal("aborted", .{});
+            },
+            0x7f, 0x08 => {
+                // Drop one UTF-8 character: continuation bytes plus the lead.
+                var erased = false;
+                while (buf.items.len > 0) {
+                    const popped = buf.pop().?;
+                    erased = true;
+                    if (popped < 0x80 or popped > 0xBF) break;
+                }
+                if (erased) out("\x08 \x08", .{});
+            },
+            else => {
+                if (b < 0x20) continue;
+                buf.append(alloc, b) catch oom();
+                // One '*' per character: continuation bytes add none.
+                if (b < 0x80 or b > 0xBF) out("*", .{});
+            },
+        }
     }
-    const line = nextLine(r, alloc) catch fatal("failed reading stdin", .{});
-    if (saved) |t| {
-        std.posix.tcsetattr(fd, .NOW, t) catch {};
-        out("\n", .{});
-    }
-    const owned = line orelse return null;
-    return std.mem.trim(u8, owned, " \t");
 }
 
 /// The value spelled so the yaml parser reads it back unchanged: double
