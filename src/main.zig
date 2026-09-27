@@ -822,45 +822,11 @@ fn runClusterInit(init: std.process.Init, alloc: std.mem.Allocator, common: cli_
         }
     };
 
-    const proto_names = [_][]const u8{ "PLAINTEXT", "SSL", "SASL_SSL", "SASL_PLAINTEXT" };
-    const proto = proto_blk: {
-        while (true) {
-            const answer = ask(r, alloc, "Security protocol [PLAINTEXT, SSL, SASL_SSL, SASL_PLAINTEXT] (PLAINTEXT): ", .{}) orelse
-                fatal("aborted", .{});
-            if (answer.len == 0) break :proto_blk @as(usize, 0);
-            if (matchChoice(answer, &proto_names)) |i| break :proto_blk i;
-            out("kite: '{s}' is not a security protocol (name or 1-{d})\n", .{ answer, proto_names.len });
-        }
-    };
-    const is_sasl = proto == 2 or proto == 3;
-    const is_tls = proto == 1 or proto == 2;
-
-    var mechanism: ?[]const u8 = null;
-    var username: ?[]const u8 = null;
+    // A SASL username means a Confluent Cloud-style SASL_SSL/PLAIN
+    // cluster; anything else is edited into kite.yaml by hand.
+    const username = ask(r, alloc, "SASL username (empty for a PLAINTEXT cluster): ", .{}) orelse fatal("aborted", .{});
     var password: ?[]const u8 = null;
-    if (is_sasl) {
-        const mech_names = [_][]const u8{ "PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512" };
-        mechanism = mech_names[
-            mech_blk: {
-                while (true) {
-                    const answer = ask(r, alloc, "SASL mechanism [PLAIN, SCRAM-SHA-256, SCRAM-SHA-512] (PLAIN): ", .{}) orelse
-                        fatal("aborted", .{});
-                    if (answer.len == 0) break :mech_blk @as(usize, 0);
-                    if (matchChoice(answer, &mech_names)) |i| break :mech_blk i;
-                    out("kite: '{s}' is not a SASL mechanism (name or 1-{d})\n", .{ answer, mech_names.len });
-                }
-            }
-        ];
-        username = user_blk: {
-            while (true) {
-                const answer = ask(r, alloc, "SASL username: ", .{}) orelse fatal("aborted", .{});
-                if (answer.len == 0) {
-                    out("kite: a SASL username is required\n", .{});
-                    continue;
-                }
-                break :user_blk answer;
-            }
-        };
+    if (username.len > 0) {
         const secret = askSecret(r, alloc, "SASL password (empty to leave it out and use $SASL_PASSWORD): ", .{}) orelse
             fatal("aborted", .{});
         password = if (secret.len == 0) null else secret;
@@ -868,26 +834,16 @@ fn runClusterInit(init: std.process.Init, alloc: std.mem.Allocator, common: cli_
             note("sasl.password left unset; set SASL_PASSWORD when using '{s}'", .{name});
     }
 
-    var truststore: ?[]const u8 = null;
-    if (is_tls) {
-        const answer = ask(r, alloc, "CA bundle path (empty for the system trust store): ", .{}) orelse fatal("aborted", .{});
-        truststore = if (answer.len == 0) null else answer;
-    }
-
-    const make_current = current_blk: {
-        const answer = ask(r, alloc, "Make '{s}' the current cluster? [Y/n] ", .{name}) orelse fatal("aborted", .{});
-        break :current_blk !(std.ascii.eqlIgnoreCase(answer, "n") or std.ascii.eqlIgnoreCase(answer, "no"));
-    };
-
     var block = std.Io.Writer.Allocating.init(alloc);
     const bw = &block.writer;
     bw.print("  {s}:\n", .{name}) catch oom();
     bw.print("    bootstrap.servers: {s}\n", .{yamlScalar(alloc, bootstrap)}) catch oom();
-    bw.print("    security.protocol: {s}\n", .{proto_names[proto]}) catch oom();
-    if (mechanism) |m| bw.print("    sasl.mechanism: {s}\n", .{m}) catch oom();
-    if (username) |u| bw.print("    sasl.username: {s}\n", .{yamlScalar(alloc, u)}) catch oom();
-    if (password) |p| bw.print("    sasl.password: {s}\n", .{yamlScalar(alloc, p)}) catch oom();
-    if (truststore) |t| bw.print("    ssl.truststore.location: {s}\n", .{yamlScalar(alloc, t)}) catch oom();
+    if (username.len > 0) {
+        bw.print("    security.protocol: SASL_SSL\n", .{}) catch oom();
+        bw.print("    sasl.mechanism: PLAIN\n", .{}) catch oom();
+        bw.print("    sasl.username: {s}\n", .{yamlScalar(alloc, username)}) catch oom();
+        if (password) |p| bw.print("    sasl.password: {s}\n", .{yamlScalar(alloc, p)}) catch oom();
+    }
 
     const new_text = spliceCluster(alloc, existing, name, block.written()) catch oom();
     if (std.fs.path.dirname(path)) |dir|
@@ -908,16 +864,11 @@ fn runClusterInit(init: std.process.Init, alloc: std.mem.Allocator, common: cli_
     };
 
     if (!common.quiet) note("wrote cluster '{s}' to {s}", .{ name, path });
-    if (make_current) {
-        config.writeCurrentCluster(io, alloc, env, name) catch |err|
-            fatal("cannot store current cluster ({s})", .{@errorName(err)});
-        if (!common.quiet) note("cluster set to '{s}'", .{name});
-    }
+    config.writeCurrentCluster(io, alloc, env, name) catch |err|
+        fatal("cannot store current cluster ({s})", .{@errorName(err)});
     if (!common.quiet) {
-        if (make_current)
-            note("try: kite consume -B TOPIC", .{})
-        else
-            note("try: kite consume @{s} -B TOPIC", .{name});
+        note("cluster set to '{s}'", .{name});
+        note("try: kite consume -B TOPIC", .{});
     }
     std.process.exit(0);
 }
@@ -930,14 +881,6 @@ fn hasName(names: []const []const u8, name: []const u8) bool {
     for (names) |n|
         if (std.mem.eql(u8, n, name)) return true;
     return false;
-}
-
-/// Case-insensitive name or 1-based number into `names`.
-fn matchChoice(answer: []const u8, names: []const []const u8) ?usize {
-    for (names, 0..) |n, i|
-        if (std.ascii.eqlIgnoreCase(answer, n)) return i;
-    const idx = std.fmt.parseInt(usize, answer, 10) catch return null;
-    return if (idx >= 1 and idx <= names.len) idx - 1 else null;
 }
 
 fn answeredYes(answer: []const u8) bool {

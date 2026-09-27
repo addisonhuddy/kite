@@ -182,13 +182,13 @@ run_case init-props 1 empty "is a properties file (use --config kite.yaml)" clus
 # Piped answers: a SASL_SSL cluster lands in a fresh file, mode 600, made
 # the current cluster.
 set +e
-(cd "$TMP/work" && printf 'demo\nb1:9092,b2:9092\nSASL_SSL\n3\nuser\npw\n\n\n' | \
+(cd "$TMP/work" && printf 'demo\nb1:9092,b2:9092\nuser\npw\n' | \
     HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" cluster init --config "$TMP/work/init.yaml" \
     >"$TMP/init.out" 2>"$TMP/init.err")
 status=$?
 set -e
 [ "$status" -eq 0 ] || { echo "FAIL init-sasl: exit $status"; cat "$TMP/init.err"; exit 1; }
-printf 'clusters:\n  demo:\n    bootstrap.servers: b1:9092,b2:9092\n    security.protocol: SASL_SSL\n    sasl.mechanism: SCRAM-SHA-512\n    sasl.username: user\n    sasl.password: pw\n' \
+printf 'clusters:\n  demo:\n    bootstrap.servers: b1:9092,b2:9092\n    security.protocol: SASL_SSL\n    sasl.mechanism: PLAIN\n    sasl.username: user\n    sasl.password: pw\n' \
     | cmp -s - "$TMP/work/init.yaml" || {
     echo "FAIL init-sasl: file contents"; cat "$TMP/work/init.yaml"; exit 1;
 }
@@ -199,9 +199,10 @@ printf 'clusters:\n  demo:\n    bootstrap.servers: b1:9092,b2:9092\n    security
     echo "FAIL init-sasl: current file"; exit 1;
 }
 echo "PASS init-sasl"
-# A second cluster is appended; the first block and current stay put.
+# A second cluster is appended; the first block stays put and the
+# current cluster moves to the new one.
 set +e
-(cd "$TMP/work" && printf 'dev2\nlocalhost:9093\nPLAINTEXT\nn\n' | \
+(cd "$TMP/work" && printf 'dev2\nlocalhost:9093\n\n' | \
     HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" cluster init --config "$TMP/work/init.yaml" \
     >"$TMP/init2.out" 2>"$TMP/init2.err")
 status=$?
@@ -210,13 +211,13 @@ set -e
     && grep -q '^  demo:$' "$TMP/work/init.yaml" \
     && grep -q '^  dev2:$' "$TMP/work/init.yaml" \
     && grep -q 'sasl.password: pw' "$TMP/work/init.yaml" \
-    && [ "$(cat "$TMP/xdg/kite/current")" = demo ] || {
+    && [ "$(cat "$TMP/xdg/kite/current")" = dev2 ] || {
     echo "FAIL init-append"; cat "$TMP/work/init.yaml"; exit 1;
 }
 echo "PASS init-append"
 # Answering y to the overwrite prompt replaces only that block.
 set +e
-(cd "$TMP/work" && printf 'demo\ny\nnew:9092\n\nn\n' | \
+(cd "$TMP/work" && printf 'demo\ny\nnew:9092\n\n' | \
     HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" cluster init --config "$TMP/work/init.yaml" \
     >"$TMP/init3.out" 2>"$TMP/init3.err")
 status=$?
@@ -224,7 +225,8 @@ set -e
 [ "$status" -eq 0 ] \
     && [ "$(grep -c '^  demo:$' "$TMP/work/init.yaml")" = 1 ] \
     && grep -q 'bootstrap.servers: new:9092' "$TMP/work/init.yaml" \
-    && grep -q '^  dev2:$' "$TMP/work/init.yaml" || {
+    && grep -q '^  dev2:$' "$TMP/work/init.yaml" \
+    && [ "$(cat "$TMP/xdg/kite/current")" = demo ] || {
     echo "FAIL init-overwrite"; cat "$TMP/work/init.yaml"; exit 1;
 }
 echo "PASS init-overwrite"
@@ -239,7 +241,7 @@ clusters:
     bootstrap.servers: dev:2
 EOF
 set +e
-(cd "$TMP/work" && printf 'new\n\n\n\ny\n' | \
+(cd "$TMP/work" && printf 'new\n\n\n' | \
     HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" cluster init --config "$TMP/work/seed.yaml" \
     >"$TMP/init4.out" 2>"$TMP/init4.err")
 status=$?

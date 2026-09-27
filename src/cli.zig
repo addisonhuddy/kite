@@ -299,10 +299,13 @@ pub const cluster_help =
     "`clusters:` keys are read, so it works even when a cluster is\n" ++
     "incomplete; kite never connects to a broker.\n" ++
     "\n" ++
-    "'init' asks for a name, bootstrap servers, security protocol and\n" ++
-    "credentials on stderr, then splices the new cluster into kite.yaml\n" ++
-    "without disturbing the rest of the file (an existing name may be\n" ++
-    "overwritten after confirmation); it can also mark it current.\n" ++
+    "'init' asks for a name, bootstrap servers and SASL credentials on\n" ++
+    "stderr — a SASL username implies a Confluent Cloud-style\n" ++
+    "SASL_SSL/PLAIN cluster, empty means PLAINTEXT — then splices the\n" ++
+    "cluster into kite.yaml without disturbing the rest of the file (an\n" ++
+    "existing name may be overwritten after confirmation) and makes it\n" ++
+    "the current cluster. Other protocols, SCRAM, and CA bundle paths\n" ++
+    "are set by editing kite.yaml.\n" ++
     "\n" ++
     "The current cluster is stored in $XDG_CONFIG_HOME/kite/current\n" ++
     "(default ~/.config/kite/current) and is used when neither @NAME nor\n" ++
