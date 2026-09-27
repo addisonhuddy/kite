@@ -759,9 +759,10 @@ fn runCluster(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
 fn runClusterInit(init: std.process.Init, alloc: std.mem.Allocator, common: cli_args.Common) noreturn {
     const io = init.io;
     const env = init.environ_map;
+    term.color.enabled = term.detect(io, std.Io.File.stderr(), env);
 
     const path = (config.findConfigFile(io, alloc, env, .{ .config_path = common.config_path }) catch
-        fatal("out of memory", .{})) orelse
+        oom()) orelse
         config.defaultYamlPath(alloc, env) catch
         fatal("cannot pick a config file location (HOME is unset)", .{});
     if (!config.isYamlPath(path))
@@ -769,7 +770,7 @@ fn runClusterInit(init: std.process.Init, alloc: std.mem.Allocator, common: cli_
 
     const existing: []const u8 = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20)) catch |err| switch (err) {
         error.FileNotFound => "clusters:\n",
-        error.OutOfMemory => fatal("out of memory", .{}),
+        error.OutOfMemory => oom(),
         else => fatal("cannot read {s}", .{path}),
     };
     // Fail early on syntax errors before asking anything.
@@ -782,7 +783,7 @@ fn runClusterInit(init: std.process.Init, alloc: std.mem.Allocator, common: cli_
         .map => |m| {
             var it = m.iterator();
             while (it.next()) |e|
-                known.append(alloc, e.key_ptr.*) catch fatal("out of memory", .{});
+                known.append(alloc, e.key_ptr.*) catch oom();
         },
     };
 
@@ -880,18 +881,15 @@ fn runClusterInit(init: std.process.Init, alloc: std.mem.Allocator, common: cli_
 
     var block = std.Io.Writer.Allocating.init(alloc);
     const bw = &block.writer;
-    bw.print("  {s}:\n", .{name}) catch fatal("out of memory", .{});
-    bw.print("    bootstrap.servers: {s}\n", .{yamlScalar(alloc, bootstrap)}) catch fatal("out of memory", .{});
-    bw.print("    security.protocol: {s}\n", .{proto_names[proto]}) catch fatal("out of memory", .{});
-    if (mechanism) |m| bw.print("    sasl.mechanism: {s}\n", .{m}) catch fatal("out of memory", .{});
-    if (username) |u| bw.print("    sasl.username: {s}\n", .{yamlScalar(alloc, u)}) catch fatal("out of memory", .{});
-    if (password) |p| bw.print("    sasl.password: {s}\n", .{yamlScalar(alloc, p)}) catch fatal("out of memory", .{});
-    if (truststore) |t| bw.print("    ssl.truststore.location: {s}\n", .{yamlScalar(alloc, t)}) catch fatal("out of memory", .{});
+    bw.print("  {s}:\n", .{name}) catch oom();
+    bw.print("    bootstrap.servers: {s}\n", .{yamlScalar(alloc, bootstrap)}) catch oom();
+    bw.print("    security.protocol: {s}\n", .{proto_names[proto]}) catch oom();
+    if (mechanism) |m| bw.print("    sasl.mechanism: {s}\n", .{m}) catch oom();
+    if (username) |u| bw.print("    sasl.username: {s}\n", .{yamlScalar(alloc, u)}) catch oom();
+    if (password) |p| bw.print("    sasl.password: {s}\n", .{yamlScalar(alloc, p)}) catch oom();
+    if (truststore) |t| bw.print("    ssl.truststore.location: {s}\n", .{yamlScalar(alloc, t)}) catch oom();
 
-    const new_text = spliceCluster(alloc, existing, name, block.written()) catch |err| switch (err) {
-        error.NoClustersSection => fatal("could not locate a top-level 'clusters:' in {s}", .{path}),
-        error.OutOfMemory => fatal("out of memory", .{}),
-    };
+    const new_text = spliceCluster(alloc, existing, name, block.written()) catch oom();
     if (std.fs.path.dirname(path)) |dir|
         std.Io.Dir.cwd().createDirPath(io, dir) catch |err|
             fatal("cannot create {s} ({s})", .{ dir, @errorName(err) });
@@ -905,23 +903,27 @@ fn runClusterInit(init: std.process.Init, alloc: std.mem.Allocator, common: cli_
     var src2: config.Source = .{};
     _ = config.listTargets(io, alloc, env, .{ .config_path = path }, &src2) catch |err| switch (err) {
         error.ConfigSyntax => fatal("{s}:{d}: {s}", .{ path, src2.diag.line, src2.diag.msg }),
-        error.OutOfMemory => fatal("out of memory", .{}),
+        error.OutOfMemory => oom(),
         else => fatal("wrote {s} but it did not re-parse cleanly ({s})", .{ path, @errorName(err) }),
     };
 
+    if (!common.quiet) note("wrote cluster '{s}' to {s}", .{ name, path });
     if (make_current) {
         config.writeCurrentCluster(io, alloc, env, name) catch |err|
             fatal("cannot store current cluster ({s})", .{@errorName(err)});
         if (!common.quiet) note("cluster set to '{s}'", .{name});
     }
     if (!common.quiet) {
-        note("wrote cluster '{s}' to {s}", .{ name, path });
         if (make_current)
             note("try: kite consume -B TOPIC", .{})
         else
             note("try: kite consume @{s} -B TOPIC", .{name});
     }
     std.process.exit(0);
+}
+
+fn oom() noreturn {
+    fatal("out of memory", .{});
 }
 
 fn hasName(names: []const []const u8, name: []const u8) bool {
@@ -942,23 +944,24 @@ fn answeredYes(answer: []const u8) bool {
     return std.ascii.eqlIgnoreCase(answer, "y") or std.ascii.eqlIgnoreCase(answer, "yes");
 }
 
-/// Print a prompt on stderr (bold on a terminal) and return the trimmed
-/// answer line; null at EOF.
-fn ask(r: *std.Io.Reader, alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ?[]const u8 {
+/// Print a prompt on stderr (bold on a terminal).
+fn printPrompt(comptime fmt: []const u8, args: anytype) void {
     if (term.color.enabled)
         out(term.bold ++ fmt ++ term.reset, args)
     else
         out(fmt, args);
+}
+
+/// Prompt and return the trimmed answer line; null at EOF.
+fn ask(r: *std.Io.Reader, alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ?[]const u8 {
+    printPrompt(fmt, args);
     const line = nextLine(r, alloc) catch fatal("failed reading stdin", .{}) orelse return null;
     return std.mem.trim(u8, line, " \t");
 }
 
 /// Like `ask` but turns off terminal echo while the answer is typed.
 fn askSecret(r: *std.Io.Reader, alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ?[]const u8 {
-    if (term.color.enabled)
-        out(term.bold ++ fmt ++ term.reset, args)
-    else
-        out(fmt, args);
+    printPrompt(fmt, args);
     const fd = std.posix.STDIN_FILENO;
     const saved: ?std.posix.termios = std.posix.tcgetattr(fd) catch null;
     if (saved) |t| {
@@ -991,12 +994,12 @@ fn yamlScalar(alloc: std.mem.Allocator, v: []const u8) []const u8 {
     };
     if (!need) return v;
     var outb: std.ArrayListUnmanaged(u8) = .empty;
-    outb.append(alloc, '"') catch fatal("out of memory", .{});
+    outb.append(alloc, '"') catch oom();
     for (v) |c| {
-        if (c == '"' or c == '\\') outb.append(alloc, '\\') catch fatal("out of memory", .{});
-        outb.append(alloc, c) catch fatal("out of memory", .{});
+        if (c == '"' or c == '\\') outb.append(alloc, '\\') catch oom();
+        outb.append(alloc, c) catch oom();
     }
-    outb.append(alloc, '"') catch fatal("out of memory", .{});
+    outb.append(alloc, '"') catch oom();
     return outb.items;
 }
 
@@ -1004,7 +1007,7 @@ fn yamlScalar(alloc: std.mem.Allocator, v: []const u8) []const u8 {
 /// under the top-level `clusters:` key, preserving all other content:
 /// replaces NAME's block when it exists, appends to the section, or adds
 /// the whole `clusters:` section at the end.
-fn spliceCluster(alloc: std.mem.Allocator, text: []const u8, name: []const u8, block: []const u8) error{ NoClustersSection, OutOfMemory }![]const u8 {
+fn spliceCluster(alloc: std.mem.Allocator, text: []const u8, name: []const u8, block: []const u8) error{OutOfMemory}![]const u8 {
     const blank = 0;
     const comment = 1;
     const content = 2;
