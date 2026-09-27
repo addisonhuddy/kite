@@ -15,7 +15,7 @@ _kite() {
     if [ "$cmd" = cluster ]; then
         for w in "${COMP_WORDS[@]:2:COMP_CWORD-2}"; do
             case "$w" in
-                list | set) sub=$w ;;
+                list | set | init) sub=$w ;;
             esac
         done
     fi
@@ -59,7 +59,7 @@ _kite() {
             ;;
         cluster)
             if [ -z "$sub" ]; then
-                opts="list set --config --json -q --quiet -v --verbose -h --help"
+                opts="list set init --config --json -q --quiet -v --verbose -h --help"
             else
                 opts="--config --format --json -q --quiet -v --verbose -h --help"
             fi

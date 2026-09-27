@@ -32,7 +32,7 @@ complete -c kite -n '__fish_seen_subcommand_from consume c' -s t -l idle -d 'Sto
 complete -c kite -n '__fish_seen_subcommand_from consume c' -s f -l follow -d 'Never stop on idle'
 
 # cluster.
-complete -c kite -n '__fish_seen_subcommand_from cluster; and test (count (commandline -opc)[2..-1]) -eq 0' -f -a 'list set'
+complete -c kite -n '__fish_seen_subcommand_from cluster; and test (count (commandline -opc)[2..-1]) -eq 0' -f -a 'list set init'
 complete -c kite -n '__fish_seen_subcommand_from cluster' -l format -d 'Output shape' -xa 'json'
 complete -c kite -n '__fish_seen_subcommand_from cluster' -l json -d 'JSON output'
 # kite cluster set NAME completes cluster names from kite.yaml.

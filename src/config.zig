@@ -224,7 +224,7 @@ fn configPaths(alloc: std.mem.Allocator, env: *std.process.Environ.Map, list: *s
     }
 }
 
-fn isYamlPath(path: []const u8) bool {
+pub fn isYamlPath(path: []const u8) bool {
     const ext = std.fs.path.extension(path);
     return std.ascii.eqlIgnoreCase(ext, ".yaml") or std.ascii.eqlIgnoreCase(ext, ".yml");
 }
@@ -363,6 +363,40 @@ pub fn listTargets(
     return .{ .names = source.targets, .selected = selected };
 }
 
+/// The config file `load`/`listTargets` would read: the explicit
+/// `--config`/`KAFKA_PROPERTIES` path when set, else the first readable
+/// file on the search path, else null.
+pub fn findConfigFile(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+    overrides: Overrides,
+) error{OutOfMemory}!?[]const u8 {
+    if (overrides.config_path) |path| return path;
+    if (env.get("KAFKA_PROPERTIES")) |from_env|
+        if (from_env.len > 0) return from_env;
+    var paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    try configPaths(alloc, env, &paths);
+    for (paths.items) |p| {
+        const f = std.Io.Dir.cwd().openFile(io, p, .{}) catch continue;
+        f.close(io);
+        return p;
+    }
+    return null;
+}
+
+/// Where `kite cluster init` writes when no config file exists:
+/// $XDG_CONFIG_HOME/kite/kite.yaml, else ~/.config/kite/kite.yaml.
+pub fn defaultYamlPath(alloc: std.mem.Allocator, env: *std.process.Environ.Map) ![]const u8 {
+    if (env.get("XDG_CONFIG_HOME")) |xdg| {
+        if (xdg.len > 0) return std.fmt.allocPrint(alloc, "{s}/kite/kite.yaml", .{xdg});
+    }
+    if (env.get("HOME")) |home| {
+        if (home.len > 0) return std.fmt.allocPrint(alloc, "{s}/.config/kite/kite.yaml", .{home});
+    }
+    return error.NoHomeDirectory;
+}
+
 /// Locate and parse the config file (`--config`/`KAFKA_PROPERTIES` or the
 /// first hit on the search path). Null when no file was found.
 fn readDoc(
@@ -386,19 +420,12 @@ fn readDoc(
             else => return error.ConfigFileUnreadable,
         };
         source.file = path;
-    } else {
-        var paths: std.ArrayListUnmanaged([]const u8) = .empty;
-        try configPaths(alloc, env, &paths);
-        for (paths.items) |p| {
-            const t = std.Io.Dir.cwd().readFileAlloc(io, p, alloc, .limited(1 << 20)) catch |err| switch (err) {
-                error.FileNotFound => continue,
-                error.OutOfMemory => return error.OutOfMemory,
-                else => continue,
-            };
-            text = t;
-            source.file = p;
-            break;
-        }
+    } else if (try findConfigFile(io, alloc, env, overrides)) |path| {
+        text = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.ConfigFileUnreadable,
+        };
+        source.file = path;
     }
 
     const body = text orelse return null;
@@ -484,7 +511,7 @@ fn validatedCurrent(io: std.Io, alloc: std.mem.Allocator, env: *std.process.Envi
     return name;
 }
 
-fn validTargetName(name: []const u8) bool {
+pub fn validTargetName(name: []const u8) bool {
     if (name.len == 0) return false;
     for (name) |c| {
         if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return false;

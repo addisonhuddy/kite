@@ -68,8 +68,10 @@ if command -v bash >/dev/null; then
         _kite && printf "%s\n" "${COMPREPLY[@]}"
         COMP_WORDS=(kite cluster s); COMP_CWORD=2; COMP_LINE="kite cluster s"; COMP_POINT=${#COMP_LINE}
         _kite && printf "%s\n" "${COMPREPLY[@]}"
+        COMP_WORDS=(kite cluster i); COMP_CWORD=2; COMP_LINE="kite cluster i"; COMP_POINT=${#COMP_LINE}
+        _kite && printf "%s\n" "${COMPREPLY[@]}"
     ') || fail "bash: completion script did not load"
-    expect bash "$out" --from-beginning --csv consume @local-b cluster set
+    expect bash "$out" --from-beginning --csv consume @local-b cluster set init
 else
     echo "SKIP bash"
 fi

@@ -175,6 +175,95 @@ run_case cluster-set-extra 1 empty "kite: unexpected argument 'b'" cluster set a
 run_case cluster-json-set 1 empty "kite: --json is only valid with kite cluster list" cluster set prod --json
 run_case cluster-format 1 empty "kite: --format: only json is valid with kite cluster list" cluster list --format tsv
 
+# kite cluster init: a wizard that writes a cluster into kite.yaml.
+run_case init-extra 1 empty "kite: unexpected argument 'extra'" cluster init extra
+run_case init-json 1 empty "kite: --json is only valid with kite cluster list" cluster init --json
+run_case init-props 1 empty "is a properties file (use --config kite.yaml)" cluster init --config x.properties
+# Piped answers: a SASL_SSL cluster lands in a fresh file, mode 600, made
+# the current cluster.
+set +e
+(cd "$TMP/work" && printf 'demo\nb1:9092,b2:9092\nSASL_SSL\n3\nuser\npw\n\n\n' | \
+    HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" cluster init --config "$TMP/work/init.yaml" \
+    >"$TMP/init.out" 2>"$TMP/init.err")
+status=$?
+set -e
+[ "$status" -eq 0 ] || { echo "FAIL init-sasl: exit $status"; cat "$TMP/init.err"; exit 1; }
+printf 'clusters:\n  demo:\n    bootstrap.servers: b1:9092,b2:9092\n    security.protocol: SASL_SSL\n    sasl.mechanism: SCRAM-SHA-512\n    sasl.username: user\n    sasl.password: pw\n' \
+    | cmp -s - "$TMP/work/init.yaml" || {
+    echo "FAIL init-sasl: file contents"; cat "$TMP/work/init.yaml"; exit 1;
+}
+[ "$(stat -c%a "$TMP/work/init.yaml")" = 600 ] || {
+    echo "FAIL init-sasl: mode is $(stat -c%a "$TMP/work/init.yaml"), want 600"; exit 1;
+}
+[ "$(cat "$TMP/xdg/kite/current")" = demo ] || {
+    echo "FAIL init-sasl: current file"; exit 1;
+}
+echo "PASS init-sasl"
+# A second cluster is appended; the first block and current stay put.
+set +e
+(cd "$TMP/work" && printf 'dev2\nlocalhost:9093\nPLAINTEXT\nn\n' | \
+    HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" cluster init --config "$TMP/work/init.yaml" \
+    >"$TMP/init2.out" 2>"$TMP/init2.err")
+status=$?
+set -e
+[ "$status" -eq 0 ] \
+    && grep -q '^  demo:$' "$TMP/work/init.yaml" \
+    && grep -q '^  dev2:$' "$TMP/work/init.yaml" \
+    && grep -q 'sasl.password: pw' "$TMP/work/init.yaml" \
+    && [ "$(cat "$TMP/xdg/kite/current")" = demo ] || {
+    echo "FAIL init-append"; cat "$TMP/work/init.yaml"; exit 1;
+}
+echo "PASS init-append"
+# Answering y to the overwrite prompt replaces only that block.
+set +e
+(cd "$TMP/work" && printf 'demo\ny\nnew:9092\n\nn\n' | \
+    HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" cluster init --config "$TMP/work/init.yaml" \
+    >"$TMP/init3.out" 2>"$TMP/init3.err")
+status=$?
+set -e
+[ "$status" -eq 0 ] \
+    && [ "$(grep -c '^  demo:$' "$TMP/work/init.yaml")" = 1 ] \
+    && grep -q 'bootstrap.servers: new:9092' "$TMP/work/init.yaml" \
+    && grep -q '^  dev2:$' "$TMP/work/init.yaml" || {
+    echo "FAIL init-overwrite"; cat "$TMP/work/init.yaml"; exit 1;
+}
+echo "PASS init-overwrite"
+# Comments and default:/defaults: above clusters: survive the splice.
+cat >"$TMP/work/seed.yaml" <<'EOF'
+# my comment
+default: dev
+defaults:
+  linger.ms: 20
+clusters:
+  dev:
+    bootstrap.servers: dev:2
+EOF
+set +e
+(cd "$TMP/work" && printf 'new\n\n\n\ny\n' | \
+    HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" cluster init --config "$TMP/work/seed.yaml" \
+    >"$TMP/init4.out" 2>"$TMP/init4.err")
+status=$?
+set -e
+[ "$status" -eq 0 ] \
+    && grep -q '^# my comment$' "$TMP/work/seed.yaml" \
+    && grep -q '^default: dev$' "$TMP/work/seed.yaml" \
+    && grep -q 'linger.ms: 20' "$TMP/work/seed.yaml" \
+    && grep -q '^  new:$' "$TMP/work/seed.yaml" || {
+    echo "FAIL init-preserve"; cat "$TMP/work/seed.yaml"; exit 1;
+}
+echo "PASS init-preserve"
+# EOF on stdin mid-wizard aborts.
+set +e
+(cd "$TMP/work" && : | HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg" "$BIN" cluster init --config "$TMP/work/f.yaml" \
+    >"$TMP/init5.out" 2>"$TMP/init5.err")
+status=$?
+set -e
+[ "$status" -eq 1 ] && grep -Fq "kite: aborted" "$TMP/init5.err" || {
+    echo "FAIL init-eof"; cat "$TMP/init5.err"; exit 1;
+}
+echo "PASS init-eof"
+rm -f "$TMP/work/init.yaml" "$TMP/work/seed.yaml" "$TMP/work/f.yaml"
+
 # @NAME: named clusters in kite.yaml.
 run_case at-target-no-file 1 empty "requires a properties file" produce @x demo
 run_case at-target-empty 1 empty "'@' must be followed by a cluster name" produce @ demo

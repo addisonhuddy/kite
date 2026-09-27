@@ -672,6 +672,7 @@ fn runCluster(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
         .ok => |value| value,
     };
     const common = cluster.common;
+    if (cluster.action == .init) runClusterInit(init, alloc, common);
 
     var source: config.Source = .{};
     const targets = config.listTargets(init.io, alloc, init.environ_map, .{
@@ -687,6 +688,7 @@ fn runCluster(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     };
 
     switch (cluster.action) {
+        .init => unreachable, // handled above, before listTargets
         .list => {},
         .set => {
             setCurrentCluster(init, alloc, common, cluster.name.?, &source, targets.names);
@@ -749,6 +751,357 @@ fn runCluster(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     }
     outw.flush() catch {};
     std.process.exit(0);
+}
+
+/// `kite cluster init`: interactive wizard that asks questions on stderr,
+/// reads answers line-by-line from stdin (TTY or piped), and splices the
+/// resulting cluster into kite.yaml. Does not need an existing config file.
+fn runClusterInit(init: std.process.Init, alloc: std.mem.Allocator, common: cli_args.Common) noreturn {
+    const io = init.io;
+    const env = init.environ_map;
+
+    const path = (config.findConfigFile(io, alloc, env, .{ .config_path = common.config_path }) catch
+        fatal("out of memory", .{})) orelse
+        config.defaultYamlPath(alloc, env) catch
+        fatal("cannot pick a config file location (HOME is unset)", .{});
+    if (!config.isYamlPath(path))
+        fatal("kite cluster init writes kite.yaml; {s} is a properties file (use --config kite.yaml)", .{path});
+
+    const existing: []const u8 = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20)) catch |err| switch (err) {
+        error.FileNotFound => "clusters:\n",
+        error.OutOfMemory => fatal("out of memory", .{}),
+        else => fatal("cannot read {s}", .{path}),
+    };
+    // Fail early on syntax errors before asking anything.
+    var diag: yaml.Diag = .{};
+    const top = yaml.parse(alloc, existing, &diag) catch
+        fatal("{s}:{d}: {s}", .{ path, diag.line, diag.msg });
+    var known: std.ArrayListUnmanaged([]const u8) = .empty;
+    if (top.get("clusters")) |node| switch (node) {
+        .scalar => {},
+        .map => |m| {
+            var it = m.iterator();
+            while (it.next()) |e|
+                known.append(alloc, e.key_ptr.*) catch fatal("out of memory", .{});
+        },
+    };
+
+    var stdin_buf: [4096]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
+    const r = &stdin_reader.interface;
+
+    const name = name_blk: {
+        var n: usize = 2;
+        var default_buf: [64]u8 = undefined;
+        var default: []const u8 = "local";
+        while (hasName(known.items, default)) {
+            default = std.fmt.bufPrint(&default_buf, "local-{d}", .{n}) catch unreachable;
+            n += 1;
+        }
+        while (true) {
+            const answer = ask(r, alloc, "Cluster name ({s}): ", .{default}) orelse fatal("aborted", .{});
+            const chosen = if (answer.len == 0) default else answer;
+            if (!config.validTargetName(chosen)) {
+                out("kite: '{s}' is not a valid cluster name (letters, digits, '-' and '_' only)\n", .{chosen});
+                continue;
+            }
+            if (hasName(known.items, chosen)) {
+                const ow = ask(r, alloc, "Cluster '{s}' exists; overwrite? [y/N] ", .{chosen}) orelse fatal("aborted", .{});
+                if (!answeredYes(ow)) continue;
+            }
+            break :name_blk chosen;
+        }
+    };
+
+    const bootstrap = bootstrap_blk: {
+        while (true) {
+            const answer = ask(r, alloc, "Bootstrap servers (localhost:9092): ", .{}) orelse fatal("aborted", .{});
+            if (answer.len == 0) break :bootstrap_blk @as([]const u8, "localhost:9092");
+            break :bootstrap_blk answer;
+        }
+    };
+
+    const proto_names = [_][]const u8{ "PLAINTEXT", "SSL", "SASL_SSL", "SASL_PLAINTEXT" };
+    const proto = proto_blk: {
+        while (true) {
+            const answer = ask(r, alloc, "Security protocol [PLAINTEXT, SSL, SASL_SSL, SASL_PLAINTEXT] (PLAINTEXT): ", .{}) orelse
+                fatal("aborted", .{});
+            if (answer.len == 0) break :proto_blk @as(usize, 0);
+            if (matchChoice(answer, &proto_names)) |i| break :proto_blk i;
+            out("kite: '{s}' is not a security protocol (name or 1-{d})\n", .{ answer, proto_names.len });
+        }
+    };
+    const is_sasl = proto == 2 or proto == 3;
+    const is_tls = proto == 1 or proto == 2;
+
+    var mechanism: ?[]const u8 = null;
+    var username: ?[]const u8 = null;
+    var password: ?[]const u8 = null;
+    if (is_sasl) {
+        const mech_names = [_][]const u8{ "PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512" };
+        mechanism = mech_names[
+            mech_blk: {
+                while (true) {
+                    const answer = ask(r, alloc, "SASL mechanism [PLAIN, SCRAM-SHA-256, SCRAM-SHA-512] (PLAIN): ", .{}) orelse
+                        fatal("aborted", .{});
+                    if (answer.len == 0) break :mech_blk @as(usize, 0);
+                    if (matchChoice(answer, &mech_names)) |i| break :mech_blk i;
+                    out("kite: '{s}' is not a SASL mechanism (name or 1-{d})\n", .{ answer, mech_names.len });
+                }
+            }
+        ];
+        username = user_blk: {
+            while (true) {
+                const answer = ask(r, alloc, "SASL username: ", .{}) orelse fatal("aborted", .{});
+                if (answer.len == 0) {
+                    out("kite: a SASL username is required\n", .{});
+                    continue;
+                }
+                break :user_blk answer;
+            }
+        };
+        const secret = askSecret(r, alloc, "SASL password (empty to leave it out and use $SASL_PASSWORD): ", .{}) orelse
+            fatal("aborted", .{});
+        password = if (secret.len == 0) null else secret;
+        if (password == null and !common.quiet)
+            note("sasl.password left unset; set SASL_PASSWORD when using '{s}'", .{name});
+    }
+
+    var truststore: ?[]const u8 = null;
+    if (is_tls) {
+        const answer = ask(r, alloc, "CA bundle path (empty for the system trust store): ", .{}) orelse fatal("aborted", .{});
+        truststore = if (answer.len == 0) null else answer;
+    }
+
+    const make_current = current_blk: {
+        const answer = ask(r, alloc, "Make '{s}' the current cluster? [Y/n] ", .{name}) orelse fatal("aborted", .{});
+        break :current_blk !(std.ascii.eqlIgnoreCase(answer, "n") or std.ascii.eqlIgnoreCase(answer, "no"));
+    };
+
+    var block = std.Io.Writer.Allocating.init(alloc);
+    const bw = &block.writer;
+    bw.print("  {s}:\n", .{name}) catch fatal("out of memory", .{});
+    bw.print("    bootstrap.servers: {s}\n", .{yamlScalar(alloc, bootstrap)}) catch fatal("out of memory", .{});
+    bw.print("    security.protocol: {s}\n", .{proto_names[proto]}) catch fatal("out of memory", .{});
+    if (mechanism) |m| bw.print("    sasl.mechanism: {s}\n", .{m}) catch fatal("out of memory", .{});
+    if (username) |u| bw.print("    sasl.username: {s}\n", .{yamlScalar(alloc, u)}) catch fatal("out of memory", .{});
+    if (password) |p| bw.print("    sasl.password: {s}\n", .{yamlScalar(alloc, p)}) catch fatal("out of memory", .{});
+    if (truststore) |t| bw.print("    ssl.truststore.location: {s}\n", .{yamlScalar(alloc, t)}) catch fatal("out of memory", .{});
+
+    const new_text = spliceCluster(alloc, existing, name, block.written()) catch |err| switch (err) {
+        error.NoClustersSection => fatal("could not locate a top-level 'clusters:' in {s}", .{path}),
+        error.OutOfMemory => fatal("out of memory", .{}),
+    };
+    if (std.fs.path.dirname(path)) |dir|
+        std.Io.Dir.cwd().createDirPath(io, dir) catch |err|
+            fatal("cannot create {s} ({s})", .{ dir, @errorName(err) });
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = new_text }) catch |err|
+        fatal("cannot write {s} ({s})", .{ path, @errorName(err) });
+    if (password != null)
+        std.Io.Dir.cwd().setFilePermissions(io, path, .fromMode(0o600), .{}) catch |err|
+            fatal("cannot set permissions on {s} ({s})", .{ path, @errorName(err) });
+
+    // Defensive: the file we just wrote must parse and list cleanly.
+    var src2: config.Source = .{};
+    _ = config.listTargets(io, alloc, env, .{ .config_path = path }, &src2) catch |err| switch (err) {
+        error.ConfigSyntax => fatal("{s}:{d}: {s}", .{ path, src2.diag.line, src2.diag.msg }),
+        error.OutOfMemory => fatal("out of memory", .{}),
+        else => fatal("wrote {s} but it did not re-parse cleanly ({s})", .{ path, @errorName(err) }),
+    };
+
+    if (make_current) {
+        config.writeCurrentCluster(io, alloc, env, name) catch |err|
+            fatal("cannot store current cluster ({s})", .{@errorName(err)});
+        if (!common.quiet) note("cluster set to '{s}'", .{name});
+    }
+    if (!common.quiet) {
+        note("wrote cluster '{s}' to {s}", .{ name, path });
+        if (make_current)
+            note("try: kite consume -B TOPIC", .{})
+        else
+            note("try: kite consume @{s} -B TOPIC", .{name});
+    }
+    std.process.exit(0);
+}
+
+fn hasName(names: []const []const u8, name: []const u8) bool {
+    for (names) |n|
+        if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+/// Case-insensitive name or 1-based number into `names`.
+fn matchChoice(answer: []const u8, names: []const []const u8) ?usize {
+    for (names, 0..) |n, i|
+        if (std.ascii.eqlIgnoreCase(answer, n)) return i;
+    const idx = std.fmt.parseInt(usize, answer, 10) catch return null;
+    return if (idx >= 1 and idx <= names.len) idx - 1 else null;
+}
+
+fn answeredYes(answer: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(answer, "y") or std.ascii.eqlIgnoreCase(answer, "yes");
+}
+
+/// Print a prompt on stderr (bold on a terminal) and return the trimmed
+/// answer line; null at EOF.
+fn ask(r: *std.Io.Reader, alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ?[]const u8 {
+    if (term.color.enabled)
+        out(term.bold ++ fmt ++ term.reset, args)
+    else
+        out(fmt, args);
+    const line = nextLine(r, alloc) catch fatal("failed reading stdin", .{}) orelse return null;
+    return std.mem.trim(u8, line, " \t");
+}
+
+/// Like `ask` but turns off terminal echo while the answer is typed.
+fn askSecret(r: *std.Io.Reader, alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ?[]const u8 {
+    if (term.color.enabled)
+        out(term.bold ++ fmt ++ term.reset, args)
+    else
+        out(fmt, args);
+    const fd = std.posix.STDIN_FILENO;
+    const saved: ?std.posix.termios = std.posix.tcgetattr(fd) catch null;
+    if (saved) |t| {
+        var raw = t;
+        raw.lflag.ECHO = false;
+        std.posix.tcsetattr(fd, .NOW, raw) catch {};
+    }
+    const line = nextLine(r, alloc) catch fatal("failed reading stdin", .{});
+    if (saved) |t| {
+        std.posix.tcsetattr(fd, .NOW, t) catch {};
+        out("\n", .{});
+    }
+    const owned = line orelse return null;
+    return std.mem.trim(u8, owned, " \t");
+}
+
+/// The value spelled so the yaml parser reads it back unchanged: double
+/// quotes (with \" and \\ escaped) whenever a plain scalar would not
+/// round-trip — a '#', a ':' before a space, edge whitespace, a leading
+/// quote, or a leading indicator character.
+fn yamlScalar(alloc: std.mem.Allocator, v: []const u8) []const u8 {
+    var need = v.len == 0 or
+        std.mem.indexOfScalar(u8, v, '#') != null or
+        std.mem.indexOf(u8, v, ": ") != null or
+        v[v.len - 1] == ':' or
+        !std.mem.eql(u8, v, std.mem.trim(u8, v, " \t"));
+    if (!need) switch (v[0]) {
+        '"', '\'', '[', ']', '{', '}', '&', '*', '|', '>', '-', '!', '%', '@', '`', '#', '?' => need = true,
+        else => {},
+    };
+    if (!need) return v;
+    var outb: std.ArrayListUnmanaged(u8) = .empty;
+    outb.append(alloc, '"') catch fatal("out of memory", .{});
+    for (v) |c| {
+        if (c == '"' or c == '\\') outb.append(alloc, '\\') catch fatal("out of memory", .{});
+        outb.append(alloc, c) catch fatal("out of memory", .{});
+    }
+    outb.append(alloc, '"') catch fatal("out of memory", .{});
+    return outb.items;
+}
+
+/// Textual splice of `block` ("  NAME:\n    key: v\n...") into `text`
+/// under the top-level `clusters:` key, preserving all other content:
+/// replaces NAME's block when it exists, appends to the section, or adds
+/// the whole `clusters:` section at the end.
+fn spliceCluster(alloc: std.mem.Allocator, text: []const u8, name: []const u8, block: []const u8) error{ NoClustersSection, OutOfMemory }![]const u8 {
+    const blank = 0;
+    const comment = 1;
+    const content = 2;
+    const Kind = struct {
+        fn of(line: []const u8) usize {
+            const t = std.mem.trimStart(u8, line, " ");
+            if (t.len == 0) return blank;
+            if (t[0] == '#') return comment;
+            return content;
+        }
+        fn indent(line: []const u8) usize {
+            var i: usize = 0;
+            while (i < line.len and line[i] == ' ') i += 1;
+            return i;
+        }
+    };
+
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    var lit = std.mem.splitScalar(u8, text, '\n');
+    while (lit.next()) |l| try lines.append(alloc, l);
+    if (lines.items.len > 0 and lines.items[lines.items.len - 1].len == 0)
+        lines.items.len -= 1;
+
+    var block_lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    var bit = std.mem.splitScalar(u8, block, '\n');
+    while (bit.next()) |l| try block_lines.append(alloc, l);
+    if (block_lines.items.len > 0 and block_lines.items[block_lines.items.len - 1].len == 0)
+        block_lines.items.len -= 1;
+
+    // Top-level `clusters:` line: indent 0, key spelled plainly.
+    var clusters_idx: ?usize = null;
+    for (lines.items, 0..) |line, i| {
+        if (Kind.of(line) != content or Kind.indent(line) != 0) continue;
+        const body = line[Kind.indent(line)..];
+        if (std.mem.startsWith(u8, body, "clusters:") or std.mem.startsWith(u8, body, "clusters :")) {
+            clusters_idx = i;
+            break;
+        }
+    }
+    const ci = clusters_idx orelse {
+        // No section: a blank line (when the file has content), then
+        // `clusters:` and the new block at the end.
+        if (lines.items.len > 0) try lines.append(alloc, "");
+        try lines.append(alloc, "clusters:");
+        try lines.appendSlice(alloc, block_lines.items);
+        return joinLines(alloc, lines.items);
+    };
+
+    // The section runs until the next indent-0 key or EOF.
+    var section_end = lines.items.len;
+    for (lines.items[ci + 1 ..], ci + 1..) |line, i| {
+        if (Kind.of(line) == content and Kind.indent(line) == 0) {
+            section_end = i;
+            break;
+        }
+    }
+
+    // NAME's existing block: a `  NAME:` line, through the next line at
+    // indent <=2 (the next cluster or a dedent).
+    var replace_start: ?usize = null;
+    var replace_end: usize = 0;
+    for (lines.items[ci + 1 .. section_end], ci + 1..) |line, i| {
+        if (Kind.of(line) != content or Kind.indent(line) != 2) continue;
+        const body = line[2..];
+        if (body.len > name.len and std.mem.startsWith(u8, body, name) and body[name.len] == ':') {
+            replace_start = i;
+            replace_end = i + 1;
+            while (replace_end < section_end and
+                !(Kind.of(lines.items[replace_end]) == content and Kind.indent(lines.items[replace_end]) <= 2))
+                replace_end += 1;
+            break;
+        }
+    }
+
+    var out_lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    if (replace_start) |rs| {
+        try out_lines.appendSlice(alloc, lines.items[0..rs]);
+        try out_lines.appendSlice(alloc, block_lines.items);
+        try out_lines.appendSlice(alloc, lines.items[replace_end..]);
+    } else {
+        // After the last section line, before any trailing blank lines.
+        var at = section_end;
+        while (at > ci + 1 and Kind.of(lines.items[at - 1]) == blank) at -= 1;
+        try out_lines.appendSlice(alloc, lines.items[0..at]);
+        try out_lines.appendSlice(alloc, block_lines.items);
+        try out_lines.appendSlice(alloc, lines.items[at..]);
+    }
+    return joinLines(alloc, out_lines.items);
+}
+
+fn joinLines(alloc: std.mem.Allocator, lines: []const []const u8) ![]const u8 {
+    var outb: std.ArrayListUnmanaged(u8) = .empty;
+    for (lines) |l| {
+        try outb.appendSlice(alloc, l);
+        try outb.append(alloc, '\n');
+    }
+    return outb.items;
 }
 
 /// Store NAME as the current cluster; NAME must exist in the loaded doc.
