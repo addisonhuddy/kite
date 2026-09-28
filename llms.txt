@@ -1,13 +1,13 @@
 # kite
 
-> kite is a single-binary, dependency-free Kafka CLI (under 640 KB, written in Zig) that produces stdin lines to a topic and consumes a topic to stdout. It is built for scripts, containers, CI, and AI agents: no JVM, no librdkafka, no daemon, no prompts, and piped reads terminate on idle by default.
+> kite is a single-binary, dependency-free Kafka CLI (under 680 KB, written in Zig) that produces stdin lines to a topic and consumes a topic to stdout. It is built for scripts, containers, CI, and AI agents: no JVM, no librdkafka, no daemon, no prompts, and piped reads terminate on idle by default.
 
 Repository: https://github.com/addisonhuddy/kite
 License: Apache-2.0
 Platforms: Linux x86_64/aarch64, macOS x86_64/arm64
 Brokers: any Kafka-protocol broker (Apache Kafka, Confluent Cloud, Redpanda, Amazon MSK with SASL/SCRAM, Aiven, WarpStream)
 Security: PLAINTEXT, SSL, SASL_SSL, SASL_PLAINTEXT; SASL PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
-Scope: produce and consume only. kite does not create topics, join consumer groups, commit offsets, or administer clusters.
+Scope: produce, consume, and topic management (list/create/delete/update). kite does not join consumer groups, commit offsets, manage ACLs, or administer clusters.
 
 ## Install
 
@@ -42,6 +42,14 @@ kite produce [OPTIONS] [@CLUSTER] TOPIC   one stdin line = one record
 --csv [--key COL]               RFC 4180 CSV rows -> JSON object values, optional key column
 -H 'name: value'                header on every record (repeatable)
 Produce is batched and idempotent by default. stdout is never written.
+
+## Topics
+
+kite topic [list]                 one topic name per line, sorted; -a includes internal topics
+kite topic list --json            {"name","partitions","replication_factor","internal"} per line
+kite topic create [-p N] [-r N] [-s KEY=VALUE]... [--if-not-exists] TOPIC
+kite topic update [-p N] [--set KEY=VALUE]... [--unset KEY]... TOPIC   (partitions can only grow)
+kite topic delete [-y] [--if-exists] TOPIC...   -y required when stderr is not a terminal
 
 ## Consume
 

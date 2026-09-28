@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/github/license/addisonhuddy/kite)](LICENSE)
 
 **kite is an ultra-lightweight Kafka CLI built for agents and sandboxes.**
-One binary under 660 KB, no JVM, no runtime, no daemon. stdin in, stdout out,
+One binary under 680 KB, no JVM, no runtime, no daemon. stdin in, stdout out,
 non-zero exit on failure.
 
 > **What is kite?** kite is a single-binary command-line tool for Apache
@@ -19,13 +19,14 @@ non-zero exit on failure.
 > Confluent Cloud, Redpanda, Amazon MSK, Aiven, WarpStream), and never hangs:
 > piped reads stop on idle by default.
 
-**Use kite when** you need to move records into or out of an existing Kafka
-topic from a shell, a script, a container, or an agent tool call, and you want
-one small static binary with no JVM, no librdkafka, and no daemon.
+**Use kite when** you need to move records into or out of a Kafka
+topic — or list, create, delete, and update topics — from a shell, a
+script, a container, or an agent tool call, and you want one small static
+binary with no JVM, no librdkafka, and no daemon.
 
-**Do not use kite when** you need Kafka administration (create/delete topics,
-manage consumer groups, commit offsets, ACLs) or a long-lived consumer group
-member; use your Kafka admin tooling or a client library for those.
+**Do not use kite when** you need consumer-group administration, offset
+commits, or ACLs, or a long-lived consumer group member; use your Kafka
+admin tooling or a client library for those.
 
 ## Run Kafka locally with Docker
 
@@ -186,7 +187,7 @@ See [Troubleshooting](#troubleshooting) if the roundtrip does not print
 If you are an agent reading this (or a human who also likes Kafka), here's
 why I think you will love kite.
 
-- **Small.** The stripped binary is under 660 KB (CI-gated by
+- **Small.** The stripped binary is under 680 KB (CI-gated by
   `scripts/check-size.sh`). It fits in a container layer, a
   sandbox, or a tool call without anyone noticing.
 - **Unix philosophy.** kite does one thing per invocation and composes with
@@ -202,11 +203,12 @@ why I think you will love kite.
   stderr with exit code 1 and a `Try 'kite --help'` hint. Help pages are
   plain text, ≤ 80 columns, no ANSI unless stderr is a terminal.
 
-kite is not a Kafka admin tool: it never manages consumer groups or commits
-offsets. When producing to a topic that does not exist it offers to create
-it — prompting on a terminal, creating automatically in scripts and pipes —
-with the broker's default partition count and replication factor. Consume
-never creates a topic; a missing one is a plain error.
+kite is not a full Kafka admin tool: it never manages consumer groups or
+commits offsets, but it does manage topics (`kite topic`). When producing
+to a topic that does not exist it offers to create it — prompting on a
+terminal, creating automatically in scripts and pipes — with the broker's
+default partition count and replication factor. Consume never creates a
+topic; a missing one is a plain error.
 
 ### What kite is optimized for
 
@@ -214,7 +216,7 @@ kite is optimized for the case where a program, not a person, is on the
 other end of the pipe: a shell script, a CI step, a container entrypoint, or
 an AI agent's tool call. That shapes every design choice:
 
-- **Zero-dependency install.** One static binary under 660 KB, fetched with
+- **Zero-dependency install.** One static binary under 680 KB, fetched with
   `curl` and verified against `SHA256SUMS`. Nothing to apt-get, brew, or
   build; nothing that needs a JVM or a shared library at runtime.
 - **Bounded by default.** A piped consume with no `-n`, `--idle`, or `-f`
@@ -229,8 +231,9 @@ an AI agent's tool call. That shapes every design choice:
 - **Safe defaults.** Idempotent, batched producing; bounded consuming;
   no writes to disk; no connections other than to the brokers you name.
 
-What it deliberately leaves out: topic and consumer-group administration,
-offset commits, and every knob that is not needed to move records.
+What it deliberately leaves out: consumer-group administration, offset
+commits, ACLs, and every knob that is not needed to move records or manage
+topics.
 
 ## For AI agents
 
@@ -379,6 +382,7 @@ kite.yaml and may appear anywhere among a command's arguments; `p` and
 ```text
 kite produce [OPTIONS] [@CLUSTER] TOPIC   Write stdin lines to TOPIC.
 kite consume [OPTIONS] [@CLUSTER] TOPIC   Read TOPIC to stdout.
+kite topic [ACTION] [OPTIONS] [@CLUSTER] [TOPIC...]   List, create, delete, or update topics.
 kite cluster [list|set NAME|init]         Pick, list, or set the current cluster.
 kite --version                            Print the version.
 ```
@@ -405,7 +409,35 @@ kite --version                            Print the version.
 | all | `-h`, `--help` | Plain-text help for the selected mode. |
 
 `kite --help` prints the command overview; `kite produce --help`,
-`kite consume --help`, and `kite cluster --help` print the full pages.
+`kite consume --help`, `kite topic --help`, and `kite cluster --help`
+print the full pages.
+
+## Topics
+
+`kite topic` manages topics; a bare `kite topic` is `kite topic list`.
+
+```sh
+kite topic list                  # one topic name per line, sorted
+kite topic list -a               # include internal topics (__consumer_offsets)
+kite topic list --json | jq -r .name
+#   -> {"name":..,"partitions":N,"replication_factor":N,"internal":BOOL}
+
+kite topic create events                      # broker defaults
+kite topic create -p 6 -r 2 -s retention.ms=86400000 events
+kite topic create --if-not-exists events      # note instead of an error
+
+kite topic update -p 12 events                # partitions can only grow
+kite topic update --set cleanup.policy=compact events
+kite topic update --unset retention.ms events
+
+kite topic delete events          # prompts for confirmation on a terminal
+kite topic delete -y old-a old-b  # scripts must pass -y (records are lost)
+kite topic delete -y --if-exists gone
+```
+
+Delete confirms on a terminal; when stderr is not a terminal it refuses
+unless `-y`/`--yes` is given. `list` writes topic names (or JSON lines) to
+stdout; all notes go to stderr.
 
 ## Common recipes
 
@@ -445,6 +477,11 @@ kite consume -b broker1:9092,broker2:9092 -B -n 5 events
 kite produce @prod events < examples/data/lines.txt
 # which clusters are there, and which one is selected?
 kite cluster list
+# topic management
+kite topic list
+kite topic create -p 6 events
+kite topic update --set cleanup.policy=compact events
+kite topic delete -y events
 ```
 
 The consumer output is in the same textual shape accepted by the producer,
@@ -735,7 +772,7 @@ pipe.
 - `KITE_DEBUG=1` enables frame and TLS diagnostics.
 - `KITE_TIME=1` prints producer timing totals and connection count.
 
-The default stripped binary is under 660 KB (CI-gated by
+The default stripped binary is under 680 KB (CI-gated by
 `scripts/check-size.sh`).
 `scripts/pack.sh` can produce an optional UPX/LZMA artifact of about 200 KiB.
 
@@ -830,7 +867,7 @@ from [`examples/config/`](examples/config).
 No. kite is one static binary with no runtime dependencies.
 
 **How big is kite and how fast does it start?**
-The stripped binary is under 660 KB (CI-gated) and starts in milliseconds.
+The stripped binary is under 680 KB (CI-gated) and starts in milliseconds.
 
 **Can kite create topics or manage consumer groups?**
 `kite produce` creates a missing topic — after a y/N prompt on a terminal,
