@@ -12,6 +12,9 @@ pub const api_key = struct {
     pub const metadata: i16 = 3;
     pub const api_versions: i16 = 18;
     pub const create_topics: i16 = 19;
+    pub const delete_topics: i16 = 20;
+    pub const create_partitions: i16 = 37;
+    pub const incremental_alter_configs: i16 = 44;
     pub const sasl_handshake: i16 = 17;
     pub const init_producer_id: i16 = 22;
     pub const sasl_authenticate: i16 = 36;
@@ -28,6 +31,9 @@ pub const version = struct {
     pub const sasl_authenticate: i16 = 2;
     pub const init_producer_id: i16 = 4;
     pub const create_topics: i16 = 7;
+    pub const delete_topics: i16 = 6;
+    pub const create_partitions: i16 = 3;
+    pub const incremental_alter_configs: i16 = 1;
 };
 
 pub const ErrorCode = enum(i16) {
@@ -45,6 +51,7 @@ pub const ErrorCode = enum(i16) {
     network_exception = 13,
     group_load_in_progress = 14,
     not_coordinator = 16,
+    invalid_topic_exception = 17,
     not_enough_replicas = 19,
     not_enough_replicas_after_append = 20,
     out_of_order_sequence_number = 45,
@@ -61,11 +68,17 @@ pub const ErrorCode = enum(i16) {
     topic_already_exists = 36,
     invalid_partitions = 37,
     invalid_replication_factor = 38,
+    invalid_replication_assignment = 39,
+    invalid_config = 40,
     not_controller = 41,
+    invalid_request = 42,
+    policy_violation = 44,
     sasl_authentication_failed = 58,
+    topic_deletion_disabled = 73,
     fenced_leader_epoch = 74,
     unknown_leader_epoch = 75,
     unsupported_compression_type = 76,
+    unknown_topic_id = 100,
     _,
 
     pub fn name(self: ErrorCode) []const u8 {
@@ -84,6 +97,7 @@ pub const ErrorCode = enum(i16) {
             .network_exception => "NETWORK_EXCEPTION",
             .group_load_in_progress => "GROUP_LOAD_IN_PROGRESS",
             .not_coordinator => "NOT_COORDINATOR",
+            .invalid_topic_exception => "INVALID_TOPIC_EXCEPTION",
             .not_enough_replicas => "NOT_ENOUGH_REPLICAS",
             .not_enough_replicas_after_append => "NOT_ENOUGH_REPLICAS_AFTER_APPEND",
             .out_of_order_sequence_number => "OUT_OF_ORDER_SEQUENCE_NUMBER",
@@ -100,8 +114,14 @@ pub const ErrorCode = enum(i16) {
             .topic_already_exists => "TOPIC_ALREADY_EXISTS",
             .invalid_partitions => "INVALID_PARTITIONS",
             .invalid_replication_factor => "INVALID_REPLICATION_FACTOR",
+            .invalid_replication_assignment => "INVALID_REPLICATION_ASSIGNMENT",
+            .invalid_config => "INVALID_CONFIG",
             .not_controller => "NOT_CONTROLLER",
+            .invalid_request => "INVALID_REQUEST",
+            .policy_violation => "POLICY_VIOLATION",
             .sasl_authentication_failed => "SASL_AUTHENTICATION_FAILED",
+            .topic_deletion_disabled => "TOPIC_DELETION_DISABLED",
+            .unknown_topic_id => "UNKNOWN_TOPIC_ID",
             .fenced_leader_epoch => "FENCED_LEADER_EPOCH",
             .unknown_leader_epoch => "UNKNOWN_LEADER_EPOCH",
             .unsupported_compression_type => "UNSUPPORTED_COMPRESSION_TYPE",
@@ -531,6 +551,9 @@ pub const Header = struct {
     key: []const u8,
     value: ?[]const u8,
 };
+
+/// A topic config name/value pair (--set KEY=VALUE).
+pub const ConfigEntry = struct { name: []const u8, value: []const u8 };
 
 /// One record in a batch. `key` null = unkeyed; `headers` may be empty.
 pub const Record = struct {
