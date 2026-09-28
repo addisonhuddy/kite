@@ -166,5 +166,90 @@ else
     echo "SKIP dev-full"
 fi
 
+# ---------------------------------------------------------------- topics
+echo "== topic management =="
+TT=kite-topic-e2e
+TERR=$(mktemp)
+zig-out/bin/kite topic delete -y --if-exists "$TT" >/dev/null 2>&1 || true
+
+zig-out/bin/kite topic create -p 3 -r 1 --set retention.ms=3600000 "$TT" 2>"$TERR" || {
+    cat "$TERR"; fail "topic: create -p 3 -r 1 failed";
+}
+zig-out/bin/kite topic list | grep -qx "$TT" || fail "topic: $TT missing from 'topic list'"
+line=$(zig-out/bin/kite topic list --json | grep "\"name\":\"$TT\"")
+{ grep -q '"partitions":3' <<<"$line" &&
+  grep -q '"replication_factor":1' <<<"$line" &&
+  grep -q '"internal":false' <<<"$line"; } \
+    || fail "topic: list --json row wrong: $line"
+
+set +e
+err=$(zig-out/bin/kite topic create "$TT" 2>&1 >/dev/null)
+rc=$?
+set -e
+[ "$rc" -eq 1 ] && grep -q "topic '$TT' already exists" <<<"$err" \
+    || fail "topic: second create exited $rc, want 1 'already exists' ($err)"
+zig-out/bin/kite topic create --if-not-exists "$TT" 2>/dev/null \
+    || fail "topic: create --if-not-exists did not exit 0"
+
+zig-out/bin/kite topic update --partitions 5 "$TT" 2>/dev/null \
+    || fail "topic: update --partitions 5 failed"
+zig-out/bin/kite topic list --json | grep "\"name\":\"$TT\"" | grep -q '"partitions":5' \
+    || fail "topic: partitions not 5 after update"
+
+zig-out/bin/kite topic update --set retention.ms=7200000 "$TT" 2>/dev/null \
+    || fail "topic: update --set failed"
+docker exec "$NAME" /opt/kafka/bin/kafka-configs.sh \
+    --bootstrap-server localhost:9092 --entity-type topics \
+    --entity-name "$TT" --describe 2>/dev/null | grep -q 'retention.ms=7200000' \
+    || fail "topic: retention.ms=7200000 not visible to kafka-configs"
+zig-out/bin/kite topic update --unset retention.ms "$TT" 2>/dev/null \
+    || fail "topic: update --unset failed"
+if docker exec "$NAME" /opt/kafka/bin/kafka-configs.sh \
+    --bootstrap-server localhost:9092 --entity-type topics \
+    --entity-name "$TT" --describe 2>/dev/null | grep -q 'retention.ms='; then
+    fail "topic: retention.ms still set after --unset"
+fi
+
+set +e
+err=$(zig-out/bin/kite topic update --partitions 2 "$TT" 2>&1 >/dev/null)
+rc=$?
+set -e
+[ "$rc" -eq 1 ] && grep -q "INVALID_PARTITIONS" <<<"$err" \
+    || fail "topic: shrink exited $rc, want 1 INVALID_PARTITIONS ($err)"
+
+zig-out/bin/kite topic delete -y "$TT" 2>/dev/null || fail "topic: delete -y failed"
+gone=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    zig-out/bin/kite topic list | grep -qx "$TT" || { gone=1; break; }
+    sleep 1
+done
+[ "$gone" -eq 1 ] || fail "topic: $TT still in list after delete"
+set +e
+err=$(zig-out/bin/kite topic delete -y "$TT" 2>&1 >/dev/null)
+rc=$?
+set -e
+[ "$rc" -eq 1 ] && grep -q "topic '$TT' does not exist" <<<"$err" \
+    || fail "topic: second delete exited $rc, want 1 'does not exist' ($err)"
+zig-out/bin/kite topic delete -y --if-exists "$TT" 2>/dev/null \
+    || fail "topic: delete --if-exists did not exit 0"
+
+# Internal topics are hidden by default and shown with -a (the earlier
+# consume tests created __consumer_offsets on this broker).
+if zig-out/bin/kite topic list -a | grep -qx '__consumer_offsets'; then
+    if zig-out/bin/kite topic list | grep -qx '__consumer_offsets'; then
+        fail "topic: __consumer_offsets visible without -a"
+    fi
+else
+    echo "SKIP topic: __consumer_offsets assertion (broker has not created it)"
+fi
+
+# A freshly created topic is consumable immediately (waitForTopic poll).
+zig-out/bin/kite topic create "$TT" 2>/dev/null || fail "topic: recreate failed"
+timeout 15s zig-out/bin/kite consume -n 0 --idle 500ms "$TT" >/dev/null 2>&1 \
+    || fail "topic: consume on fresh topic failed"
+zig-out/bin/kite topic delete -y "$TT" >/dev/null 2>&1 || true
+rm -f "$TERR"
+echo "PASS topic"
+
 status=0
 echo "ok: e2e against $IMAGE"

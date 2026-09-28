@@ -34,7 +34,7 @@ _kite() {
         _arguments -s \
             '(-V --version)'{-V,--version}'[print version]' \
             '(-h --help)'{-h,--help}'[show help]' \
-            '1:command:(produce p consume c cluster)'
+            '1:command:(produce p consume c cluster topic)'
         return
     fi
 
@@ -72,6 +72,36 @@ _kite() {
                 '--csv[read RFC 4180 CSV (same as --format csv)]' \
                 '--key[use CSV column as record key]:column:' \
                 '*:arg:_kite_at_targets'
+            ;;
+        topic)
+            if (( CURRENT == 3 )); then
+                _arguments -s '1:action:(list create delete update)'
+            else
+                case "$words[3]" in
+                    list)
+                        _arguments -s $shared \
+                            '(-a --all)'{-a,--all}'[include internal topics]'
+                        ;;
+                    create)
+                        _arguments -s $shared \
+                            '(-p --partitions)'{-p,--partitions}'[partition count]:partitions:' \
+                            '(-r --replication-factor)'{-r,--replication-factor}'[replication factor]:factor:' \
+                            '(-s --set)'{-s,--set}'[set a topic config]:KEY=VALUE:' \
+                            '--if-not-exists[not an error when the topic exists]'
+                        ;;
+                    delete)
+                        _arguments -s $shared \
+                            '(-y --yes)'{-y,--yes}'[delete without confirming]' \
+                            '--if-exists[a missing topic is not an error]'
+                        ;;
+                    update)
+                        _arguments -s $shared \
+                            '(-p --partitions)'{-p,--partitions}'[grow partition count]:partitions:' \
+                            '(-s --set)'{-s,--set}'[set a topic config]:KEY=VALUE:' \
+                            '--unset[remove a topic config]:config:'
+                        ;;
+                esac
+            fi
             ;;
     esac
 }

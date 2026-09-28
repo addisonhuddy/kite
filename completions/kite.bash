@@ -9,13 +9,20 @@ _kite() {
     sub=""
     for w in "${COMP_WORDS[@]:1:COMP_CWORD-1}"; do
         case "$w" in
-            produce | p | consume | c | cluster) cmd=$w ;;
+            produce | p | consume | c | cluster | topic) cmd=$w ;;
         esac
     done
     if [ "$cmd" = cluster ]; then
         for w in "${COMP_WORDS[@]:2:COMP_CWORD-2}"; do
             case "$w" in
                 list | set | init) sub=$w ;;
+            esac
+        done
+    fi
+    if [ "$cmd" = topic ]; then
+        for w in "${COMP_WORDS[@]:2:COMP_CWORD-2}"; do
+            case "$w" in
+                list | create | delete | update) sub=$w ;;
             esac
         done
     fi
@@ -45,7 +52,7 @@ _kite() {
             COMPREPLY=($(compgen -f -- "$cur"))
             return
             ;;
-        -b | --bootstrap | -H | --key | --offset | --partition | -n | --max | -t | --idle)
+        -b | --bootstrap | -H | --key | --offset | --partition | -n | --max | -t | --idle | --set | --unset | -p | --partitions | -r | --replication-factor | -s)
             return
             ;;
     esac
@@ -68,8 +75,21 @@ _kite() {
             opts="-b --bootstrap --config --format --json -H --csv --key \
                 -q --quiet -v --verbose -h --help"
             ;;
+        topic)
+            if [ -z "$sub" ]; then
+                opts="list create delete update"
+            else
+                case "$sub" in
+                    list) opts="-a --all --format --json" ;;
+                    create) opts="-p --partitions -r --replication-factor -s --set --if-not-exists" ;;
+                    delete) opts="-y --yes --if-exists" ;;
+                    update) opts="-p --partitions -s --set --unset" ;;
+                esac
+                opts="$opts -b --bootstrap --config -q --quiet -v --verbose -h --help"
+            fi
+            ;;
         *)
-            opts="produce p consume c cluster \
+            opts="produce p consume c cluster topic \
                 -V --version -h --help"
             ;;
     esac
