@@ -23,7 +23,7 @@ jobs:
       - run: scripts/cli-check.sh
       - run: sudo apt-get update && sudo apt-get install -y zsh fish
       - run: scripts/completion-check.sh
-      - run: scripts/check-size.sh
+      - run: zig build -Dtarget=x86_64-linux -p zig-out-release && scripts/check-size.sh zig-out-release/bin/kite
 
   e2e:
     runs-on: ubuntu-latest
