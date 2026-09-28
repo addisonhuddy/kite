@@ -29,125 +29,10 @@ binary with no JVM, no librdkafka, and no daemon.
 commits, or ACLs, or a long-lived consumer group member; use your Kafka
 admin tooling or a client library for those.
 
-## Run Kafka locally with Docker
-
-Already have a Kafka 4.0+ broker? Skip to the [Quickstart](#quickstart).
-Otherwise, a single-node broker on your laptop is one `docker run` away. The
-commands below need [Docker](https://docs.docker.com/get-docker/), `curl`,
-and (for the JSON example only) [`jq`](https://jqlang.github.io/jq/):
-
-```sh
-docker --version && curl --version | head -1 && jq --version
-```
-
-Start Kafka (the image kite is tested against; bound to loopback only) and
-wait until it answers:
-
-```sh
-docker run -d --name kite-kafka -p 127.0.0.1:9092:9092 apache/kafka:4.0.0
-
-until docker exec kite-kafka /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server localhost:9092 --list >/dev/null 2>&1; do
-  sleep 2
-done
-echo "kafka ready"
-```
-
-Check on it or tear it down later with:
-
-```sh
-docker ps --filter name=kite-kafka          # status
-docker logs kite-kafka | tail               # broker log
-docker rm -f kite-kafka                     # stop and remove
-```
-
-The default image auto-creates topics, so the Quickstart below works
-unchanged. For a fuller check against the same image, `scripts/e2e-docker.sh`
-runs the whole broker-backed suite in a throwaway container; see
-[TESTING.md](TESTING.md#docker-harness).
-
-### Remapped ports and several brokers: advertised listeners
-
-`-b HOST:PORT` is only how kite finds the *first* broker. The metadata
-that broker returns lists every broker by its **advertised listener**
-(`advertised.listeners`), and kite connects to those addresses for the
-actual produce and fetch traffic. If they are not reachable from where
-kite runs, the bootstrap connection succeeds and the very next step
-fails with `connection refused` or a timeout.
-
-The default image advertises `localhost:9092`, which is why the
-`-p 127.0.0.1:9092:9092` mapping above works and why simply remapping
-the host port does not: with `-p 19092:9092` the broker still tells kite
-to come back on `localhost:9092`. Set the advertised address to what the
-host sees. Any `KAFKA_*` variable replaces the image's whole default
-config, so the KRaft basics have to come along:
-
-```sh
-docker run -d --name kite-kafka -p 127.0.0.1:19092:9092 \
-  -e KAFKA_NODE_ID=1 \
-  -e KAFKA_PROCESS_ROLES=broker,controller \
-  -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
-  -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
-  -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
-  -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:19092 \
-  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
-  apache/kafka:4.0.0
-
-until kite produce -q -b localhost:19092 probe </dev/null 2>/dev/null; do sleep 2; done
-```
-
-The readiness loop from the previous section will *not* work here:
-`kafka-topics.sh` inside the container follows the same advertised
-address, and `localhost:19092` means nothing in there. Probe from the
-host with kite instead, as shown (an empty produce creates the topic
-and exits 0 once the broker answers).
-
-With several brokers each one needs its own host port *and* its own
-advertised address on that port, while brokers keep talking to each
-other over the Docker network. Two listeners per broker do that:
-`INTERNAL` (container names, used between brokers) and `EXTERNAL` (what
-the host sees). The common settings, then one container per broker:
-
-```sh
-docker network create kafka-net
-common=(
-  -e KAFKA_PROCESS_ROLES=broker,controller
-  -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka-1:9093,2@kafka-2:9093
-  -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
-  -e KAFKA_LISTENERS=INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
-  -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
-  -e KAFKA_INTER_BROKER_LISTENER_NAME=INTERNAL
-  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=2
-  -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=2
-  -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
-  -e CLUSTER_ID=5L6g3nShT-eMCtK--X86sw
-)
-docker run -d --name kafka-1 --network kafka-net -p 127.0.0.1:9092:9092 "${common[@]}" \
-  -e KAFKA_NODE_ID=1 \
-  -e KAFKA_ADVERTISED_LISTENERS=INTERNAL://kafka-1:29092,EXTERNAL://localhost:9092 \
-  apache/kafka:4.0.0
-docker run -d --name kafka-2 --network kafka-net -p 127.0.0.1:9093:9092 "${common[@]}" \
-  -e KAFKA_NODE_ID=2 \
-  -e KAFKA_ADVERTISED_LISTENERS=INTERNAL://kafka-2:29092,EXTERNAL://localhost:9093 \
-  apache/kafka:4.0.0
-
-kite consume -b localhost:9092,localhost:9093 -B events
-```
-
-The same rule explains the classic symptoms on any deployment, not just
-Docker: a broker that advertises an internal hostname (`kafka-1`, a
-private IP, a Kubernetes service name) is reachable for bootstrap through
-a tunnel or port-forward yet fails right after, because kite is being
-sent to an address only the cluster's own network can resolve. The
-error names the advertised address (`connection refused by kafka-1:9092`),
-and `kite produce -v` logs `connected broker N at HOST:PORT` for each one it
-reaches. Fix it on the broker side; a client cannot rewrite those
-addresses.
-
 ## Quickstart
 
 You need a reachable Kafka 4.0+ broker (`localhost:9092` below, e.g. the
-Docker one above), permission to read and write the topic you name, and
+Docker one in [Run Kafka locally with Docker](#run-kafka-locally-with-docker)), permission to read and write the topic you name, and
 [`jq`](https://jqlang.github.io/jq/) for the last line only. Use a fresh
 topic name so the output is exactly one record; produce creates a missing
 topic automatically when run from a script or pipe.
@@ -780,6 +665,121 @@ pipe.
 The default stripped binary is under 680 KB (CI-gated by
 `scripts/check-size.sh`).
 `scripts/pack.sh` can produce an optional UPX/LZMA artifact of about 200 KiB.
+
+## Run Kafka locally with Docker
+
+No Kafka 4.0+ broker for the [Quickstart](#quickstart)? A single-node broker
+on your laptop is one `docker run` away. The
+commands below need [Docker](https://docs.docker.com/get-docker/), `curl`,
+and (for the JSON example only) [`jq`](https://jqlang.github.io/jq/):
+
+```sh
+docker --version && curl --version | head -1 && jq --version
+```
+
+Start Kafka (the image kite is tested against; bound to loopback only) and
+wait until it answers:
+
+```sh
+docker run -d --name kite-kafka -p 127.0.0.1:9092:9092 apache/kafka:4.0.0
+
+until docker exec kite-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --list >/dev/null 2>&1; do
+  sleep 2
+done
+echo "kafka ready"
+```
+
+Check on it or tear it down later with:
+
+```sh
+docker ps --filter name=kite-kafka          # status
+docker logs kite-kafka | tail               # broker log
+docker rm -f kite-kafka                     # stop and remove
+```
+
+The default image auto-creates topics, so the [Quickstart](#quickstart) works
+unchanged. For a fuller check against the same image, `scripts/e2e-docker.sh`
+runs the whole broker-backed suite in a throwaway container; see
+[TESTING.md](TESTING.md#docker-harness).
+
+### Remapped ports and several brokers: advertised listeners
+
+`-b HOST:PORT` is only how kite finds the *first* broker. The metadata
+that broker returns lists every broker by its **advertised listener**
+(`advertised.listeners`), and kite connects to those addresses for the
+actual produce and fetch traffic. If they are not reachable from where
+kite runs, the bootstrap connection succeeds and the very next step
+fails with `connection refused` or a timeout.
+
+The default image advertises `localhost:9092`, which is why the
+`-p 127.0.0.1:9092:9092` mapping above works and why simply remapping
+the host port does not: with `-p 19092:9092` the broker still tells kite
+to come back on `localhost:9092`. Set the advertised address to what the
+host sees. Any `KAFKA_*` variable replaces the image's whole default
+config, so the KRaft basics have to come along:
+
+```sh
+docker run -d --name kite-kafka -p 127.0.0.1:19092:9092 \
+  -e KAFKA_NODE_ID=1 \
+  -e KAFKA_PROCESS_ROLES=broker,controller \
+  -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+  -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+  -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+  -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:19092 \
+  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+  apache/kafka:4.0.0
+
+until kite produce -q -b localhost:19092 probe </dev/null 2>/dev/null; do sleep 2; done
+```
+
+The readiness loop from the previous section will *not* work here:
+`kafka-topics.sh` inside the container follows the same advertised
+address, and `localhost:19092` means nothing in there. Probe from the
+host with kite instead, as shown (an empty produce creates the topic
+and exits 0 once the broker answers).
+
+With several brokers each one needs its own host port *and* its own
+advertised address on that port, while brokers keep talking to each
+other over the Docker network. Two listeners per broker do that:
+`INTERNAL` (container names, used between brokers) and `EXTERNAL` (what
+the host sees). The common settings, then one container per broker:
+
+```sh
+docker network create kafka-net
+common=(
+  -e KAFKA_PROCESS_ROLES=broker,controller
+  -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka-1:9093,2@kafka-2:9093
+  -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
+  -e KAFKA_LISTENERS=INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+  -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+  -e KAFKA_INTER_BROKER_LISTENER_NAME=INTERNAL
+  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=2
+  -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=2
+  -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
+  -e CLUSTER_ID=5L6g3nShT-eMCtK--X86sw
+)
+docker run -d --name kafka-1 --network kafka-net -p 127.0.0.1:9092:9092 "${common[@]}" \
+  -e KAFKA_NODE_ID=1 \
+  -e KAFKA_ADVERTISED_LISTENERS=INTERNAL://kafka-1:29092,EXTERNAL://localhost:9092 \
+  apache/kafka:4.0.0
+docker run -d --name kafka-2 --network kafka-net -p 127.0.0.1:9093:9092 "${common[@]}" \
+  -e KAFKA_NODE_ID=2 \
+  -e KAFKA_ADVERTISED_LISTENERS=INTERNAL://kafka-2:29092,EXTERNAL://localhost:9093 \
+  apache/kafka:4.0.0
+
+kite consume -b localhost:9092,localhost:9093 -B events
+```
+
+The same rule explains the classic symptoms on any deployment, not just
+Docker: a broker that advertises an internal hostname (`kafka-1`, a
+private IP, a Kubernetes service name) is reachable for bootstrap through
+a tunnel or port-forward yet fails right after, because kite is being
+sent to an address only the cluster's own network can resolve. The
+error names the advertised address (`connection refused by kafka-1:9092`),
+and `kite produce -v` logs `connected broker N at HOST:PORT` for each one it
+reaches. Fix it on the broker side; a client cannot rewrite those
+addresses.
 
 ## Troubleshooting
 
