@@ -140,11 +140,7 @@ pub fn main(init: std.process.Init) !void {
         .err => |message| parseFatal(init, message, cli_args.overview_usage),
         .ok => |value| value,
         .help => {
-            if (term.detect(io, std.Io.File.stdout(), init.environ_map)) {
-                term.color.enabled = true;
-                const page = term.renderHelp(alloc, cli_args.overview_help) catch fatal("out of memory", .{});
-                writeText(init, std.Io.File.stdout(), page);
-            } else writeText(init, std.Io.File.stdout(), cli_args.overview_help);
+            showHelpPage(init, alloc, cli_args.overview_help);
             return;
         },
     };
@@ -166,11 +162,7 @@ pub fn main(init: std.process.Init) !void {
     const parsed = cli_args.parseProduce(alloc, command_args.rest);
     const produce = switch (parsed) {
         .help => {
-            if (term.detect(io, std.Io.File.stdout(), init.environ_map)) {
-                term.color.enabled = true;
-                const page = term.renderHelp(alloc, cli_args.produce_help) catch fatal("out of memory", .{});
-                writeText(init, std.Io.File.stdout(), page);
-            } else writeText(init, std.Io.File.stdout(), cli_args.produce_help);
+            showHelpPage(init, alloc, cli_args.produce_help);
             return;
         },
         .err => |message| parseFatal(init, message, cli_args.produce_usage),
@@ -578,11 +570,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     const parsed = cli_args.parseConsume(alloc, args);
     const consume = switch (parsed) {
         .help => {
-            if (term.detect(init.io, std.Io.File.stdout(), init.environ_map)) {
-                term.color.enabled = true;
-                const page = term.renderHelp(alloc, cli_args.consume_help) catch fatal("out of memory", .{});
-                writeText(init, std.Io.File.stdout(), page);
-            } else writeText(init, std.Io.File.stdout(), cli_args.consume_help);
+            showHelpPage(init, alloc, cli_args.consume_help);
             std.process.exit(0);
         },
         .err => |message| parseFatal(init, message, cli_args.consume_usage),
@@ -688,11 +676,7 @@ fn runCluster(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     const parsed = cli_args.parseCluster(alloc, args);
     const cluster = switch (parsed) {
         .help => {
-            if (term.detect(init.io, std.Io.File.stdout(), init.environ_map)) {
-                term.color.enabled = true;
-                const page = term.renderHelp(alloc, cli_args.cluster_help) catch fatal("out of memory", .{});
-                writeText(init, std.Io.File.stdout(), page);
-            } else writeText(init, std.Io.File.stdout(), cli_args.cluster_help);
+            showHelpPage(init, alloc, cli_args.cluster_help);
             std.process.exit(0);
         },
         .err => |message| parseFatal(init, message, cli_args.cluster_usage),
@@ -783,15 +767,28 @@ fn runCluster(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
 /// `kite topic [list|create|delete|update]`: topic administration over the
 /// admin APIs (Metadata/CreateTopics/DeleteTopics/CreatePartitions/
 /// IncrementalAlterConfigs), sent to the controller when it is known.
+/// Print a help page, rendered with colours when stdout is a terminal.
+fn showHelpPage(init: std.process.Init, alloc: std.mem.Allocator, text: []const u8) void {
+    if (term.detect(init.io, std.Io.File.stdout(), init.environ_map)) {
+        term.color.enabled = true;
+        const page = term.renderHelp(alloc, text) catch fatal("out of memory", .{});
+        writeText(init, std.Io.File.stdout(), page);
+    } else writeText(init, std.Io.File.stdout(), text);
+}
+
+fn updateErr(cli: *client.Client, alloc: std.mem.Allocator, name: []const u8, err: anyerror) noreturn {
+    switch (err) {
+        error.TopicNotFound => fatal("{s}", .{cli_args.errCat(alloc, &.{ "topic '", name, "' does not exist" })}),
+        error.TopicAuthorizationFailed => fatal("{s}", .{cli_args.errCat(alloc, &.{ "not authorized to alter topic '", name, "' (check ACLs for this principal)" })}),
+        else => fatalErr(cli, "could not update topic"),
+    }
+}
+
 fn runTopic(init: std.process.Init, args: []const []const u8, alloc: std.mem.Allocator) noreturn {
     const parsed = cli_args.parseTopic(alloc, args);
     const topic = switch (parsed) {
         .help => {
-            if (term.detect(init.io, std.Io.File.stdout(), init.environ_map)) {
-                term.color.enabled = true;
-                const page = term.renderHelp(alloc, cli_args.topic_help) catch fatal("out of memory", .{});
-                writeText(init, std.Io.File.stdout(), page);
-            } else writeText(init, std.Io.File.stdout(), cli_args.topic_help);
+            showHelpPage(init, alloc, cli_args.topic_help);
             std.process.exit(0);
         },
         .err => |message| parseFatal(init, message, cli_args.topic_usage),
@@ -843,7 +840,7 @@ fn runTopic(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
                 }
             }
             outw.flush() catch {};
-            if (shown == 0 and !quiet) note("no topics", .{});
+            if (shown == 0 and !quiet) note("{s}", .{"no topics"});
             std.process.exit(0);
         },
         .create => {
@@ -855,12 +852,12 @@ fn runTopic(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
             }) catch |err| switch (err) {
                 error.TopicAlreadyExists => {
                     if (topic.if_not_exists) {
-                        if (!quiet) note("topic '{s}' already exists", .{name});
+                        if (!quiet) note("{s}", .{cli_args.errCat(alloc, &.{ "topic '", name, "' already exists" })});
                         std.process.exit(0);
                     }
-                    fatal("topic '{s}' already exists", .{name});
+                    fatal("{s}", .{cli_args.errCat(alloc, &.{ "topic '", name, "' already exists" })});
                 },
-                error.TopicAuthorizationFailed => fatal("not authorized to create topic '{s}' (check ACLs for this principal)", .{name}),
+                error.TopicAuthorizationFailed => fatal("{s}", .{cli_args.errCat(alloc, &.{ "not authorized to create topic '", name, "' (check ACLs for this principal)" })}),
                 else => fatalErr(&cli, "could not create topic"),
             };
             if (!quiet)
@@ -874,48 +871,36 @@ fn runTopic(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
                 cli.deleteTopic(name) catch |err| {
                     switch (err) {
                         error.TopicNotFound => if (topic.if_exists) {
-                            if (!quiet) note("topic '{s}' does not exist", .{name});
+                            if (!quiet) note("{s}", .{cli_args.errCat(alloc, &.{ "topic '", name, "' does not exist" })});
                             continue;
                         } else {
                             failed = true;
-                            errLine("topic '{s}' does not exist", .{name});
+                            errLine("{s}", .{cli_args.errCat(alloc, &.{ "topic '", name, "' does not exist" })});
                         },
                         error.TopicAuthorizationFailed => {
                             failed = true;
-                            errLine("not authorized to delete topic '{s}' (check ACLs for this principal)", .{name});
+                            errLine("{s}", .{cli_args.errCat(alloc, &.{ "not authorized to delete topic '", name, "' (check ACLs for this principal)" })});
                         },
                         else => {
                             failed = true;
-                            const detail = cli.errDetail();
-                            if (detail.len > 0)
-                                errLine("could not delete topic '{s}': {s}", .{ name, detail })
-                            else
-                                errLine("could not delete topic '{s}'", .{name});
+                            errLine("{s}", .{cli_args.errCat(alloc, &.{ "could not delete topic '", name, "'", if (cli.errDetail().len > 0) ": " else "", cli.errDetail() })});
                         },
                     }
                     continue;
                 };
-                if (!quiet) note("deleted topic '{s}'", .{name});
+                if (!quiet) note("{s}", .{cli_args.errCat(alloc, &.{ "deleted topic , name, " })});
             }
             std.process.exit(if (failed) 1 else 0);
         },
         .update => {
             const name = topic.topics[0];
             if (topic.partitions) |n| {
-                cli.createPartitions(name, n) catch |err| switch (err) {
-                    error.TopicNotFound => fatal("topic '{s}' does not exist", .{name}),
-                    error.TopicAuthorizationFailed => fatal("not authorized to alter topic '{s}' (check ACLs for this principal)", .{name}),
-                    else => fatalErr(&cli, "could not update topic"),
-                };
+                cli.createPartitions(name, n) catch |err| updateErr(&cli, alloc, name, err);
                 if (!quiet) note("topic '{s}' now has {d} partition(s)", .{ name, n });
             }
             const nconfigs = topic.set.len + topic.unset.len;
             if (nconfigs > 0) {
-                cli.alterTopicConfigs(name, topic.set, topic.unset) catch |err| switch (err) {
-                    error.TopicNotFound => fatal("topic '{s}' does not exist", .{name}),
-                    error.TopicAuthorizationFailed => fatal("not authorized to alter topic '{s}' (check ACLs for this principal)", .{name}),
-                    else => fatalErr(&cli, "could not update topic"),
-                };
+                cli.alterTopicConfigs(name, topic.set, topic.unset) catch |err| updateErr(&cli, alloc, name, err);
                 if (!quiet) note("updated {d} config(s) on topic '{s}'", .{ nconfigs, name });
             }
             std.process.exit(0);
