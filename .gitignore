@@ -1,5 +1,6 @@
 # --- Zig build artifacts ---
 zig-out/
+zig-out-release/
 .zig-cache/
 zig-cache/          # pre-0.13 cache dir name
 dist/
