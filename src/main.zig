@@ -50,6 +50,15 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(1);
 }
 
+/// A per-item error line in fatal()'s format, without exiting — delete
+/// keeps going through the remaining topics.
+fn errLine(comptime fmt: []const u8, args: anytype) void {
+    if (term.color.enabled)
+        out(term.red ++ "kite:" ++ term.reset ++ " " ++ fmt ++ "\n", args)
+    else
+        out("kite: " ++ fmt ++ "\n", args);
+}
+
 fn fatalErr(c: *const client.Client, comptime fmt: []const u8) noreturn {
     const detail = c.errDetail();
     if (detail.len > 0)
@@ -146,6 +155,10 @@ pub fn main(init: std.process.Init) !void {
         },
         .cluster => {
             runCluster(init, command_args.rest, alloc);
+            return;
+        },
+        .topic => {
+            runTopic(init, command_args.rest, alloc);
             return;
         },
         .produce => {},
@@ -467,22 +480,21 @@ fn unknownTargetFatal(alloc: std.mem.Allocator, source: *config.Source) noreturn
     fatal("no cluster '{s}' in {s} (available: {s})", .{ source.target.?, source.file.?, names });
 }
 
-/// True when a missing topic should be created: automatically when stderr
-/// is not a terminal (scripts, pipes) or /dev/tty cannot be opened, else
-/// only when the user confirms at the /dev/tty prompt. The prompt reads
-/// /dev/tty rather than stdin, which may be the record pipe for produce.
-fn shouldCreateTopic(io: std.Io, topic: []const u8) bool {
+/// Print `fmt` on stderr and read a y/N answer from /dev/tty. Returns null
+/// when stderr is not a terminal or /dev/tty cannot be opened; the prompt
+/// reads /dev/tty rather than stdin, which may be the record pipe.
+fn confirm(io: std.Io, comptime fmt: []const u8, args: anytype) ?bool {
     const stderr_tty = std.Io.File.stderr().isTty(io) catch false;
     const tty: ?std.Io.File = if (stderr_tty)
         std.Io.Dir.cwd().openFile(io, "/dev/tty", .{}) catch null
     else
         null;
-    const f = tty orelse return true;
+    const f = tty orelse return null;
     defer f.close(io);
     if (term.color.enabled)
-        out(term.dim ++ "kite: topic '{s}' does not exist. Create it? [y/N] " ++ term.reset, .{topic})
+        out(term.dim ++ "kite: " ++ fmt ++ term.reset, args)
     else
-        out("kite: topic '{s}' does not exist. Create it? [y/N] ", .{topic});
+        out("kite: " ++ fmt, args);
     var buf: [256]u8 = undefined;
     var fr = f.reader(io, &buf);
     const line = fr.interface.takeDelimiter('\n') catch return false;
@@ -490,12 +502,21 @@ fn shouldCreateTopic(io: std.Io, topic: []const u8) bool {
     return std.ascii.eqlIgnoreCase(answer, "y") or std.ascii.eqlIgnoreCase(answer, "yes");
 }
 
+/// True when a missing topic should be created: automatically when stderr
+/// is not a terminal (scripts, pipes) or /dev/tty cannot be opened, else
+/// only when the user confirms at the /dev/tty prompt.
+fn shouldCreateTopic(io: std.Io, topic: []const u8) bool {
+    return confirm(io, "topic '{s}' does not exist. Create it? [y/N] ", .{topic}) orelse true;
+}
+
 /// Create the missing topic, then poll metadata until the brokers agree on
 /// its partition->leader table (a fresh topic reports no leader briefly).
 fn createAndResolve(cli: *client.Client, topic: []const u8, access: []const u8, quiet: bool) void {
     if (!shouldCreateTopic(cli.io, topic))
         fatal("topic '{s}' does not exist and was not created (answer y to create it, or create it with your admin tooling)", .{topic});
-    cli.createTopic(topic) catch |err| switch (err) {
+    // TopicAlreadyExists counts as success: someone else won the race.
+    _ = cli.createTopic(topic, .{}) catch |err| switch (err) {
+        error.TopicAlreadyExists => client.Client.CreateResult{ .partitions = -1, .replication_factor = -1 },
         error.TopicAuthorizationFailed => fatal(
             "not authorized to create topic '{s}' (check ACLs for this principal)",
             .{topic},
@@ -503,6 +524,12 @@ fn createAndResolve(cli: *client.Client, topic: []const u8, access: []const u8, 
         else => fatalErr(cli, "could not create topic"),
     };
     if (!quiet) note("created topic '{s}'", .{topic});
+    waitForTopic(cli, topic, access, quiet);
+}
+
+/// Poll metadata until the brokers agree on the topic's partition->leader
+/// table (a fresh topic reports no leader briefly).
+fn waitForTopic(cli: *client.Client, topic: []const u8, access: []const u8, quiet: bool) void {
     const max_attempts = 10;
     const retry_ms = 200;
     var attempt: usize = 0;
@@ -751,6 +778,149 @@ fn runCluster(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     }
     outw.flush() catch {};
     std.process.exit(0);
+}
+
+/// `kite topic [list|create|delete|update]`: topic administration over the
+/// admin APIs (Metadata/CreateTopics/DeleteTopics/CreatePartitions/
+/// IncrementalAlterConfigs), sent to the controller when it is known.
+fn runTopic(init: std.process.Init, args: []const []const u8, alloc: std.mem.Allocator) noreturn {
+    const parsed = cli_args.parseTopic(alloc, args);
+    const topic = switch (parsed) {
+        .help => {
+            if (term.detect(init.io, std.Io.File.stdout(), init.environ_map)) {
+                term.color.enabled = true;
+                const page = term.renderHelp(alloc, cli_args.topic_help) catch fatal("out of memory", .{});
+                writeText(init, std.Io.File.stdout(), page);
+            } else writeText(init, std.Io.File.stdout(), cli_args.topic_help);
+            std.process.exit(0);
+        },
+        .err => |message| parseFatal(init, message, cli_args.topic_usage),
+        .ok => |value| value,
+    };
+    const quiet = topic.common.quiet;
+
+    // Deleting is destructive: confirm on a terminal before touching config
+    // or the network, so a piped `kite topic delete x` fails fast offline.
+    if (topic.action == .delete and !topic.yes) {
+        var quoted: std.ArrayListUnmanaged(u8) = .empty;
+        for (topic.topics, 0..) |t, i| {
+            if (i > 0) quoted.appendSlice(alloc, ", ") catch oom();
+            quoted.append(alloc, '\'') catch oom();
+            quoted.appendSlice(alloc, t) catch oom();
+            quoted.append(alloc, '\'') catch oom();
+        }
+        const ok = confirm(
+            init.io,
+            "Delete {s} {s}? This removes all of its records. [y/N] ",
+            .{ if (topic.topics.len == 1) "topic" else "topics", quoted.items },
+        ) orelse fatal("refusing to delete without --yes when stderr is not a terminal", .{});
+        if (!ok) fatal("topics were not deleted", .{});
+    }
+
+    var cfg = loadConfig(init, alloc, topic.common, &dummy_source);
+    var cli = client.Client.init(alloc, init.io, init.environ_map, &cfg);
+    cli.bootstrap() catch fatalErr(&cli, "could not reach any bootstrap server");
+
+    switch (topic.action) {
+        .list => {
+            const topics = cli.listTopics() catch fatalErr(&cli, "could not list topics");
+            var buf: [4096]u8 = undefined;
+            var w = std.Io.File.stdout().writer(init.io, &buf);
+            const outw = &w.interface;
+            var shown: usize = 0;
+            for (topics) |t| {
+                if (t.internal and !topic.all) continue;
+                shown += 1;
+                if (topic.common.format == .json) {
+                    outw.writeAll("{\"name\":") catch {};
+                    json.writeString(outw, t.name) catch {};
+                    outw.print(",\"partitions\":{d},\"replication_factor\":{d},\"internal\":{s}}}\n", .{
+                        t.partitions, t.replication_factor, if (t.internal) "true" else "false",
+                    }) catch {};
+                } else {
+                    outw.writeAll(t.name) catch {};
+                    outw.writeByte('\n') catch {};
+                }
+            }
+            outw.flush() catch {};
+            if (shown == 0 and !quiet) note("no topics", .{});
+            std.process.exit(0);
+        },
+        .create => {
+            const name = topic.topics[0];
+            const res = cli.createTopic(name, .{
+                .partitions = topic.partitions orelse -1,
+                .replication_factor = topic.replication_factor orelse -1,
+                .configs = topic.set,
+            }) catch |err| switch (err) {
+                error.TopicAlreadyExists => {
+                    if (topic.if_not_exists) {
+                        if (!quiet) note("topic '{s}' already exists", .{name});
+                        std.process.exit(0);
+                    }
+                    fatal("topic '{s}' already exists", .{name});
+                },
+                error.TopicAuthorizationFailed => fatal("not authorized to create topic '{s}' (check ACLs for this principal)", .{name}),
+                else => fatalErr(&cli, "could not create topic"),
+            };
+            if (!quiet)
+                note("created topic '{s}' with {d} partition(s), replication factor {d}", .{ name, res.partitions, res.replication_factor });
+            waitForTopic(&cli, name, "write", quiet);
+            std.process.exit(0);
+        },
+        .delete => {
+            var failed = false;
+            for (topic.topics) |name| {
+                cli.deleteTopic(name) catch |err| {
+                    switch (err) {
+                        error.TopicNotFound => if (topic.if_exists) {
+                            if (!quiet) note("topic '{s}' does not exist", .{name});
+                            continue;
+                        } else {
+                            failed = true;
+                            errLine("topic '{s}' does not exist", .{name});
+                        },
+                        error.TopicAuthorizationFailed => {
+                            failed = true;
+                            errLine("not authorized to delete topic '{s}' (check ACLs for this principal)", .{name});
+                        },
+                        else => {
+                            failed = true;
+                            const detail = cli.errDetail();
+                            if (detail.len > 0)
+                                errLine("could not delete topic '{s}': {s}", .{ name, detail })
+                            else
+                                errLine("could not delete topic '{s}'", .{name});
+                        },
+                    }
+                    continue;
+                };
+                if (!quiet) note("deleted topic '{s}'", .{name});
+            }
+            std.process.exit(if (failed) 1 else 0);
+        },
+        .update => {
+            const name = topic.topics[0];
+            if (topic.partitions) |n| {
+                cli.createPartitions(name, n) catch |err| switch (err) {
+                    error.TopicNotFound => fatal("topic '{s}' does not exist", .{name}),
+                    error.TopicAuthorizationFailed => fatal("not authorized to alter topic '{s}' (check ACLs for this principal)", .{name}),
+                    else => fatalErr(&cli, "could not update topic"),
+                };
+                if (!quiet) note("topic '{s}' now has {d} partition(s)", .{ name, n });
+            }
+            const nconfigs = topic.set.len + topic.unset.len;
+            if (nconfigs > 0) {
+                cli.alterTopicConfigs(name, topic.set, topic.unset) catch |err| switch (err) {
+                    error.TopicNotFound => fatal("topic '{s}' does not exist", .{name}),
+                    error.TopicAuthorizationFailed => fatal("not authorized to alter topic '{s}' (check ACLs for this principal)", .{name}),
+                    else => fatalErr(&cli, "could not update topic"),
+                };
+                if (!quiet) note("updated {d} config(s) on topic '{s}'", .{ nconfigs, name });
+            }
+            std.process.exit(0);
+        },
+    }
 }
 
 /// `kite cluster init`: interactive wizard that asks questions on stderr,
