@@ -10,7 +10,8 @@ One binary under 680 KB, no JVM, no runtime, no daemon. stdin in, stdout out,
 non-zero exit on failure.
 
 > **What is kite?** kite is a single-binary command-line tool for Apache
-> Kafka that produces records from stdin and consumes records to stdout. It is
+> Kafka that produces records from stdin, consumes records to stdout, and
+> manages topics. It is
 > a drop-in, dependency-free alternative to `kafka-console-producer.sh`,
 > `kafka-console-consumer.sh`, `kcat`/`kafkacat`, and `rpk topic produce|consume`
 > for scripts, CI jobs, containers, and AI agents. It is written in Zig, speaks
@@ -258,11 +259,14 @@ the facts you need. They are stable across releases.
   `{topic,partition,offset,timestamp,key,headers,value}` per line. A piped
   read with neither bound stops after 5 s idle; `-n` alone waits for its
   records; `-f` never stops.
+- **Topics:** `kite topic list [--json]`, `kite topic create [-p N] [-r N] TOPIC`,
+  `kite topic update [-p N] [--set KEY=VALUE] TOPIC`, `kite topic delete -y TOPIC`
+  (`-y` is required when stderr is not a terminal).
 - **Contract:** data on stdout only, diagnostics on stderr only, exit `0` on
   success, `1` on any error with a single-line `kite: MESSAGE`, `130` on
   Ctrl-C. No interactive prompts, no color when stdout/stderr is not a TTY,
   no config written to disk, no network calls other than to the brokers.
-- **Does not:** join consumer groups, commit offsets, or manage the cluster.
+- **Does not:** join consumer groups, commit offsets, or manage ACLs.
   Produce creates a missing topic (automatically when not on a TTY); consume
   never does.
 
@@ -272,7 +276,8 @@ A tool description you can paste into an agent's tool registry:
 kite: single-binary Kafka CLI. `kite produce TOPIC` produces stdin lines (or
 --json / --csv records) to TOPIC. `kite consume TOPIC` reads TOPIC to stdout; use -B for
 history, -n N to cap records, --idle DUR to stop when quiet, --json for full
-metadata. Configure with BOOTSTRAP_SERVERS (and SASL_*/SECURITY_PROTOCOL) or
+metadata. `kite topic list|create|update|delete` manages topics (delete needs
+-y when not on a terminal). Configure with BOOTSTRAP_SERVERS (and SASL_*/SECURITY_PROTOCOL) or
 -b HOST:PORT. Exit 0 ok, 1 error (message on stderr). A piped consume with
 no -n/--idle/-f stops after 5s idle; pass -n and --idle together for a
 bounded read.
