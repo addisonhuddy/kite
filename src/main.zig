@@ -764,9 +764,6 @@ fn runCluster(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     std.process.exit(0);
 }
 
-/// `kite topic [list|create|delete|update]`: topic administration over the
-/// admin APIs (Metadata/CreateTopics/DeleteTopics/CreatePartitions/
-/// IncrementalAlterConfigs), sent to the controller when it is known.
 /// Print a help page, rendered with colours when stdout is a terminal.
 fn showHelpPage(init: std.process.Init, alloc: std.mem.Allocator, text: []const u8) void {
     if (term.detect(init.io, std.Io.File.stdout(), init.environ_map)) {
@@ -784,6 +781,9 @@ fn updateErr(cli: *client.Client, alloc: std.mem.Allocator, name: []const u8, er
     }
 }
 
+/// `kite topic [list|create|delete|update]`: topic administration over the
+/// admin APIs (Metadata/CreateTopics/DeleteTopics/CreatePartitions/
+/// IncrementalAlterConfigs), sent to the controller when it is known.
 fn runTopic(init: std.process.Init, args: []const []const u8, alloc: std.mem.Allocator) noreturn {
     const parsed = cli_args.parseTopic(alloc, args);
     const topic = switch (parsed) {
@@ -888,7 +888,7 @@ fn runTopic(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
                     }
                     continue;
                 };
-                if (!quiet) note("{s}", .{cli_args.errCat(alloc, &.{ "deleted topic , name, " })});
+                if (!quiet) note("{s}", .{cli_args.errCat(alloc, &.{ "deleted topic '", name, "'" })});
             }
             std.process.exit(if (failed) 1 else 0);
         },
