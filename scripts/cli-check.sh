@@ -57,7 +57,13 @@ cmp -s "$TMP/root-help.out" "$TMP/consume-help.out" && {
 }
 run_case produce-help 0 nonempty empty produce --help
 run_case cluster-help 0 nonempty empty cluster --help
-for page in "$TMP/root-help.out" "$TMP/consume-help.out" "$TMP/produce-help.out" "$TMP/cluster-help.out"; do
+run_case topic-help 0 nonempty empty topic --help
+run_case topic-short-help 0 nonempty empty topic -h
+cmp -s "$TMP/topic-help.out" "$TMP/topic-short-help.out" || {
+    echo "FAIL topic help differs between -h and --help"
+    exit 1
+}
+for page in "$TMP/root-help.out" "$TMP/consume-help.out" "$TMP/produce-help.out" "$TMP/cluster-help.out" "$TMP/topic-help.out"; do
     if awk 'length($0) > 80 { bad=1 } END { exit bad }' "$page"; then :; else
         echo "FAIL help line exceeds 80 columns"; exit 1
     fi
@@ -174,6 +180,24 @@ run_case cluster-set-missing 1 empty "kite: missing NAME" cluster set
 run_case cluster-set-extra 1 empty "kite: unexpected argument 'b'" cluster set a b
 run_case cluster-json-set 1 empty "kite: --json is only valid with kite cluster list" cluster set prod --json
 run_case cluster-format 1 empty "kite: --format: only json is valid with kite cluster list" cluster list --format tsv
+
+# kite topic: offline parser validation — all of these fail before any
+# config load or broker connection.
+run_case topic-bad-action 1 empty "kite: unknown topic action 'bogus' (want list, create, delete, or update)" topic bogus
+run_case topic-create-missing 1 empty "kite: missing TOPIC" topic create
+run_case topic-update-missing 1 empty "kite: missing TOPIC" topic update
+run_case topic-delete-missing 1 empty "kite: missing TOPIC" topic delete
+run_case topic-list-extra 1 empty "kite: unexpected argument 'x'" topic list x
+run_case topic-list-partitions 1 empty "kite: '--partitions' is not valid with kite topic list" topic list --partitions 3
+run_case topic-create-all 1 empty "kite: '--all' is not valid with kite topic create" topic create --all x
+run_case topic-update-rf 1 empty "kite: '-r' is not valid with kite topic update" topic update -r 2 x
+run_case topic-update-nothing 1 empty "kite: nothing to update (want --partitions, --set, or --unset)" topic update events
+run_case topic-set-malformed 1 empty "kite: --set: 'nokey' is not KEY=VALUE" topic create --set nokey x
+run_case topic-partitions-zero 1 empty "kite: --partitions: '0' is not a positive integer" topic create -p 0 x
+run_case topic-json-create 1 empty "kite: --json is only valid with kite topic list" topic create --json x
+# delete without --yes refuses before connecting (stderr is a pipe here).
+run_case topic-delete-refuse 1 empty "kite: refusing to delete without --yes when stderr is not a terminal" topic delete events
+run_case topic-no-broker 1 empty "no broker configured" topic list
 
 # kite cluster init: a wizard that writes a cluster into kite.yaml.
 run_case init-extra 1 empty "kite: unexpected argument 'extra'" cluster init extra
@@ -380,6 +404,11 @@ done
 for name in consume-no-args offset-text offset-negative offset-overflow partition-text count-text timeout-negative conflict-first conflict-second consume-unknown consume-extra; do
     grep -Fq "Try 'kite consume --help' for examples." "$TMP/$name.err" || {
         echo "FAIL $name: missing consume help hint"; exit 1;
+    }
+done
+for name in topic-bad-action topic-create-missing topic-list-partitions topic-update-nothing; do
+    grep -Fq "Try 'kite topic --help' for examples." "$TMP/$name.err" || {
+        echo "FAIL $name: missing topic help hint"; exit 1;
     }
 done
 echo "PASS help hints"
