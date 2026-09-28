@@ -314,8 +314,7 @@ pub const topic_help =
     "  @NAME                 Use cluster NAME from kite.yaml for this\n" ++
     "                        run only (also $KITE_TARGET).\n" ++
     "  -a, --all             Include internal topics (list only).\n" ++
-    "  -p, --partitions N    Partition count (create/update; update can\n" ++
-    "                        only grow a topic, never shrink it).\n" ++
+    "  -p, --partitions N    Partition count (create/update; grow only).\n" ++
     "  -r, --replication-factor N\n" ++
     "                        Replication factor (create only).\n" ++
     "  -s, --set KEY=VALUE   Set a topic config (create/update; repeatable).\n" ++
@@ -323,29 +322,21 @@ pub const topic_help =
     "  -y, --yes             Delete without the confirmation prompt.\n" ++
     "  --if-exists           A missing topic is a note, not an error (delete).\n" ++
     "  --if-not-exists       An existing topic is a note, not an error (create).\n" ++
-    "  --json                One JSON object per topic (list only):\n" ++
-    "                        {\"name\":..,\"partitions\":N,\n" ++
-    "                         \"replication_factor\":N,\"internal\":BOOL}\n" ++
+    "  --json                One JSON object per topic, fields name,\n" ++
+    "                        partitions, replication_factor, internal.\n" ++
     "  -q, --quiet           Suppress notes on stderr.\n" ++
     "  -v, --verbose         Write diagnostics to stderr.\n" ++
     "  -h, --help            Show this help and exit.\n" ++
     "\n" ++
-    "'list' prints one topic name per line on stdout, sorted, hiding\n" ++
-    "internal topics unless -a is given. 'delete' asks for confirmation\n" ++
-    "on a terminal (records are destroyed); scripts must pass -y.\n" ++
-    "'update' needs at least one of -p, --set, --unset; partitions are\n" ++
-    "grown first, then configs applied.\n" ++
+    "'list' prints sorted topic names, hiding internal ones unless -a.\n" ++
+    "'delete' confirms on a terminal; scripts pass -y. 'update' grows\n" ++
+    "partitions first, then applies --set/--unset (one is required).\n" ++
     "\n" ++
     "Examples:\n" ++
-    "  kite topic list\n" ++
     "  kite topic list --json | jq -r .name\n" ++
-    "  kite topic list -a\n" ++
     "  kite topic create -p 6 -s retention.ms=86400000 events\n" ++
-    "  kite topic create --if-not-exists events\n" ++
     "  kite topic update --set cleanup.policy=compact events\n" ++
-    "  kite topic update -p 12 --unset retention.ms events\n" ++
     "  kite topic delete -y events\n" ++
-    "  kite topic delete --if-exists -y old-a old-b\n" ++
     "\n" ++
     config_help;
 
@@ -859,15 +850,20 @@ pub fn parseTopic(alloc: std.mem.Allocator, args: []const []const u8) Result(Top
     var sets: std.ArrayListUnmanaged(protocol.ConfigEntry) = .empty;
     var unsets: std.ArrayListUnmanaged([]const u8) = .empty;
     var action_seen = false;
-    // Which spelling set each option, for "not valid with" messages.
-    var all_sp: ?[]const u8 = null;
-    var partitions_sp: ?[]const u8 = null;
-    var rf_sp: ?[]const u8 = null;
-    var set_sp: ?[]const u8 = null;
-    var unset_sp: ?[]const u8 = null;
-    var yes_sp: ?[]const u8 = null;
-    var if_exists_sp: ?[]const u8 = null;
-    var if_not_exists_sp: ?[]const u8 = null;
+    // Bit per topic option, spelling recorded on first use — the message
+    // reports the spelling the user typed. Bit order is the report order.
+    const OptBit = struct {
+        const all: u8 = 1;
+        const partitions: u8 = 2;
+        const rf: u8 = 4;
+        const set: u8 = 8;
+        const unset: u8 = 16;
+        const yes: u8 = 32;
+        const if_exists: u8 = 64;
+        const if_not_exists: u8 = 128;
+    };
+    var seen: u8 = 0;
+    var spells: [8][]const u8 = undefined;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -882,52 +878,59 @@ pub fn parseTopic(alloc: std.mem.Allocator, args: []const []const u8) Result(Top
         var value: ?[]const u8 = null;
         if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--all")) {
             parsed.all = true;
-            if (all_sp == null) all_sp = arg;
+            seen |= OptBit.all;
+            spells[0] = arg;
         } else if (std.mem.eql(u8, arg, "-y") or std.mem.eql(u8, arg, "--yes")) {
             parsed.yes = true;
-            if (yes_sp == null) yes_sp = arg;
-        } else if (std.mem.eql(u8, arg, "--if-exists")) {
-            parsed.if_exists = true;
-            if (if_exists_sp == null) if_exists_sp = arg;
-        } else if (std.mem.eql(u8, arg, "--if-not-exists")) {
-            parsed.if_not_exists = true;
-            if (if_not_exists_sp == null) if_not_exists_sp = arg;
+            seen |= OptBit.yes;
+            spells[5] = arg;
+        } else if (std.mem.startsWith(u8, arg, "--if-")) {
+            if (std.mem.eql(u8, arg["--if-".len..], "exists")) {
+                parsed.if_exists = true;
+                seen |= OptBit.if_exists;
+                spells[6] = arg;
+            } else if (std.mem.eql(u8, arg["--if-".len..], "not-exists")) {
+                parsed.if_not_exists = true;
+                seen |= OptBit.if_not_exists;
+                spells[7] = arg;
+            } else return .{ .err = unknownOption(alloc, .topic, arg) };
         } else if (optionValue(args, &i, &value, arg, "-p", "--partitions")) {
             const pval = value orelse
-                return errorResult(TopicArgs, alloc, "{s} requires a value", .{arg});
-            const v = parsePositive(i32, alloc, "--partitions", pval);
+                return .{ .err = errCat(alloc, &.{ arg, " requires a value" }) };
+            const v = parsePositive(alloc, "--partitions", pval, std.math.maxInt(i32));
             switch (v) {
-                .ok => |n| parsed.partitions = n,
+                .ok => |n| parsed.partitions = @intCast(n),
                 .err => |m| return .{ .err = m },
                 .help => unreachable,
             }
-            if (partitions_sp == null) partitions_sp = if (std.mem.startsWith(u8, arg, "--")) "--partitions" else "-p";
+            seen |= OptBit.partitions;
+            spells[1] = arg[0..if (arg[1] == '-') 12 else 2];
         } else if (optionValue(args, &i, &value, arg, "-r", "--replication-factor")) {
             const rval = value orelse
-                return errorResult(TopicArgs, alloc, "{s} requires a value", .{arg});
-            const v = parsePositive(i16, alloc, "--replication-factor", rval);
+                return .{ .err = errCat(alloc, &.{ arg, " requires a value" }) };
+            const v = parsePositive(alloc, "--replication-factor", rval, std.math.maxInt(i16));
             switch (v) {
-                .ok => |n| parsed.replication_factor = n,
+                .ok => |n| parsed.replication_factor = @intCast(n),
                 .err => |m| return .{ .err = m },
                 .help => unreachable,
             }
-            if (rf_sp == null) rf_sp = if (std.mem.startsWith(u8, arg, "--")) "--replication-factor" else "-r";
+            seen |= OptBit.rf;
+            spells[2] = arg[0..if (arg[1] == '-') 20 else 2];
         } else if (optionValue(args, &i, &value, arg, "-s", "--set")) {
             const v = value orelse
-                return errorResult(TopicArgs, alloc, "{s} requires a value", .{arg});
-            const eq = std.mem.indexOfScalar(u8, v, '=') orelse
-                return errorResult(TopicArgs, alloc, "--set: '{s}' is not KEY=VALUE", .{v});
+                return .{ .err = errCat(alloc, &.{ arg, " requires a value" }) };
+            const eq = std.mem.indexOfScalar(u8, v, '=') orelse 0;
             if (eq == 0)
-                return errorResult(TopicArgs, alloc, "--set: '{s}' is not KEY=VALUE", .{v});
+                return .{ .err = errCat(alloc, &.{ "--set: '", v, "' is not KEY=VALUE" }) };
             sets.append(alloc, .{ .name = v[0..eq], .value = v[eq + 1 ..] }) catch return .{ .err = "out of memory" };
-            if (set_sp == null) set_sp = if (std.mem.startsWith(u8, arg, "--")) "--set" else "-s";
-        } else if (optionValue(args, &i, &value, arg, null, "--unset")) {
-            const v = value orelse
-                return errorResult(TopicArgs, alloc, "--unset requires a config name", .{});
-            if (v.len == 0)
-                return errorResult(TopicArgs, alloc, "--unset requires a config name", .{});
+            seen |= OptBit.set;
+            spells[3] = arg[0..if (arg[1] == '-') 5 else 2];
+        } else if (optionValue(args, &i, &value, arg, "", "--unset")) {
+            const v = value orelse "";
+            if (v.len == 0) return .{ .err = "--unset requires a config name" };
             unsets.append(alloc, v) catch return .{ .err = "out of memory" };
-            if (unset_sp == null) unset_sp = arg;
+            seen |= OptBit.unset;
+            spells[4] = arg[0..if (arg.len > 7) 7 else arg.len];
         } else if (arg.len > 0 and arg[0] == '-') {
             return .{ .err = unknownOption(alloc, .topic, arg) };
         } else if (!action_seen) {
@@ -941,7 +944,7 @@ pub fn parseTopic(alloc: std.mem.Allocator, args: []const []const u8) Result(Top
             } else if (std.mem.eql(u8, arg, "update")) {
                 parsed.action = .update;
             } else {
-                return errorResult(TopicArgs, alloc, "unknown topic action '{s}' (want list, create, delete, or update)", .{arg});
+                return .{ .err = errCat(alloc, &.{ "unknown topic action '", arg, "' (want list, create, delete, or update)" }) };
             }
         } else {
             topics.append(alloc, arg) catch return .{ .err = "out of memory" };
@@ -952,50 +955,43 @@ pub fn parseTopic(alloc: std.mem.Allocator, args: []const []const u8) Result(Top
     parsed.unset = unsets.items;
 
     // Options allowed per action; the message reports the spelling used.
-    const invalid: ?[]const u8 = switch (parsed.action) {
-        .list => firstNonNull(&.{ partitions_sp, rf_sp, set_sp, unset_sp, yes_sp, if_exists_sp, if_not_exists_sp }),
-        .create => firstNonNull(&.{ all_sp, unset_sp, yes_sp, if_exists_sp }),
-        .delete => firstNonNull(&.{ all_sp, partitions_sp, rf_sp, set_sp, unset_sp, if_not_exists_sp }),
-        .update => firstNonNull(&.{ all_sp, rf_sp, yes_sp, if_exists_sp, if_not_exists_sp }),
+    const disallowed: u8 = switch (parsed.action) {
+        .list => OptBit.partitions | OptBit.rf | OptBit.set | OptBit.unset | OptBit.yes | OptBit.if_exists | OptBit.if_not_exists,
+        .create => OptBit.all | OptBit.unset | OptBit.yes | OptBit.if_exists,
+        .delete => OptBit.all | OptBit.partitions | OptBit.rf | OptBit.set | OptBit.unset | OptBit.if_not_exists,
+        .update => OptBit.all | OptBit.rf | OptBit.yes | OptBit.if_exists | OptBit.if_not_exists,
     };
-    if (invalid) |sp|
-        return errorResult(TopicArgs, alloc, "'{s}' is not valid with kite topic {s}", .{ sp, @tagName(parsed.action) });
+    const bad = seen & disallowed;
+    if (bad != 0)
+        return .{ .err = errCat(alloc, &.{ "'", spells[@ctz(bad)], "' is not valid with kite topic ", @tagName(parsed.action) }) };
 
-    switch (parsed.action) {
-        .list => if (parsed.topics.len > 0)
-            return errorResult(TopicArgs, alloc, "unexpected argument '{s}'", .{parsed.topics[0]}),
-        .create, .update => {
-            if (parsed.topics.len == 0)
-                return errorResult(TopicArgs, alloc, "missing TOPIC", .{});
-            if (parsed.topics.len > 1)
-                return errorResult(TopicArgs, alloc, "unexpected argument '{s}'", .{parsed.topics[1]});
-            if (parsed.topics[0].len == 0)
-                return errorResult(TopicArgs, alloc, "TOPIC must not be empty", .{});
-        },
-        .delete => {
-            if (parsed.topics.len == 0)
-                return errorResult(TopicArgs, alloc, "missing TOPIC", .{});
-            for (parsed.topics) |t|
-                if (t.len == 0)
-                    return errorResult(TopicArgs, alloc, "TOPIC must not be empty", .{});
-        },
-    }
+    const extra: ?[]const u8 = switch (parsed.action) {
+        .list => if (parsed.topics.len > 0) parsed.topics[0] else null,
+        .create, .update => if (parsed.topics.len > 1) parsed.topics[1] else null,
+        .delete => null,
+    };
+    if (extra) |x|
+        return .{ .err = errCat(alloc, &.{ "unexpected argument '", x, "'" }) };
+    if (parsed.action != .list and parsed.topics.len == 0)
+        return .{ .err = "missing TOPIC" };
+    for (parsed.topics) |t|
+        if (t.len == 0) return .{ .err = "TOPIC must not be empty" };
     if (parsed.action == .update and parsed.partitions == null and
         parsed.set.len == 0 and parsed.unset.len == 0)
-        return errorResult(TopicArgs, alloc, "nothing to update (want --partitions, --set, or --unset)", .{});
+        return .{ .err = "nothing to update (want --partitions, --set, or --unset)" };
     switch (parsed.action) {
         .list => if (parsed.common.format != .auto and parsed.common.format != .json)
-            return errorResult(TopicArgs, alloc, "--format: only json is valid with kite topic list", .{}),
+            return .{ .err = "--format: only json is valid with kite topic list" },
         else => if (parsed.common.format != .auto)
-            return errorResult(TopicArgs, alloc, "--json is only valid with kite topic list", .{}),
+            return .{ .err = "--json is only valid with kite topic list" },
     }
     if (finishCommon(parsed.common)) |m| return .{ .err = m };
     return .{ .ok = parsed };
 }
 
-fn firstNonNull(spells: []const ?[]const u8) ?[]const u8 {
-    for (spells) |s| if (s) |v| return v;
-    return null;
+/// Join message parts; one shared non-generic path keeps the parser lean.
+pub fn errCat(alloc: std.mem.Allocator, parts: []const []const u8) []const u8 {
+    return std.mem.concat(alloc, u8, parts) catch "out of memory";
 }
 
 /// Match an option taking a value in any of its spellings
@@ -1006,10 +1002,10 @@ fn optionValue(
     i: *usize,
     value: *?[]const u8,
     arg: []const u8,
-    comptime short: ?[]const u8,
-    comptime long: []const u8,
+    short: []const u8,
+    long: []const u8,
 ) bool {
-    if (std.mem.eql(u8, arg, long) or (short != null and std.mem.eql(u8, arg, short.?))) {
+    if (std.mem.eql(u8, arg, long) or (short.len > 0 and std.mem.eql(u8, arg, short))) {
         if (i.* + 1 >= args.len) {
             value.* = null;
             return true;
@@ -1022,20 +1018,20 @@ fn optionValue(
         value.* = arg[long.len + 1 ..];
         return true;
     }
-    if (short != null and std.mem.startsWith(u8, arg, short.?) and arg.len > short.?.len and arg[1] != '-') {
-        value.* = arg[short.?.len..];
+    if (short.len > 0 and std.mem.startsWith(u8, arg, short) and arg.len > short.len) {
+        value.* = arg[short.len..];
         return true;
     }
     return false;
 }
 
-/// A positive integer no larger than `T`'s max; 0 and negatives reject.
-fn parsePositive(comptime T: type, alloc: std.mem.Allocator, option: []const u8, value: []const u8) Result(T) {
+/// A positive integer no larger than `max`; 0 and negatives reject.
+fn parsePositive(alloc: std.mem.Allocator, option: []const u8, value: []const u8, max: u64) Result(u64) {
     const n = std.fmt.parseInt(u64, value, 10) catch
-        return errorResult(T, alloc, "{s}: '{s}' is not a positive integer", .{ option, value });
-    if (n == 0 or n > std.math.maxInt(T))
-        return errorResult(T, alloc, "{s}: '{s}' is not a positive integer", .{ option, value });
-    return .{ .ok = @intCast(n) };
+        return .{ .err = errCat(alloc, &.{ option, ": '", value, "' is not a positive integer" }) };
+    if (n == 0 or n > max)
+        return .{ .err = errCat(alloc, &.{ option, ": '", value, "' is not a positive integer" }) };
+    return .{ .ok = n };
 }
 
 fn expectErr(comptime T: type, result: Result(T), expected: []const u8) !void {
