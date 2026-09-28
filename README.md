@@ -294,7 +294,7 @@ supported OS (it uses `sudo` only if that directory is not writable). Pass
 options after `sh -s --`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh -s -- --bin-dir ~/.local/bin --version v0.2.0
+curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh -s -- --bin-dir ~/.local/bin --version v0.3.0
 ```
 
 | Option | Env | Meaning |
