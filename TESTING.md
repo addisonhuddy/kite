@@ -76,7 +76,9 @@ setup beyond Docker: it pulls `apache/kafka` (pinned tag), starts a
 single-node KRaft container on `127.0.0.1:9092`, creates a `kite-e2e` topic,
 and runs `smoke.sh` plus broker-dependent edge cases (the README Quickstart on
 a fresh topic, `-n` vs `--idle` stopping behaviour, early pipe closure,
-`/dev/full` write errors):
+`/dev/full` write errors, and `kite topic` management: create with
+partitions/configs, `--if-not-exists`, partition growth, `--set`/`--unset`
+verified via `kafka-configs.sh`, delete with `-y`, and `--if-exists`):
 
 ```sh
 zig build
