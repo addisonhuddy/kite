@@ -462,40 +462,7 @@ pub const Client = struct {
     /// Fetch metadata for `topic` over the control connection; refreshes the
     /// broker map and the topic's partition->leader table.
     pub fn refreshMetadata(c: *Client, topic: []const u8) !void {
-        const body = struct {
-            fn f(e: *Encoder, t: []const u8) protocol.ProtoError!void {
-                try e.compactArrayLen(1);
-                try e.raw(&[_]u8{0} ** 16); // topic_id: zero uuid
-                try e.compactString(t);
-                try e.tagBuffer();
-                try e.boolean(false); // allow_auto_topic_creation
-                try e.boolean(false); // include_cluster_authorized_operations
-                try e.boolean(false); // include_topic_authorized_operations
-                try e.tagBuffer();
-            }
-        }.f;
-        var resp: Resp = undefined;
-        var reconnected = false;
-        while (true) {
-            const conn = c.control orelse return error.MetadataFailed;
-            resp = c.sendRequest(conn, protocol.api_key.metadata, protocol.version.metadata, topic, body) catch {
-                // A dead control socket (broker restart/failover) would leave
-                // partition->leader stale, steering every produce retry at a
-                // dead broker — rebuild it via bootstrap, then retry once.
-                if (reconnected) {
-                    c.setErr("metadata request failed", .{});
-                    return error.MetadataFailed;
-                }
-                reconnected = true;
-                c.vlog("metadata request failed — reconnecting control connection", .{});
-                c.reconnectControl() catch {
-                    c.setErr("metadata request failed", .{});
-                    return error.MetadataFailed;
-                };
-                continue;
-            };
-            break;
-        }
+        const resp = try c.metadataRequest(topic);
         defer c.alloc.free(resp.frame);
 
         var d = Decoder.init(resp.body);
@@ -677,22 +644,64 @@ pub const Client = struct {
         unreachable;
     }
 
-    /// Delete one topic (DeleteTopics v6).
-    pub fn deleteTopic(c: *Client, topic: []const u8) !void {
-        try c.requireVersion(protocol.api_key.delete_topics, protocol.version.delete_topics, "DeleteTopics");
-        const body = struct {
-            fn f(e: *Encoder, t: []const u8) protocol.ProtoError!void {
-                try e.compactArrayLen(1);
-                try e.compactString(t);
-                try e.raw(&[_]u8{0} ** 16); // topic_id: zero uuid
-                try e.tagBuffer();
-                try e.i32v(30000); // timeout_ms
+    /// One-shot admin request shared by deleteTopic, createPartitions, and
+    /// alterTopicConfigs: `key` selects the request layout at runtime so the
+    /// encoder and sendRequest instantiate once.
+    const AdminReq = struct {
+        key: i16,
+        ver: i16,
+        api: []const u8,
+        t: []const u8,
+        count: i32 = 0,
+        set: []const protocol.ConfigEntry = &.{},
+        unset: []const []const u8 = &.{},
+    };
+
+    fn adminReqBody(e: *Encoder, r: AdminReq) protocol.ProtoError!void {
+        if (r.key == protocol.api_key.delete_topics) {
+            try e.compactArrayLen(1);
+            try e.compactString(r.t);
+            try e.raw(&[_]u8{0} ** 16); // topic_id: zero uuid
+            try e.tagBuffer();
+            try e.i32v(30000); // timeout_ms
+            try e.tagBuffer();
+        } else if (r.key == protocol.api_key.create_partitions) {
+            try e.compactArrayLen(1);
+            try e.compactString(r.t);
+            try e.i32v(r.count);
+            try e.uvarint(0); // assignments: null (broker assigns)
+            try e.tagBuffer();
+            try e.i32v(30000); // timeout_ms
+            try e.boolean(false); // validate_only
+            try e.tagBuffer();
+        } else { // incremental_alter_configs
+            try e.compactArrayLen(1);
+            try e.i8v(2); // resource_type: TOPIC
+            try e.compactString(r.t);
+            try e.compactArrayLen(r.set.len + r.unset.len);
+            for (r.set) |cfg| {
+                try e.compactString(cfg.name);
+                try e.i8v(0); // SET
+                try e.compactString(cfg.value);
                 try e.tagBuffer();
             }
-        }.f;
+            for (r.unset) |name| {
+                try e.compactString(name);
+                try e.i8v(1); // DELETE
+                try e.compactString(null);
+                try e.tagBuffer();
+            }
+            try e.tagBuffer();
+            try e.boolean(false); // validate_only
+            try e.tagBuffer();
+        }
+    }
+
+    fn adminRequest(c: *Client, r: AdminReq) !void {
+        try c.requireVersion(r.key, r.ver, r.api);
         const conn = try c.adminConn();
-        const resp = c.sendRequest(conn, protocol.api_key.delete_topics, protocol.version.delete_topics, topic, body) catch {
-            c.setErr("DeleteTopics request failed", .{});
+        const resp = c.sendRequest(conn, r.key, r.ver, r, adminReqBody) catch {
+            c.setErr("{s} request failed", .{r.api});
             return error.AdminFailed;
         };
         defer c.alloc.free(resp.frame);
@@ -700,96 +709,60 @@ pub const Client = struct {
         _ = try d.i32v(); // throttle
         const n = try d.compactArrayLen();
         if (n < 1) {
-            c.setErr("DeleteTopics: empty responses array", .{});
+            c.setErr("{s}: empty results array", .{r.api});
             return error.AdminFailed;
         }
-        _ = try d.compactString(); // name
-        try d.skip(16); // topic_id uuid
-        const code: protocol.ErrorCode = @enumFromInt(try d.i16v());
-        const msg = try d.compactString();
-        try c.adminResult("DeleteTopics", topic, code, msg);
+        var code: protocol.ErrorCode = undefined;
+        var msg: ?[]const u8 = null;
+        if (r.key == protocol.api_key.incremental_alter_configs) {
+            code = @enumFromInt(try d.i16v());
+            msg = try d.compactString();
+            _ = try d.i8v(); // resource_type
+            _ = try d.compactString(); // resource_name
+        } else {
+            _ = try d.compactString(); // name
+            if (r.key == protocol.api_key.delete_topics)
+                try d.skip(16); // topic_id uuid
+            code = @enumFromInt(try d.i16v());
+            msg = try d.compactString();
+        }
+        try d.tagBuffer();
+        try c.adminResult(r.api, r.t, code, msg);
+    }
+
+    /// Delete one topic (DeleteTopics v6).
+    pub fn deleteTopic(c: *Client, topic: []const u8) !void {
+        try c.adminRequest(.{
+            .key = protocol.api_key.delete_topics,
+            .ver = protocol.version.delete_topics,
+            .api = "DeleteTopics",
+            .t = topic,
+        });
     }
 
     /// Grow `topic` to `count` partitions (CreatePartitions v3). Shrinking is
     /// INVALID_PARTITIONS; the broker's message is passed through in err_ctx.
     pub fn createPartitions(c: *Client, topic: []const u8, count: i32) !void {
-        try c.requireVersion(protocol.api_key.create_partitions, protocol.version.create_partitions, "CreatePartitions");
-        const Ctx = struct { t: []const u8, count: i32 };
-        const body = struct {
-            fn f(e: *Encoder, ctx: Ctx) protocol.ProtoError!void {
-                try e.compactArrayLen(1);
-                try e.compactString(ctx.t);
-                try e.i32v(ctx.count);
-                try e.uvarint(0); // assignments: null (broker assigns)
-                try e.tagBuffer();
-                try e.i32v(30000); // timeout_ms
-                try e.boolean(false); // validate_only
-                try e.tagBuffer();
-            }
-        }.f;
-        const conn = try c.adminConn();
-        const resp = c.sendRequest(conn, protocol.api_key.create_partitions, protocol.version.create_partitions, Ctx{ .t = topic, .count = count }, body) catch {
-            c.setErr("CreatePartitions request failed", .{});
-            return error.AdminFailed;
-        };
-        defer c.alloc.free(resp.frame);
-        var d = Decoder.init(resp.body);
-        _ = try d.i32v(); // throttle
-        const n = try d.compactArrayLen();
-        if (n < 1) {
-            c.setErr("CreatePartitions: empty results array", .{});
-            return error.AdminFailed;
-        }
-        _ = try d.compactString(); // name
-        const code: protocol.ErrorCode = @enumFromInt(try d.i16v());
-        const msg = try d.compactString();
-        try c.adminResult("CreatePartitions", topic, code, msg);
+        try c.adminRequest(.{
+            .key = protocol.api_key.create_partitions,
+            .ver = protocol.version.create_partitions,
+            .api = "CreatePartitions",
+            .t = topic,
+            .count = count,
+        });
     }
 
     /// Apply --set/--unset topic configs (IncrementalAlterConfigs v1): one
     /// resource (type TOPIC=2) with one op per entry, SET=0 / DELETE=1.
     pub fn alterTopicConfigs(c: *Client, topic: []const u8, set: []const protocol.ConfigEntry, unset: []const []const u8) !void {
-        try c.requireVersion(protocol.api_key.incremental_alter_configs, protocol.version.incremental_alter_configs, "IncrementalAlterConfigs");
-        const Ctx = struct { t: []const u8, set: []const protocol.ConfigEntry, unset: []const []const u8 };
-        const body = struct {
-            fn f(e: *Encoder, ctx: Ctx) protocol.ProtoError!void {
-                try e.compactArrayLen(1);
-                try e.i8v(2); // resource_type: TOPIC
-                try e.compactString(ctx.t);
-                try e.compactArrayLen(ctx.set.len + ctx.unset.len);
-                for (ctx.set) |cfg| {
-                    try e.compactString(cfg.name);
-                    try e.i8v(0); // SET
-                    try e.compactString(cfg.value);
-                    try e.tagBuffer();
-                }
-                for (ctx.unset) |name| {
-                    try e.compactString(name);
-                    try e.i8v(1); // DELETE
-                    try e.compactString(null);
-                    try e.tagBuffer();
-                }
-                try e.tagBuffer();
-                try e.boolean(false); // validate_only
-                try e.tagBuffer();
-            }
-        }.f;
-        const conn = try c.adminConn();
-        const resp = c.sendRequest(conn, protocol.api_key.incremental_alter_configs, protocol.version.incremental_alter_configs, Ctx{ .t = topic, .set = set, .unset = unset }, body) catch {
-            c.setErr("IncrementalAlterConfigs request failed", .{});
-            return error.AdminFailed;
-        };
-        defer c.alloc.free(resp.frame);
-        var d = Decoder.init(resp.body);
-        _ = try d.i32v(); // throttle
-        const n = try d.compactArrayLen();
-        if (n < 1) {
-            c.setErr("IncrementalAlterConfigs: empty responses array", .{});
-            return error.AdminFailed;
-        }
-        const code: protocol.ErrorCode = @enumFromInt(try d.i16v());
-        const msg = try d.compactString();
-        try c.adminResult("IncrementalAlterConfigs", topic, code, msg);
+        try c.adminRequest(.{
+            .key = protocol.api_key.incremental_alter_configs,
+            .ver = protocol.version.incremental_alter_configs,
+            .api = "IncrementalAlterConfigs",
+            .t = topic,
+            .set = set,
+            .unset = unset,
+        });
     }
 
     pub const TopicInfo = struct {
@@ -799,25 +772,29 @@ pub const Client = struct {
         internal: bool,
     };
 
-    /// Every topic the principal can see (Metadata v12, topics = null),
-    /// sorted by name; per-topic errors are skipped. Refreshes the broker
-    /// map/controller id like refreshMetadata but leaves `partitions` alone.
-    /// Names are duped into c.alloc — the response frame is freed.
-    pub fn listTopics(c: *Client) ![]TopicInfo {
-        const body = struct {
-            fn f(e: *Encoder, _: void) protocol.ProtoError!void {
-                try e.uvarint(0); // topics: null = all topics
-                try e.boolean(false); // allow_auto_topic_creation
-                try e.boolean(false); // include_cluster_authorized_operations
-                try e.boolean(false); // include_topic_authorized_operations
-                try e.tagBuffer();
-            }
-        }.f;
-        var resp: Resp = undefined;
+    /// Metadata request body: `t` names one topic, null asks for all.
+    fn metadataBody(e: *Encoder, t: ?[]const u8) protocol.ProtoError!void {
+        if (t) |name| {
+            try e.compactArrayLen(1);
+            try e.raw(&[_]u8{0} ** 16); // topic_id: zero uuid
+            try e.compactString(name);
+            try e.tagBuffer();
+        } else {
+            try e.uvarint(0); // topics: null = all topics
+        }
+        try e.boolean(false); // allow_auto_topic_creation
+        try e.boolean(false); // include_cluster_authorized_operations
+        try e.boolean(false); // include_topic_authorized_operations
+        try e.tagBuffer();
+    }
+
+    /// Metadata on the control connection; a dead socket gets one reconnect
+    /// retry — it would otherwise steer every produce retry at a dead broker.
+    fn metadataRequest(c: *Client, t: ?[]const u8) !Resp {
         var reconnected = false;
         while (true) {
             const conn = c.control orelse return error.MetadataFailed;
-            resp = c.sendRequest(conn, protocol.api_key.metadata, protocol.version.metadata, {}, body) catch {
+            return c.sendRequest(conn, protocol.api_key.metadata, protocol.version.metadata, t, metadataBody) catch {
                 if (reconnected) {
                     c.setErr("metadata request failed", .{});
                     return error.MetadataFailed;
@@ -830,8 +807,15 @@ pub const Client = struct {
                 };
                 continue;
             };
-            break;
         }
+    }
+
+    /// Every topic the principal can see (Metadata v12, topics = null),
+    /// sorted by name; per-topic errors are skipped. Refreshes the broker
+    /// map/controller id like refreshMetadata but leaves `partitions` alone.
+    /// Names are duped into c.alloc — the response frame is freed.
+    pub fn listTopics(c: *Client) ![]TopicInfo {
+        const resp = try c.metadataRequest(null);
         defer c.alloc.free(resp.frame);
 
         var d = Decoder.init(resp.body);
