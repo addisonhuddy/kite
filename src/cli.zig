@@ -193,8 +193,8 @@ pub const overview_help =
     "  kite produce [OPTIONS] [@CLUSTER] TOPIC   Write stdin records to TOPIC.\n" ++
     "  kite consume [OPTIONS] [@CLUSTER] TOPIC   Read TOPIC to stdout.\n" ++
     "  kite topic [ACTION] [OPTIONS] [@CLUSTER] [TOPIC...]\n" ++
-    "                                        List, create, delete, update topics.\n" ++
-    "  kite cluster [list|set NAME|init]   Pick or set the current cluster.\n" ++
+    "                                            List, create, delete, update topics.\n" ++
+    "  kite cluster [list|set NAME|init]         Pick or set the current cluster.\n" ++
     "  kite --help                               Show this help.\n" ++
     "  kite --version                            Print the version.\n" ++
     "\n" ++
@@ -223,7 +223,8 @@ pub const produce_help =
     "  kite produce [OPTIONS] [@CLUSTER] TOPIC   ('p' works too)\n" ++
     "\n" ++
     "Options:\n" ++
-    "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
+    "  -b, --bootstrap HOSTS\n" ++
+    "                        Comma-separated host:port brokers.\n" ++
     "  --config FILE         Read this properties file instead of searching.\n" ++
     "  @NAME                 Use cluster NAME from kite.yaml for this\n" ++
     "                        run only (also $KITE_TARGET).\n" ++
@@ -258,7 +259,8 @@ pub const consume_help =
     "  kite consume [OPTIONS] [@CLUSTER] TOPIC   ('c' works too)\n" ++
     "\n" ++
     "Options:\n" ++
-    "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
+    "  -b, --bootstrap HOSTS\n" ++
+    "                        Comma-separated host:port brokers.\n" ++
     "  --config FILE         Read this properties file instead of searching.\n" ++
     "  @NAME                 Use cluster NAME from kite.yaml for this\n" ++
     "                        run only (also $KITE_TARGET).\n" ++
@@ -309,7 +311,8 @@ pub const topic_help =
     "  kite topic update [OPTIONS] TOPIC        Grow partitions or alter configs.\n" ++
     "\n" ++
     "Options:\n" ++
-    "  -b, --bootstrap HOSTS Comma-separated host:port brokers.\n" ++
+    "  -b, --bootstrap HOSTS\n" ++
+    "                        Comma-separated host:port brokers.\n" ++
     "  --config FILE         Read this properties file instead of searching.\n" ++
     "  @NAME                 Use cluster NAME from kite.yaml for this\n" ++
     "                        run only (also $KITE_TARGET).\n" ++
@@ -328,7 +331,9 @@ pub const topic_help =
     "  -v, --verbose         Write diagnostics to stderr.\n" ++
     "  -h, --help            Show this help and exit.\n" ++
     "\n" ++
-    "'list' prints sorted topic names, hiding internal ones unless -a.\n" ++
+    "'list' prints a table of names, partitions and replication factors\n" ++
+    "on a terminal, or one name per line otherwise; -a includes internal\n" ++
+    "topics.\n" ++
     "'delete' confirms on a terminal; scripts pass -y. 'update' grows\n" ++
     "partitions first, then applies --set/--unset (one is required).\n" ++
     "\n" ++
@@ -363,7 +368,8 @@ pub const cluster_help =
     "With no subcommand on a terminal, kite draws a picker (arrows or j/k,\n" ++
     "Enter to choose, q to quit); when stdin or stderr is not a terminal it\n" ++
     "behaves like 'kite cluster list' so scripts never hang. 'list' prints\n" ++
-    "one cluster name per line, sorted, with '*' after the current one; the\n" ++
+    "one cluster name per line, sorted, with '*' after the current one\n" ++
+    "(before it on a terminal); the\n" ++
     "JSON form is {\"file\":..,\"current\":..,\"clusters\":[..]}. Only the file's\n" ++
     "`clusters:` keys are read, so it works even when a cluster is\n" ++
     "incomplete; kite never connects to a broker.\n" ++
