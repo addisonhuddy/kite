@@ -230,6 +230,19 @@ chmod +x kite && sudo mv kite /usr/local/bin/
 Prebuilt binaries plus `SHA256SUMS` for every version are on the
 [releases page](https://github.com/addisonhuddy/kite/releases).
 
+### Updating
+
+```sh
+kite update            # latest release; no-op when already current
+kite update v0.2.0     # a specific release
+```
+
+`kite update` asks GitHub for the latest release and, if it differs from the
+running binary, runs the same `install.sh` with `--bin-dir` set to the
+directory the running `kite` lives in, so it replaces itself in place (with
+the same checksum check, and `sudo` only if that directory is not writable).
+It needs `/bin/sh` and `curl` or `wget`.
+
 ### From source
 
 Requires Zig 0.16.x.
@@ -299,6 +312,7 @@ kite produce [OPTIONS] [@CLUSTER] TOPIC   Write stdin lines to TOPIC.
 kite consume [OPTIONS] [@CLUSTER] TOPIC   Read TOPIC to stdout.
 kite topic [ACTION] [OPTIONS] [@CLUSTER] [TOPIC...]   List, create, delete, or update topics.
 kite cluster [list|set NAME|init]         Pick, list, or set the current cluster.
+kite update [VERSION]                     Install the latest (or VERSION) release in place.
 kite --version                            Print the version.
 ```
 

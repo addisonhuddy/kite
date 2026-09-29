@@ -31,6 +31,7 @@ kite cluster list [--json]      list clusters, `*` marks the effective one; neve
 kite cluster set NAME           store NAME as the current cluster (beats `default:`)
 kite cluster init               wizard: add a cluster to kite.yaml by answering questions
 kite -v                         verbose: prints which config sources were used
+kite update [VERSION]           replace this binary with the latest (or VERSION) GitHub release
 
 ## Produce
 

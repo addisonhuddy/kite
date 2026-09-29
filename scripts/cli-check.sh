@@ -58,12 +58,16 @@ cmp -s "$TMP/root-help.out" "$TMP/consume-help.out" && {
 run_case produce-help 0 nonempty empty produce --help
 run_case cluster-help 0 nonempty empty cluster --help
 run_case topic-help 0 nonempty empty topic --help
+run_case update-help 0 nonempty empty update --help
+run_case update-bad-tag 1 empty "kite: 'main' is not a release tag (want e.g. v0.3.0)" update main
+run_case update-extra 1 empty "kite: unexpected argument 'v2'" update v1 v2
+run_case update-unknown 1 empty "kite: unknown option '--bogus'" update --bogus
 run_case topic-short-help 0 nonempty empty topic -h
 cmp -s "$TMP/topic-help.out" "$TMP/topic-short-help.out" || {
     echo "FAIL topic help differs between -h and --help"
     exit 1
 }
-for page in "$TMP/root-help.out" "$TMP/consume-help.out" "$TMP/produce-help.out" "$TMP/cluster-help.out" "$TMP/topic-help.out"; do
+for page in "$TMP/root-help.out" "$TMP/consume-help.out" "$TMP/produce-help.out" "$TMP/cluster-help.out" "$TMP/topic-help.out" "$TMP/update-help.out"; do
     if awk 'length($0) > 80 { bad=1 } END { exit bad }' "$page"; then :; else
         echo "FAIL help line exceeds 80 columns"; exit 1
     fi

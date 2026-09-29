@@ -55,6 +55,7 @@ pub const Command = enum {
     consume,
     cluster,
     topic,
+    update,
 };
 
 pub const ClusterAction = enum { pick, list, set, init };
@@ -83,6 +84,11 @@ pub const TopicArgs = struct {
     common: Common = .{},
 };
 
+pub const UpdateArgs = struct {
+    /// Release tag to install; null = the latest release.
+    version: ?[]const u8 = null,
+};
+
 pub const CommandSplit = struct {
     command: Command,
     rest: []const []const u8,
@@ -93,10 +99,11 @@ fn matchCommand(arg: []const u8) ?Command {
     if (std.mem.eql(u8, arg, "consume") or std.mem.eql(u8, arg, "c")) return .consume;
     if (std.mem.eql(u8, arg, "cluster")) return .cluster;
     if (std.mem.eql(u8, arg, "topic")) return .topic;
+    if (std.mem.eql(u8, arg, "update")) return .update;
     return null;
 }
 
-const command_names = [_][]const u8{ "produce", "consume", "cluster", "topic" };
+const command_names = [_][]const u8{ "produce", "consume", "cluster", "topic", "update" };
 
 /// Closest command name when exactly one is within distance 2.
 fn suggestCommand(name: []const u8) ?[]const u8 {
@@ -195,6 +202,7 @@ pub const overview_help =
     "  kite topic [ACTION] [OPTIONS] [@CLUSTER] [TOPIC...]\n" ++
     "                                            List, create, delete, update topics.\n" ++
     "  kite cluster [list|set NAME|init]         Pick or set the current cluster.\n" ++
+    "  kite update [VERSION]                     Install the latest kite release.\n" ++
     "  kite --help                               Show this help.\n" ++
     "  kite --version                            Print the version.\n" ++
     "\n" ++
@@ -395,6 +403,56 @@ pub const cluster_help =
     "\n" ++
     config_help;
 
+pub const update_usage =
+    "Usage: kite update [VERSION]\n" ++
+    "Try 'kite update --help' for details.\n";
+
+pub const update_help =
+    "kite update - Install the latest kite release from GitHub\n" ++
+    "\n" ++
+    "Usage:\n" ++
+    "  kite update              Replace this binary with the latest release.\n" ++
+    "  kite update VERSION      Install a specific release (e.g. v0.2.0).\n" ++
+    "\n" ++
+    "Options:\n" ++
+    "  -h, --help            Show this help and exit.\n" ++
+    "\n" ++
+    "kite asks github.com/addisonhuddy/kite for its latest release and, when\n" ++
+    "that differs from this binary (" ++ version ++ "), runs the project's install.sh\n" ++
+    "with --bin-dir set to the directory this binary lives in, so the new\n" ++
+    "version replaces it in place. The installer verifies the download\n" ++
+    "against the release's SHA256SUMS and uses sudo only when that\n" ++
+    "directory is not writable. Needs /bin/sh and curl or wget.\n" ++
+    "\n" ++
+    "Examples:\n" ++
+    "  kite update\n" ++
+    "  kite update v0.2.0\n";
+
+/// A release tag: letters, digits, '.', '-', '_'; a leading 'v' is added
+/// when missing so `kite update 0.3.0` means v0.3.0.
+fn releaseTag(alloc: std.mem.Allocator, arg: []const u8) ?[]const u8 {
+    if (arg.len == 0 or arg.len > 64) return null;
+    for (arg) |ch| if (!std.ascii.isAlphanumeric(ch) and ch != '.' and ch != '-' and ch != '_') return null;
+    if (arg[0] == 'v') return arg;
+    if (!std.ascii.isDigit(arg[0])) return null;
+    return std.fmt.allocPrint(alloc, "v{s}", .{arg}) catch null;
+}
+
+pub fn parseUpdate(alloc: std.mem.Allocator, args: []const []const u8) Result(UpdateArgs) {
+    var parsed: UpdateArgs = .{};
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return .help;
+        if (arg.len > 0 and arg[0] == '-')
+            return .{ .err = unknownOption(alloc, .update, arg) };
+        if (parsed.version != null)
+            return errorResult(UpdateArgs, alloc, "unexpected argument '{s}'", .{arg});
+        if (std.mem.eql(u8, arg, "latest")) continue;
+        parsed.version = releaseTag(alloc, arg) orelse
+            return errorResult(UpdateArgs, alloc, "'{s}' is not a release tag (want e.g. v0.3.0)", .{arg});
+    }
+    return .{ .ok = parsed };
+}
+
 fn errorResult(comptime T: type, alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) Result(T) {
     return .{ .err = std.fmt.allocPrint(alloc, fmt, args) catch "out of memory" };
 }
@@ -459,6 +517,7 @@ const consume_only = [_][]const u8{ "-B", "--from-beginning", "--offset", "--par
 const produce_options = [_][]const u8{ "--bootstrap", "--config", "--format", "--json", "--csv", "--key", "--quiet", "--verbose", "--help" };
 const consume_options = [_][]const u8{ "--bootstrap", "--config", "--from-beginning", "--offset", "--partition", "--max", "--idle", "--follow", "--format", "--json", "--quiet", "--verbose", "--help" };
 const cluster_options = [_][]const u8{ "--config", "--json", "--format", "--quiet", "--verbose", "--help" };
+const update_options = [_][]const u8{"--help"};
 const topic_options = [_][]const u8{ "--bootstrap", "--config", "--format", "--json", "--all", "--partitions", "--replication-factor", "--set", "--unset", "--yes", "--if-exists", "--if-not-exists", "--quiet", "--verbose", "--help" };
 
 /// Damerau-Levenshtein distance (adjacent transposition counts as one edit).
@@ -488,6 +547,7 @@ fn suggestOption(command: Command, name: []const u8) ?[]const u8 {
         .consume => &consume_options,
         .cluster => &cluster_options,
         .topic => &topic_options,
+        .update => &update_options,
     };
     var best: ?[]const u8 = null;
     var best_dist: usize = 3;
@@ -529,7 +589,7 @@ fn unknownOption(alloc: std.mem.Allocator, command: Command, arg: []const u8) []
             return errMsg(alloc, "'{s}' is a consume option; use 'kite consume [OPTIONS] TOPIC'", .{name}),
         .consume => if (isOneOf(name, &produce_only))
             return errMsg(alloc, "'{s}' is a produce option; use 'kite produce [OPTIONS] TOPIC'", .{name}),
-        .cluster, .topic => {},
+        .cluster, .topic, .update => {},
     }
     if (suggestOption(command, name)) |candidate|
         return errMsg(alloc, "unknown option '{s}' (did you mean '{s}'?)", .{ arg, candidate });
@@ -1237,6 +1297,36 @@ test "the first argument names the command" {
     try expectErr(CommandSplit, splitCommand(alloc, &.{}), "missing command (want produce, consume, cluster, or topic)");
 }
 
+test "update takes an optional release tag" {
+    const alloc = std.heap.page_allocator;
+    const cases = [_]struct { args: []const []const u8, version: ?[]const u8 }{
+        .{ .args = &.{}, .version = null },
+        .{ .args = &.{"latest"}, .version = null },
+        .{ .args = &.{"v0.2.0"}, .version = "v0.2.0" },
+        .{ .args = &.{"0.2.0"}, .version = "v0.2.0" },
+        .{ .args = &.{"v1.0.0-rc.1"}, .version = "v1.0.0-rc.1" },
+    };
+    for (cases) |case| {
+        switch (parseUpdate(alloc, case.args)) {
+            .ok => |r| if (case.version) |want|
+                try std.testing.expectEqualStrings(want, r.version.?)
+            else
+                try std.testing.expect(r.version == null),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    switch (splitCommand(alloc, &.{ "update", "v0.2.0" })) {
+        .ok => |r| try std.testing.expectEqual(Command.update, r.command),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(Result(UpdateArgs).help, parseUpdate(alloc, &.{"-h"}));
+    try expectErr(UpdateArgs, parseUpdate(alloc, &.{ "v1", "v2" }), "unexpected argument 'v2'");
+    try expectErr(UpdateArgs, parseUpdate(alloc, &.{"--bogus"}), "unknown option '--bogus'");
+    try expectErr(UpdateArgs, parseUpdate(alloc, &.{"main;rm"}), "'main;rm' is not a release tag (want e.g. v0.3.0)");
+    try expectErr(UpdateArgs, parseUpdate(alloc, &.{"main"}), "'main' is not a release tag (want e.g. v0.3.0)");
+    try expectErr(CommandSplit, splitCommand(alloc, &.{"updte"}), "unknown command 'updte'; did you mean 'update'?");
+}
+
 test "0.1 spellings report migration errors" {
     const alloc = std.heap.page_allocator;
     try expectErr(CommandSplit, splitCommand(alloc, &.{ "-c", "events" }), "'-c' is now a command: kite consume [@CLUSTER] TOPIC");
@@ -1466,9 +1556,9 @@ test "help is detected in argument order" {
 
 test "help text stays plain and narrow" {
     try std.testing.expect(produce_help.len != consume_help.len);
-    for ([_][]const u8{ produce_help, consume_help, cluster_help, topic_help }) |page|
+    for ([_][]const u8{ produce_help, consume_help, cluster_help, topic_help, update_help }) |page|
         try std.testing.expect(std.mem.indexOf(u8, page, "-h, --help") != null);
-    for ([_][]const u8{ overview_help, produce_help, consume_help, cluster_help, topic_help }) |page| {
+    for ([_][]const u8{ overview_help, produce_help, consume_help, cluster_help, topic_help, update_help }) |page| {
         var lines = std.mem.splitScalar(u8, page, '\n');
         while (lines.next()) |line| {
             try std.testing.expect(line.len <= 80);
