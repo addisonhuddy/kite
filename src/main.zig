@@ -216,6 +216,7 @@ pub fn main(init: std.process.Init) !void {
     var t_drain: u64 = 0;
     var timer = Lap.init(io);
     var stats = stats_mod.Stats.init(io, topic, stderr_tty and !verbose and !quiet);
+    stats.pretty = stderr_tty;
     defer stats.deinit();
     live_stats = &stats;
     read_loop: while (true) {
@@ -294,7 +295,25 @@ pub fn main(init: std.process.Init) !void {
 fn produceSummary(cli: *client.Client, stats: *stats_mod.Stats, total: u64, nparts: usize, quiet: bool) void {
     const parts_used = cli.last_offsets.items.len;
     stats.clearLine();
-    if (!quiet) {
+    if (!quiet and stats.pretty) {
+        var detail: [64]u8 = undefined;
+        const d = std.fmt.bufPrint(&detail, "{d} of {d} partition{s}", .{ parts_used, nparts, if (nparts == 1) "" else "s" }) catch "";
+        var line: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&line);
+        stats.writeSummary(&w, "produced to", d, "", if (total == 0) .empty else .ok, term.color.enabled);
+        if (total > 0) {
+            var lat_buf: [32]u8 = undefined;
+            const per_req = if (cli.avgAckMs()) |ms|
+                std.fmt.bufPrint(&lat_buf, "{d:.1}ms", .{ms}) catch "?"
+            else
+                "n/a";
+            stats_mod.Stats.writeLabel(&w, term.color.enabled, "requests");
+            w.print("{d} sent  {d} retried  {s} avg ack  {d} connection{s}\n", .{
+                cli.produce_requests, cli.produce_retries, per_req, cli.conns.count(), if (cli.conns.count() == 1) "" else "s",
+            }) catch {};
+        }
+        std.debug.print("{s}", .{w.buffered()});
+    } else if (!quiet) {
         if (term.color.enabled)
             std.debug.print("{s}{d}{s} record(s) produced to '{s}{s}{s}' across {d} of {d} partition(s)\n", .{
                 term.bold, total, term.reset, term.cyan, stats.topic, term.reset, parts_used, nparts,
@@ -304,19 +323,23 @@ fn produceSummary(cli: *client.Client, stats: *stats_mod.Stats, total: u64, npar
                 total, stats.topic, parts_used, nparts,
             });
         stats.finish();
+        if (total > 0) {
+            var lat_buf: [32]u8 = undefined;
+            const per_req = if (cli.avgAckMs()) |ms|
+                std.fmt.bufPrint(&lat_buf, "{d:.1}ms", .{ms}) catch "?"
+            else
+                "n/a";
+            std.debug.print("{d} produce request(s), {d} retried batch(es), {s} avg ack latency, {d} connection(s)\n", .{
+                cli.produce_requests, cli.produce_retries, per_req, cli.conns.count(),
+            });
+        }
     }
-    if (total > 0 and !quiet) {
-        var lat_buf: [32]u8 = undefined;
-        const per_req = if (cli.avgAckMs()) |ms|
-            std.fmt.bufPrint(&lat_buf, "{d:.1}ms", .{ms}) catch "?"
+    if (cli.acked_records != total) {
+        if (term.color.enabled)
+            std.debug.print("{s}warning:{s} broker acknowledged {d} of {d} record(s)\n", .{ term.yellow, term.reset, cli.acked_records, total })
         else
-            "n/a";
-        std.debug.print("{d} produce request(s), {d} retried batch(es), {s} avg ack latency, {d} connection(s)\n", .{
-            cli.produce_requests, cli.produce_retries, per_req, cli.conns.count(),
-        });
+            std.debug.print("warning: broker acknowledged {d} of {d} record(s)\n", .{ cli.acked_records, total });
     }
-    if (cli.acked_records != total)
-        std.debug.print("warning: broker acknowledged {d} of {d} record(s)\n", .{ cli.acked_records, total });
 }
 
 /// Parse a `--json` input line: {"key":..,"value":..,"headers":{..}}. A
@@ -414,6 +437,21 @@ fn note(comptime fmt: []const u8, args: anytype) void {
         out(term.dim ++ "kite: " ++ fmt ++ term.reset ++ "\n", args)
     else
         out("kite: " ++ fmt ++ "\n", args);
+}
+
+/// Success note: a green check mark instead of the dim `kite:` prefix
+/// when stderr is colored.
+fn done(comptime fmt: []const u8, args: anytype) void {
+    if (term.color.enabled)
+        out(term.green ++ "\u{2713} " ++ term.reset ++ fmt ++ "\n", args)
+    else
+        out("kite: " ++ fmt ++ "\n", args);
+}
+
+fn writeStyledOut(w: *std.Io.Writer, color: bool, code: []const u8, text: []const u8) void {
+    if (color) w.writeAll(code) catch {};
+    w.writeAll(text) catch {};
+    if (color) w.writeAll(term.reset) catch {};
 }
 
 const search_path_hint = "./kite.yaml, ./kite.properties, $XDG_CONFIG_HOME/kite/, ~/.config/kite/";
@@ -515,7 +553,7 @@ fn createAndResolve(cli: *client.Client, topic: []const u8, access: []const u8, 
         ),
         else => fatalErr(cli, "could not create topic"),
     };
-    if (!quiet) note("created topic '{s}'", .{topic});
+    if (!quiet) done("created topic '{s}'", .{topic});
     waitForTopic(cli, topic, access, quiet);
 }
 
@@ -585,6 +623,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     connectAndResolve(&cli, topic_name, "read", quiet, false);
 
     const stdout_tty = std.Io.File.stdout().isTty(init.io) catch false;
+    const stdout_color = term.detect(init.io, std.Io.File.stdout(), init.environ_map);
     const stderr_tty = std.Io.File.stderr().isTty(init.io) catch false;
     // Unbounded reads only make sense on a terminal (or with --follow); a
     // pipe/file consumer without a bound stops after a short idle so scripts
@@ -601,6 +640,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     var stdout_buf: [64 * 1024]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(init.io, &stdout_buf);
     var stats = stats_mod.Stats.init(init.io, topic_name, stderr_tty and !verbose and !quiet);
+    stats.pretty = stderr_tty;
     defer stats.deinit();
     live_stats = &stats;
     stats.clear_before_output = stdout_tty;
@@ -629,6 +669,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
         .stats = &stats,
         .stop = &interrupted,
         .sink_closed = stdoutClosed,
+        .color = stdout_color,
     }, &stdout.interface) catch |err| switch (err) {
         error.PartitionNotFound => fatal("partition {d} not found in topic '{s}'", .{ consume.partition orelse -1, topic_name }),
         error.OffsetOutOfRange => fatalErr(&cli, "cannot start consuming"),
@@ -646,21 +687,36 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     };
     const stopped_by_signal = interrupted.load(.acquire);
     const reason: []const u8 = if (stopped_by_signal)
-        " (interrupted)"
+        "interrupted"
     else if (consume.max_records != null and consumed >= consume.max_records.?)
         ""
     else if (idle_ms != null)
-        " (idle timeout)"
+        "idle timeout"
     else
         "";
     stats.clearLine();
-    if (!quiet) {
+    if (!quiet and stats.pretty) {
+        const mark: stats_mod.Stats.Mark = if (consumed == 0)
+            .empty
+        else if (stopped_by_signal)
+            .interrupted
+        else
+            .ok;
+        var line: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&line);
+        stats.writeSummary(&w, "consumed from", "", reason, mark, term.color.enabled);
+        std.debug.print("{s}", .{w.buffered()});
+    } else if (!quiet) {
+        const old_reason = if (reason.len > 0)
+            std.fmt.allocPrint(alloc, " ({s})", .{reason}) catch reason
+        else
+            reason;
         if (term.color.enabled)
             std.debug.print("{s}{d}{s} record(s) consumed from '{s}{s}{s}'{s}\n", .{
-                term.bold, consumed, term.reset, term.cyan, topic_name, term.reset, reason,
+                term.bold, consumed, term.reset, term.cyan, topic_name, term.reset, old_reason,
             })
         else
-            std.debug.print("{d} record(s) consumed from '{s}'{s}\n", .{ consumed, topic_name, reason });
+            std.debug.print("{d} record(s) consumed from '{s}'{s}\n", .{ consumed, topic_name, old_reason });
         stats.finish();
     }
     if (consumed == 0 and consume.start == .latest and !stats.live and !quiet)
@@ -734,16 +790,45 @@ fn runCluster(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     var w = std.Io.File.stdout().writer(init.io, &stdout_buf);
     const outw = &w.interface;
     if (common.format == .json) {
-        outw.writeAll("{\"file\":") catch {};
-        json.writeString(outw, source.file.?) catch {};
-        outw.writeAll(",\"current\":") catch {};
-        if (targets.selected) |t| json.writeString(outw, t) catch {} else outw.writeAll("null") catch {};
-        outw.writeAll(",\"clusters\":[") catch {};
+        var jb: std.Io.Writer.Allocating = .init(alloc);
+        const jw = &jb.writer;
+        jw.writeAll("{\"file\":") catch {};
+        json.writeString(jw, source.file.?) catch {};
+        jw.writeAll(",\"current\":") catch {};
+        if (targets.selected) |t| json.writeString(jw, t) catch {} else jw.writeAll("null") catch {};
+        jw.writeAll(",\"clusters\":[") catch {};
         for (targets.names, 0..) |t, i| {
-            if (i > 0) outw.writeByte(',') catch {};
-            json.writeString(outw, t) catch {};
+            if (i > 0) jw.writeByte(',') catch {};
+            json.writeString(jw, t) catch {};
         }
-        outw.writeAll("]}\n") catch {};
+        jw.writeAll("]}\n") catch {};
+        if (term.detect(init.io, std.Io.File.stdout(), init.environ_map))
+            term.writeJsonColored(outw, jb.written()) catch {}
+        else
+            outw.writeAll(jb.written()) catch {};
+    } else if (std.Io.File.stdout().isTty(init.io) catch false) {
+        const out_color = term.detect(init.io, std.Io.File.stdout(), init.environ_map);
+        for (targets.names) |t| {
+            if (targets.selected) |sel| {
+                if (std.mem.eql(u8, sel, t)) {
+                    writeStyledOut(outw, out_color, term.green, "*");
+                    outw.writeByte(' ') catch {};
+                    writeStyledOut(outw, out_color, term.bold, t);
+                    outw.writeByte('\n') catch {};
+                    continue;
+                }
+            }
+            outw.writeAll("  ") catch {};
+            outw.writeAll(t) catch {};
+            outw.writeByte('\n') catch {};
+        }
+        if (!common.quiet) {
+            term.color.enabled = std.Io.File.stderr().isTty(init.io) catch false;
+            if (targets.names.len == 0)
+                note("{s} defines no clusters", .{source.file.?})
+            else
+                note("clusters from {s}", .{source.file.?});
+        }
     } else {
         for (targets.names) |t| {
             outw.writeAll(t) catch {};
@@ -825,15 +910,67 @@ fn runTopic(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
             var w = std.Io.File.stdout().writer(init.io, &buf);
             const outw = &w.interface;
             var shown: usize = 0;
+            var hidden: usize = 0;
+            const stdout_tty = std.Io.File.stdout().isTty(init.io) catch false;
+            if (topic.common.format != .json and stdout_tty) {
+                const out_color = term.detect(init.io, std.Io.File.stdout(), init.environ_map);
+                var width: usize = "TOPIC".len;
+                for (topics) |t| {
+                    if (t.internal and !topic.all) continue;
+                    if (t.name.len > width) width = t.name.len;
+                }
+                writeStyledOut(outw, out_color, term.bold, "TOPIC");
+                outw.splatByteAll(' ', width - "TOPIC".len) catch {};
+                outw.writeAll("  ") catch {};
+                writeStyledOut(outw, out_color, term.bold, "PARTITIONS");
+                outw.writeAll("  ") catch {};
+                writeStyledOut(outw, out_color, term.bold, "REPLICATION");
+                outw.writeByte('\n') catch {};
+                for (topics) |t| {
+                    if (t.internal and !topic.all) {
+                        hidden += 1;
+                        continue;
+                    }
+                    shown += 1;
+                    if (t.internal and out_color) outw.writeAll(term.dim) catch {};
+                    writeStyledOut(outw, out_color and !t.internal, term.cyan, t.name);
+                    outw.splatByteAll(' ', width - t.name.len) catch {};
+                    outw.print("  {d:>10}  {d:>11}", .{ t.partitions, t.replication_factor }) catch {};
+                    if (t.internal) {
+                        outw.writeAll("  internal") catch {};
+                        if (out_color) outw.writeAll(term.reset) catch {};
+                    }
+                    outw.writeByte('\n') catch {};
+                }
+                outw.flush() catch {};
+                if (!quiet) {
+                    if (shown == 0) {
+                        note("{s}", .{"no topics"});
+                    } else if (hidden == 0) {
+                        note("{d} topic{s}", .{ shown, if (shown == 1) "" else "s" });
+                    } else {
+                        note("{d} topic{s}, {d} internal hidden (-a to show)", .{
+                            shown, if (shown == 1) "" else "s", hidden,
+                        });
+                    }
+                }
+                std.process.exit(0);
+            }
             for (topics) |t| {
                 if (t.internal and !topic.all) continue;
                 shown += 1;
                 if (topic.common.format == .json) {
-                    outw.writeAll("{\"name\":") catch {};
-                    json.writeString(outw, t.name) catch {};
-                    outw.print(",\"partitions\":{d},\"replication_factor\":{d},\"internal\":{s}}}\n", .{
+                    var jb: [512]u8 = undefined;
+                    var jw: std.Io.Writer = .fixed(&jb);
+                    jw.writeAll("{\"name\":") catch {};
+                    json.writeString(&jw, t.name) catch {};
+                    jw.print(",\"partitions\":{d},\"replication_factor\":{d},\"internal\":{s}}}\n", .{
                         t.partitions, t.replication_factor, if (t.internal) "true" else "false",
                     }) catch {};
+                    if (term.detect(init.io, std.Io.File.stdout(), init.environ_map))
+                        term.writeJsonColored(outw, jw.buffered()) catch {}
+                    else
+                        outw.writeAll(jw.buffered()) catch {};
                 } else {
                     outw.writeAll(t.name) catch {};
                     outw.writeByte('\n') catch {};
@@ -861,7 +998,7 @@ fn runTopic(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
                 else => fatalErr(&cli, "could not create topic"),
             };
             if (!quiet)
-                note("created topic '{s}' with {d} partition(s), replication factor {d}", .{ name, res.partitions, res.replication_factor });
+                done("created topic '{s}' with {d} partition(s), replication factor {d}", .{ name, res.partitions, res.replication_factor });
             waitForTopic(&cli, name, "write", quiet);
             std.process.exit(0);
         },
@@ -888,7 +1025,7 @@ fn runTopic(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
                     }
                     continue;
                 };
-                if (!quiet) note("{s}", .{cli_args.errCat(alloc, &.{ "deleted topic '", name, "'" })});
+                if (!quiet) done("{s}", .{cli_args.errCat(alloc, &.{ "deleted topic '", name, "'" })});
             }
             std.process.exit(if (failed) 1 else 0);
         },
@@ -896,12 +1033,12 @@ fn runTopic(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
             const name = topic.topics[0];
             if (topic.partitions) |n| {
                 cli.createPartitions(name, n) catch |err| updateErr(&cli, alloc, name, err);
-                if (!quiet) note("topic '{s}' now has {d} partition(s)", .{ name, n });
+                if (!quiet) done("topic '{s}' now has {d} partition(s)", .{ name, n });
             }
             const nconfigs = topic.set.len + topic.unset.len;
             if (nconfigs > 0) {
                 cli.alterTopicConfigs(name, topic.set, topic.unset) catch |err| updateErr(&cli, alloc, name, err);
-                if (!quiet) note("updated {d} config(s) on topic '{s}'", .{ nconfigs, name });
+                if (!quiet) done("updated {d} config(s) on topic '{s}'", .{ nconfigs, name });
             }
             std.process.exit(0);
         },
@@ -1018,11 +1155,11 @@ fn runClusterInit(init: std.process.Init, alloc: std.mem.Allocator, common: cli_
         else => fatal("wrote {s} but it did not re-parse cleanly ({s})", .{ path, @errorName(err) }),
     };
 
-    if (!common.quiet) note("wrote cluster '{s}' to {s}", .{ name, path });
+    if (!common.quiet) done("wrote cluster '{s}' to {s}", .{ name, path });
     config.writeCurrentCluster(io, alloc, env, name) catch |err|
         fatal("cannot store current cluster ({s})", .{@errorName(err)});
     if (!common.quiet) {
-        note("cluster set to '{s}'", .{name});
+        done("cluster set to '{s}'", .{name});
         note("try: kite consume -B TOPIC", .{});
     }
     std.process.exit(0);
@@ -1270,7 +1407,7 @@ fn setCurrentCluster(
     }
     config.writeCurrentCluster(init.io, alloc, init.environ_map, name) catch |err|
         fatal("cannot store current cluster ({s})", .{@errorName(err)});
-    if (!common.quiet) note("cluster set to '{s}'", .{name});
+    if (!common.quiet) done("cluster set to '{s}'", .{name});
 }
 
 /// Idle bound applied to `kite consume` when stdout is not a terminal and no
