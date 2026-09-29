@@ -214,7 +214,7 @@ pub const Stats = struct {
         const total = fmtBytes(s.bytes, &bytes_buf);
         const msg_rate = fmtCount(@intFromFloat(@max(0, rate)), &rate_buf);
         const bytes_rate = fmtBytes(@intFromFloat(@max(0, byte_rate)), &brate_buf);
-        const count = fmtCount(s.records, &count_buf);
+        const count = std.fmt.bufPrint(&count_buf, "{d}", .{s.records}) catch "?";
 
         switch (mark) {
             .ok => styled(w, color, term.green, "\u{2713}"),

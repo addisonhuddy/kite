@@ -369,8 +369,8 @@ pub const cluster_help =
     "Enter to choose, q to quit); when stdin or stderr is not a terminal it\n" ++
     "behaves like 'kite cluster list' so scripts never hang. 'list' prints\n" ++
     "one cluster name per line, sorted, with '*' after the current one\n" ++
-    "(before it on a terminal); the\n" ++
-    "JSON form is {\"file\":..,\"current\":..,\"clusters\":[..]}. Only the file's\n" ++
+    "(before it on a terminal); the JSON form is\n" ++
+    "{\"file\":..,\"current\":..,\"clusters\":[..]}. Only the file's\n" ++
     "`clusters:` keys are read, so it works even when a cluster is\n" ++
     "incomplete; kite never connects to a broker.\n" ++
     "\n" ++
