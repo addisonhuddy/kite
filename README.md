@@ -17,7 +17,7 @@ non-zero exit on failure.
 > for scripts, CI jobs, containers, and AI agents. It is written in Zig, speaks
 > the Kafka wire protocol directly (PLAINTEXT, SSL, SASL/PLAIN, SCRAM-SHA-256,
 > SCRAM-SHA-512), works with any Kafka-compatible broker (Apache Kafka,
-> Confluent Cloud, Redpanda, Amazon MSK, Aiven, WarpStream), and never hangs:
+> Confluent Cloud, Amazon MSK, WarpStream), and never hangs:
 > piped reads stop on idle by default.
 
 **Use kite when** you need to move records into or out of a Kafka
@@ -872,7 +872,7 @@ records exist). Without `-n`, a piped `kite consume` stops on its own after 5 s
 without data, so `kite consume -B TOPIC > dump.txt` produces a snapshot rather
 than hanging.
 
-**Does kite work with Confluent Cloud, Redpanda, Amazon MSK, or Aiven?**
+**Does kite work with Confluent Cloud or Amazon MSK?**
 Yes. Any broker that speaks the Kafka protocol works. Set
 `SECURITY_PROTOCOL=SASL_SSL`, `SASL_MECHANISM=PLAIN` (or `SCRAM-SHA-256` /
 `SCRAM-SHA-512`), `SASL_USERNAME`, and `SASL_PASSWORD`, or copy a template
