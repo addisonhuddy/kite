@@ -5,7 +5,6 @@ pub const dim = "\x1b[2m";
 pub const red = "\x1b[31m";
 pub const yellow = "\x1b[33m";
 pub const green = "\x1b[32m";
-pub const bold_blue = "\x1b[1;34m";
 pub const cyan = "\x1b[36m";
 pub const reset = "\x1b[0m";
 
@@ -154,32 +153,22 @@ pub fn renderHelp(alloc: std.mem.Allocator, page: []const u8) ![]u8 {
             try appendStyled(&out, alloc, color.enabled, bold, line);
         } else if (std.mem.startsWith(u8, line, "  ")) {
             const prefix_len: usize = 2;
-            const body = line[prefix_len..];
-            if (body.len > 0 and (body[0] == '-' or body[0] == '@')) {
-                const end = std.mem.indexOf(u8, body, "  ") orelse body.len;
-                try out.appendSlice(alloc, line[0..prefix_len]);
-                try appendStyled(&out, alloc, color.enabled, green, body[0..end]);
-                try out.appendSlice(alloc, body[end..]);
+            const word: []const u8 = if (std.mem.startsWith(u8, line[prefix_len..], "kite produce"))
+                "kite produce"
+            else if (std.mem.startsWith(u8, line[prefix_len..], "kite consume"))
+                "kite consume"
+            else if (std.mem.startsWith(u8, line[prefix_len..], "kite cluster"))
+                "kite cluster"
+            else if (std.mem.startsWith(u8, line[prefix_len..], "kite"))
+                "kite"
+            else
+                "";
+            try out.appendSlice(alloc, line[0..prefix_len]);
+            if (word.len > 0) {
+                try appendStyled(&out, alloc, color.enabled, cyan, word);
+                try out.appendSlice(alloc, line[prefix_len + word.len ..]);
             } else {
-                const word: []const u8 = if (std.mem.startsWith(u8, body, "kite produce"))
-                    "kite produce"
-                else if (std.mem.startsWith(u8, body, "kite consume"))
-                    "kite consume"
-                else if (std.mem.startsWith(u8, body, "kite topic"))
-                    "kite topic"
-                else if (std.mem.startsWith(u8, body, "kite cluster"))
-                    "kite cluster"
-                else if (std.mem.startsWith(u8, body, "kite"))
-                    "kite"
-                else
-                    "";
-                try out.appendSlice(alloc, line[0..prefix_len]);
-                if (word.len > 0) {
-                    try appendStyled(&out, alloc, color.enabled, cyan, word);
-                    try out.appendSlice(alloc, line[prefix_len + word.len ..]);
-                } else {
-                    try out.appendSlice(alloc, body);
-                }
+                try out.appendSlice(alloc, line[prefix_len..]);
             }
         } else {
             try out.appendSlice(alloc, line);
@@ -187,86 +176,4 @@ pub fn renderHelp(alloc: std.mem.Allocator, page: []const u8) ![]u8 {
         try out.append(alloc, '\n');
     }
     return out.toOwnedSlice(alloc);
-}
-
-/// Syntax-color one JSON value: object keys bold blue, other strings
-/// green, `null` dim, everything else verbatim. Escapes inside strings
-/// are skipped so a \" does not end the span early.
-pub fn writeJsonColored(w: *std.Io.Writer, bytes: []const u8) !void {
-    var i: usize = 0;
-    while (i < bytes.len) {
-        if (bytes[i] == '"') {
-            var j = i + 1;
-            while (j < bytes.len) {
-                if (bytes[j] == '\\') {
-                    j += 2;
-                    continue;
-                }
-                if (bytes[j] == '"') break;
-                j += 1;
-            }
-            const end = @min(j + 1, bytes.len);
-            var k = end;
-            while (k < bytes.len and (bytes[k] == ' ' or bytes[k] == '\t')) k += 1;
-            const is_key = k < bytes.len and bytes[k] == ':';
-            try w.writeAll(if (is_key) bold_blue else green);
-            try w.writeAll(bytes[i..end]);
-            try w.writeAll(reset);
-            i = end;
-        } else if (i + 4 <= bytes.len and std.mem.eql(u8, bytes[i .. i + 4], "null") and
-            (i + 4 == bytes.len or !std.ascii.isAlphanumeric(bytes[i + 4])))
-        {
-            try w.writeAll(dim);
-            try w.writeAll("null");
-            try w.writeAll(reset);
-            i += 4;
-        } else {
-            try w.writeByte(bytes[i]);
-            i += 1;
-        }
-    }
-}
-
-fn stripAnsi(alloc: std.mem.Allocator, bytes: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    var i: usize = 0;
-    while (i < bytes.len) {
-        if (bytes[i] == 0x1b) {
-            while (i < bytes.len and bytes[i] != 'm') i += 1;
-            i += 1;
-        } else {
-            try out.append(alloc, bytes[i]);
-            i += 1;
-        }
-    }
-    return out.toOwnedSlice(alloc);
-}
-
-test "writeJsonColored colors keys, strings, escapes and null" {
-    const alloc = std.testing.allocator;
-    const input = "{\"a\":\"x\",\"b\":null,\"c\":\"he\\\"llo\\\\\",\"d\":[1,\"s\"],\"nullable\":true}";
-    var buf: std.Io.Writer.Allocating = .init(alloc);
-    defer buf.deinit();
-    try writeJsonColored(&buf.writer, input);
-    const out = buf.written();
-
-    try std.testing.expect(std.mem.indexOf(u8, out, bold_blue ++ "\"a\"" ++ reset) != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, green ++ "\"x\"" ++ reset) != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, green ++ "\"he\\\"llo\\\\\"" ++ reset) != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, dim ++ "null" ++ reset) != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, bold_blue ++ "\"nullable\"" ++ reset) != null);
-    // Keys inside the string value are not treated as object keys.
-    try std.testing.expect(std.mem.indexOf(u8, out, bold_blue ++ "\"llo\"") == null);
-
-    const plain = try stripAnsi(alloc, out);
-    defer alloc.free(plain);
-    try std.testing.expectEqualStrings(input, plain);
-}
-
-test "writeJsonColored leaves bare scalars unstyled" {
-    const alloc = std.testing.allocator;
-    var buf: std.Io.Writer.Allocating = .init(alloc);
-    defer buf.deinit();
-    try writeJsonColored(&buf.writer, "42, -1.5, true");
-    try std.testing.expectEqualStrings("42, -1.5, true", buf.written());
 }

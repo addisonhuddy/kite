@@ -2,7 +2,6 @@ const std = @import("std");
 const client = @import("client.zig");
 const protocol = @import("protocol.zig");
 const stats = @import("stats.zig");
-const term = @import("term.zig");
 const json = @import("json.zig");
 const format_mod = @import("format.zig");
 
@@ -26,8 +25,6 @@ pub const Options = struct {
     /// Polled between fetch rounds so a closed downstream pipe stops the
     /// consumer even when no new records arrive to trigger a write error.
     sink_closed: ?*const fn () bool = null,
-    /// Colorize record output (keys, headers, JSON syntax) for a terminal.
-    color: bool = false,
 };
 
 pub const Error = error{
@@ -79,9 +76,6 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         round_alloc = round_arena.allocator();
     }
 
-    var scratch: std.Io.Writer.Allocating = .init(c.alloc);
-    defer scratch.deinit();
-
     var count: u64 = 0;
     var last_record = std.Io.Timestamp.now(c.io, .awake);
     var retry_attempts: u8 = 0;
@@ -107,7 +101,7 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
                 if (candidate.leader == cursor.leader)
                     try parts.append(round_alloc, .{ .pidx = candidate.pidx, .cursor = candidate });
 
-            fetchLeader(c, round_alloc, opts, parts.items, out, &scratch, &count, &progress) catch |err| switch (err) {
+            fetchLeader(c, round_alloc, opts, parts.items, out, &count, &progress) catch |err| switch (err) {
                 error.RetryFetch => {
                     retry_attempts += 1;
                     if (retry_attempts >= 6) {
@@ -229,7 +223,6 @@ fn fetchLeader(
     opts: Options,
     parts: []const FetchPart,
     out: *std.Io.Writer,
-    scratch: *std.Io.Writer.Allocating,
     count: *u64,
     progress: *bool,
 ) !void {
@@ -329,8 +322,6 @@ fn fetchLeader(
                     .format = opts.format,
                     .topic = opts.topic,
                     .pidx = pidx,
-                    .color = opts.color,
-                    .scratch = scratch,
                 };
                 next_from_batches = protocol.decodeBatches(alloc, blob, &ctx, onRecord) catch |err| switch (err) {
                     error.WriteFailed => return error.WriteFailed,
@@ -376,8 +367,6 @@ const RecordSink = struct {
     format: format_mod.Format,
     topic: []const u8,
     pidx: i32,
-    color: bool = false,
-    scratch: ?*std.Io.Writer.Allocating = null,
 };
 
 fn writeJsonRecord(w: *std.Io.Writer, topic: []const u8, pidx: i32, offset: i64, ts: i64, rec: protocol.Record) !void {
@@ -400,54 +389,29 @@ fn writeJsonRecord(w: *std.Io.Writer, topic: []const u8, pidx: i32, offset: i64,
 }
 
 /// key<TAB>[h: v<TAB>]*value — the shape `auto` and `tsv` share.
-/// With `color` the key is cyan and each `name: value` header dim; the
-/// TABs and the value stay plain.
-fn writeTsvRecord(w: *std.Io.Writer, rec: protocol.Record, color: bool) !void {
-    if (rec.key) |key| {
-        if (color) try w.writeAll(term.cyan);
-        try w.writeAll(key);
-        if (color) try w.writeAll(term.reset);
-    }
+fn writeTsvRecord(w: *std.Io.Writer, rec: protocol.Record) !void {
+    if (rec.key) |key| try w.writeAll(key);
     try w.writeByte('\t');
     for (rec.headers) |header| {
-        if (color) try w.writeAll(term.dim);
         try w.writeAll(header.key);
         try w.writeAll(": ");
         if (header.value) |value| try w.writeAll(value);
-        if (color) try w.writeAll(term.reset);
         try w.writeByte('\t');
     }
     try w.writeAll(rec.value);
-}
-
-fn writeJsonRecordColored(
-    w: *std.Io.Writer,
-    scratch: *std.Io.Writer.Allocating,
-    topic: []const u8,
-    pidx: i32,
-    offset: i64,
-    ts: i64,
-    rec: protocol.Record,
-) !void {
-    scratch.clearRetainingCapacity();
-    try writeJsonRecord(&scratch.writer, topic, pidx, offset, ts, rec);
-    try term.writeJsonColored(w, scratch.written());
 }
 
 fn onRecord(ctx: *RecordSink, offset: i64, timestamp_ms: i64, rec: protocol.Record) !void {
     if (ctx.max) |max| if (ctx.count.* >= max) return;
     if (ctx.stats) |s| s.beforeOutput();
     switch (ctx.format) {
-        .json => if (ctx.color)
-            try writeJsonRecordColored(ctx.out, ctx.scratch.?, ctx.topic, ctx.pidx, offset, timestamp_ms, rec)
-        else
-            try writeJsonRecord(ctx.out, ctx.topic, ctx.pidx, offset, timestamp_ms, rec),
+        .json => try writeJsonRecord(ctx.out, ctx.topic, ctx.pidx, offset, timestamp_ms, rec),
         .value => try ctx.out.writeAll(rec.value),
-        .tsv => try writeTsvRecord(ctx.out, rec, ctx.color),
+        .tsv => try writeTsvRecord(ctx.out, rec),
         .auto, .csv => if (rec.key == null and rec.headers.len == 0)
             try ctx.out.writeAll(rec.value)
         else
-            try writeTsvRecord(ctx.out, rec, ctx.color),
+            try writeTsvRecord(ctx.out, rec),
     }
     try ctx.out.writeByte('\n');
     ctx.count.* += 1;
