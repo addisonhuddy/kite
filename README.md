@@ -31,6 +31,8 @@ admin tooling or a client library for those.
 
 ## Quickstart
 
+![kite demo: create a topic, produce, consume, list, delete](examples/demo.gif)
+
 You need a reachable Kafka 4.0+ broker (`localhost:9092` below, e.g. the
 Docker one in [Run Kafka locally with Docker](#run-kafka-locally-with-docker)), permission to read and write the topic you name, and
 [`jq`](https://jqlang.github.io/jq/) for the last line only. Use a fresh
