@@ -9,7 +9,7 @@ _kite() {
     sub=""
     for w in "${COMP_WORDS[@]:1:COMP_CWORD-1}"; do
         case "$w" in
-            produce | p | consume | c | cluster | topic) cmd=$w ;;
+            produce | p | consume | c | cluster | topic | update) cmd=$w ;;
         esac
     done
     if [ "$cmd" = cluster ]; then
@@ -75,6 +75,9 @@ _kite() {
             opts="-b --bootstrap --config --format --json -H --csv --key \
                 -q --quiet -v --verbose -h --help"
             ;;
+        update)
+            opts="-h --help"
+            ;;
         topic)
             if [ -z "$sub" ]; then
                 opts="list create delete update"
@@ -89,7 +92,7 @@ _kite() {
             fi
             ;;
         *)
-            opts="produce p consume c cluster topic \
+            opts="produce p consume c cluster topic update \
                 -V --version -h --help"
             ;;
     esac

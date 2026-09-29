@@ -2,7 +2,7 @@
 #   mkdir -p ~/.config/fish/completions && cp completions/kite.fish ~/.config/fish/completions/
 
 # First word: the commands (plus the p/c aliases).
-complete -c kite -n 'test (count (commandline -opc)[2..-1]) -eq 0' -f -a 'produce p consume c cluster topic'
+complete -c kite -n 'test (count (commandline -opc)[2..-1]) -eq 0' -f -a 'produce p consume c cluster topic update'
 
 # Cluster names from kite.yaml for @NAME positionals.
 complete -c kite -f -a '(begin; test -f kite.yaml; and awk "/^clusters:/{f=1;next} f&&/^[^ ]/{f=0} f&&/^  [A-Za-z0-9_-]+:/{sub(/^  /,\"@\");sub(/:.*/,\"\");print}" kite.yaml | sort -u; end)'
@@ -10,7 +10,7 @@ complete -c kite -f -a '(begin; test -f kite.yaml; and awk "/^clusters:/{f=1;nex
 # Options valid for every command.
 complete -c kite -n '__fish_seen_subcommand_from produce p consume c cluster topic' -s q -l quiet -d 'Suppress summary and progress lines'
 complete -c kite -n '__fish_seen_subcommand_from produce p consume c cluster topic' -s v -l verbose -d 'Diagnostics on stderr'
-complete -c kite -n '__fish_seen_subcommand_from produce p consume c cluster topic' -s h -l help -d 'Show help'
+complete -c kite -n '__fish_seen_subcommand_from produce p consume c cluster topic update' -s h -l help -d 'Show help'
 
 # produce and consume.
 complete -c kite -n '__fish_seen_subcommand_from produce p consume c topic' -s b -l bootstrap -d 'Comma-separated host:port brokers' -x

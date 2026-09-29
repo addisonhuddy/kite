@@ -34,7 +34,7 @@ _kite() {
         _arguments -s \
             '(-V --version)'{-V,--version}'[print version]' \
             '(-h --help)'{-h,--help}'[show help]' \
-            '1:command:(produce p consume c cluster topic)'
+            '1:command:(produce p consume c cluster topic update)'
         return
     fi
 
@@ -72,6 +72,9 @@ _kite() {
                 '--csv[read RFC 4180 CSV (same as --format csv)]' \
                 '--key[use CSV column as record key]:column:' \
                 '*:arg:_kite_at_targets'
+            ;;
+        update)
+            _arguments -s '(-h --help)'{-h,--help}'[show help]'
             ;;
         topic)
             if (( CURRENT == 3 )); then

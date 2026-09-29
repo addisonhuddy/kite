@@ -157,6 +157,7 @@ pub fn main(init: std.process.Init) !void {
             runTopic(init, command_args.rest, alloc);
             return;
         },
+        .update => runUpdate(init, command_args.rest, alloc),
         .produce => {},
     }
     const parsed = cli_args.parseProduce(alloc, command_args.rest);
@@ -850,6 +851,54 @@ fn runCluster(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
 }
 
 /// Print a help page, rendered with colours when stdout is a terminal.
+/// Run by /bin/sh as `sh -c update_script kite-update CURRENT BIN_DIR [TAG]`.
+/// An empty TAG means the latest release, skipped when it is CURRENT.
+const update_script =
+    \\set -eu
+    \\repo=addisonhuddy/kite
+    \\current=v$1 bin_dir=$2 want=$3
+    \\if command -v curl >/dev/null 2>&1; then fetch() { curl -fsSL "$1"; }
+    \\elif command -v wget >/dev/null 2>&1; then fetch() { wget -qO- "$1"; }
+    \\else echo "kite: curl or wget is required" >&2; exit 1
+    \\fi
+    \\if [ -z "$want" ]; then
+    \\    want=$(fetch "https://api.github.com/repos/$repo/releases/latest" |
+    \\        sed -n 's/^ *"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)
+    \\    [ -n "$want" ] || {
+    \\        echo "kite: could not look up the latest release; see https://github.com/$repo/releases" >&2
+    \\        exit 1
+    \\    }
+    \\    if [ "$want" = "$current" ]; then
+    \\        echo "kite: already up to date ($current)" >&2
+    \\        exit 0
+    \\    fi
+    \\fi
+    \\echo "kite: updating $current to $want" >&2
+    \\installer=$(fetch "https://raw.githubusercontent.com/$repo/main/install.sh") || {
+    \\    echo "kite: could not download install.sh from github.com/$repo" >&2
+    \\    exit 1
+    \\}
+    \\printf '%s\n' "$installer" | sh -s -- --bin-dir "$bin_dir" --version "$want"
+;
+
+/// `kite update [VERSION]`: hand off to install.sh with --bin-dir set to
+/// this binary's directory. exec'ing /bin/sh keeps HTTPS out of the binary.
+fn runUpdate(init: std.process.Init, args: []const []const u8, alloc: std.mem.Allocator) noreturn {
+    const update = switch (cli_args.parseUpdate(alloc, args)) {
+        .help => {
+            showHelpPage(init, alloc, cli_args.update_help);
+            std.process.exit(0);
+        },
+        .err => |message| parseFatal(init, message, cli_args.update_usage),
+        .ok => |value| value,
+    };
+    const bin_dir = std.process.executableDirPathAlloc(init.io, alloc) catch
+        fatal("cannot find the directory that holds the kite binary", .{});
+    const argv = [_][]const u8{ "/bin/sh", "-c", update_script, "kite-update", cli_args.version, bin_dir, update.version orelse "" };
+    const err = std.process.replace(init.io, .{ .argv = &argv });
+    fatal("cannot run /bin/sh: {s}", .{@errorName(err)});
+}
+
 fn showHelpPage(init: std.process.Init, alloc: std.mem.Allocator, text: []const u8) void {
     if (term.detect(init.io, std.Io.File.stdout(), init.environ_map)) {
         term.color.enabled = true;
