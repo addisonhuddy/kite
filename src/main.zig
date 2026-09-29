@@ -850,20 +850,25 @@ fn runCluster(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     std.process.exit(0);
 }
 
-/// Print a help page, rendered with colours when stdout is a terminal.
 /// Run by /bin/sh as `sh -c update_script kite-update CURRENT BIN_DIR [TAG]`.
-/// An empty TAG means the latest release, skipped when it is CURRENT.
+/// An empty TAG means the latest release, skipped when it is CURRENT. The
+/// latest tag comes from the releases/latest redirect, which unlike
+/// api.github.com has no 60-requests-per-hour limit.
 const update_script =
     \\set -eu
     \\repo=addisonhuddy/kite
     \\current=v$1 bin_dir=$2 want=$3
-    \\if command -v curl >/dev/null 2>&1; then fetch() { curl -fsSL "$1"; }
-    \\elif command -v wget >/dev/null 2>&1; then fetch() { wget -qO- "$1"; }
+    \\if command -v curl >/dev/null 2>&1; then
+    \\    fetch() { curl -fsSL "$1"; }
+    \\    headers() { curl -fsSI "$1"; }
+    \\elif command -v wget >/dev/null 2>&1; then
+    \\    fetch() { wget -qO- "$1"; }
+    \\    headers() { wget -S --spider --max-redirect=0 "$1" 2>&1; }
     \\else echo "kite: curl or wget is required" >&2; exit 1
     \\fi
     \\if [ -z "$want" ]; then
-    \\    want=$(fetch "https://api.github.com/repos/$repo/releases/latest" |
-    \\        sed -n 's/^ *"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)
+    \\    want=$(headers "https://github.com/$repo/releases/latest" | tr -d '\r' |
+    \\        sed -n 's|^ *[Ll]ocation: .*/releases/tag/\([^ ]*\).*|\1|p' | head -n 1)
     \\    [ -n "$want" ] || {
     \\        echo "kite: could not look up the latest release; see https://github.com/$repo/releases" >&2
     \\        exit 1
@@ -899,6 +904,7 @@ fn runUpdate(init: std.process.Init, args: []const []const u8, alloc: std.mem.Al
     fatal("cannot run /bin/sh: {s}", .{@errorName(err)});
 }
 
+/// Print a help page, rendered with colours when stdout is a terminal.
 fn showHelpPage(init: std.process.Init, alloc: std.mem.Allocator, text: []const u8) void {
     if (term.detect(init.io, std.Io.File.stdout(), init.environ_map)) {
         term.color.enabled = true;
