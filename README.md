@@ -309,7 +309,7 @@ print the full pages.
 `kite topic` manages topics; a bare `kite topic` is `kite topic list`.
 
 ```sh
-kite topic list                  # one topic name per line, sorted
+kite topic list                  # aligned table on a terminal; one name per line when piped, sorted
 kite topic list -a               # include internal topics (__consumer_offsets)
 kite topic list --json | jq -r .name
 #   -> {"name":..,"partitions":N,"replication_factor":N,"internal":BOOL}
@@ -559,7 +559,8 @@ command line (`@prod @dev`) are rejected rather than letting the last
 one win. Topics never start with `@`, so there is no ambiguity.
 
 `kite cluster list` lists the clusters, one per line and sorted, with
-` *` after the effective one (the same selection order as above), and
+` *` after the effective one (`* ` before it on a terminal; the same
+selection order as above), and
 a note on stderr naming the file it read (`-q` drops the note). It
 reads only the `clusters:` keys and never resolves a configuration or
 connects to a broker, so it works even while a cluster is still half
@@ -640,6 +641,13 @@ sources on stderr before connecting.
 - Exit 0 on success, 1 on any error (usage, configuration, connection,
   broker), 130 when a consume is stopped with Ctrl-C. Usage errors print
   `kite: MESSAGE` followed by a one-line `Try 'kite --help'` hint.
+
+On a terminal the output is dressed up for readability: the end-of-run
+summary becomes an aligned block, `kite topic list` prints an aligned
+table of partitions and replication factors, `kite cluster list` marks
+the current cluster with a leading `*`, and consume output colors the
+record keys, headers and JSON syntax. Pipes and files get the stable
+plain forms described above, byte for byte.
 
 Every run ends with a summary on stderr. Produce reports the record count,
 partitions used, bytes, elapsed time, message and byte rates, the last

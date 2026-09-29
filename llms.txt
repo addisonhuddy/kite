@@ -45,7 +45,7 @@ Produce is batched and idempotent by default. stdout is never written.
 
 ## Topics
 
-kite topic [list]                 one topic name per line, sorted; -a includes internal topics
+kite topic [list]                 one topic name per line, sorted (aligned table on a terminal); -a includes internal topics
 kite topic list --json            {"name","partitions","replication_factor","internal"} per line
 kite topic create [-p N] [-r N] [-s KEY=VALUE]... [--if-not-exists] TOPIC
 kite topic update [-p N] [--set KEY=VALUE]... [--unset KEY]... TOPIC   (partitions can only grow)
