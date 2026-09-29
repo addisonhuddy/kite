@@ -1,24 +1,47 @@
-# kite
+<div align="center">
+<pre>
+     /\    
+    /||\   
+   / || \  
+  /  ||  \ 
+ &lt;===++===&gt;
+  \  ||  / 
+   \ || /  
+    \||/   
+     \/    
+      \    
+       )-&gt;&lt;
+      (    
+       )-&gt;&lt;
+      (    
+</pre>
 
-[![CI](https://github.com/addisonhuddy/kite/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/addisonhuddy/kite/actions/workflows/ci.yml)
-[![Release](https://github.com/addisonhuddy/kite/actions/workflows/release.yml/badge.svg)](https://github.com/addisonhuddy/kite/actions/workflows/release.yml)
-[![Version](https://img.shields.io/github/v/release/addisonhuddy/kite?sort=semver&display_name=tag&label=version)](https://github.com/addisonhuddy/kite/releases/latest)
-[![License](https://img.shields.io/github/license/addisonhuddy/kite)](LICENSE)
+<h1>kite</h1>
 
-**kite is an ultra-lightweight Kafka CLI built for agents and sandboxes.**
-One binary under 700 KB, no JVM, no runtime, no daemon. stdin in, stdout out,
-non-zero exit on failure.
+<p>
+  <a href="https://github.com/addisonhuddy/kite/actions/workflows/ci.yml"><img src="https://github.com/addisonhuddy/kite/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/addisonhuddy/kite/actions/workflows/release.yml"><img src="https://github.com/addisonhuddy/kite/actions/workflows/release.yml/badge.svg" alt="Release"></a>
+  <a href="https://github.com/addisonhuddy/kite/releases/latest"><img src="https://img.shields.io/github/v/release/addisonhuddy/kite?sort=semver&display_name=tag&label=version" alt="Version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/addisonhuddy/kite" alt="License"></a>
+</p>
 
-> **What is kite?** kite is a single-binary command-line tool for Apache
-> Kafka that produces records from stdin, consumes records to stdout, and
-> manages topics. It is
-> a drop-in, dependency-free alternative to `kafka-console-producer.sh`,
-> `kafka-console-consumer.sh`, `kcat`/`kafkacat`, and `rpk topic produce|consume`
-> for scripts, CI jobs, containers, and AI agents. It is written in Zig, speaks
-> the Kafka wire protocol directly (PLAINTEXT, SSL, SASL/PLAIN, SCRAM-SHA-256,
-> SCRAM-SHA-512), works with any Kafka-compatible broker (Apache Kafka,
-> Confluent Cloud, Amazon MSK, WarpStream), and never hangs:
-> piped reads stop on idle by default.
+<p>
+  <strong>kite is an ultra-lightweight Kafka CLI built for agents and sandboxes.</strong><br>
+  One binary under 700 KB, no JVM, no runtime, no daemon. stdin in, stdout out,
+  non-zero exit on failure.
+</p>
+</div>
+
+**What is kite?** kite is a single-binary command-line tool for Apache
+Kafka that produces records from stdin, consumes records to stdout, and
+manages topics. It is
+a drop-in, dependency-free alternative to `kafka-console-producer.sh`,
+`kafka-console-consumer.sh`, `kcat`/`kafkacat`, and `rpk topic produce|consume`
+for scripts, CI jobs, containers, and AI agents. It is written in Zig, speaks
+the Kafka wire protocol directly (PLAINTEXT, SSL, SASL/PLAIN, SCRAM-SHA-256,
+SCRAM-SHA-512), works with any Kafka-compatible broker (Apache Kafka,
+Confluent Cloud, Amazon MSK, WarpStream), and never hangs:
+piped reads stop on idle by default.
 
 **Use kite when** you need to move records into or out of a Kafka
 topic — or list, create, delete, and update topics — from a shell, a
