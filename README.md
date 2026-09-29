@@ -679,11 +679,11 @@ and (for the JSON example only) [`jq`](https://jqlang.github.io/jq/):
 docker --version && curl --version | head -1 && jq --version
 ```
 
-Start Kafka (the image kite is tested against; bound to loopback only) and
-wait until it answers:
+Start Kafka with the [Apache Kafka native image](https://hub.docker.com/layers/apache/kafka-native/latest/images/sha256-e50f6ad232dc9e524134ef6babba8285ba8a793326cb27ca2efc20fa83e45a0b)
+(bound to loopback only) and wait until it answers:
 
 ```sh
-docker run -d --name kite-kafka -p 127.0.0.1:9092:9092 apache/kafka:4.0.0
+docker run -d --name kite-kafka -p 127.0.0.1:9092:9092 apache/kafka-native:latest
 
 until docker exec kite-kafka /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server localhost:9092 --list >/dev/null 2>&1; do
@@ -730,7 +730,7 @@ docker run -d --name kite-kafka -p 127.0.0.1:19092:9092 \
   -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
   -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:19092 \
   -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
-  apache/kafka:4.0.0
+  apache/kafka-native:latest
 
 until kite produce -q -b localhost:19092 probe </dev/null 2>/dev/null; do sleep 2; done
 ```
@@ -764,11 +764,11 @@ common=(
 docker run -d --name kafka-1 --network kafka-net -p 127.0.0.1:9092:9092 "${common[@]}" \
   -e KAFKA_NODE_ID=1 \
   -e KAFKA_ADVERTISED_LISTENERS=INTERNAL://kafka-1:29092,EXTERNAL://localhost:9092 \
-  apache/kafka:4.0.0
+  apache/kafka-native:latest
 docker run -d --name kafka-2 --network kafka-net -p 127.0.0.1:9093:9092 "${common[@]}" \
   -e KAFKA_NODE_ID=2 \
   -e KAFKA_ADVERTISED_LISTENERS=INTERNAL://kafka-2:29092,EXTERNAL://localhost:9093 \
-  apache/kafka:4.0.0
+  apache/kafka-native:latest
 
 kite consume -b localhost:9092,localhost:9093 -B events
 ```
