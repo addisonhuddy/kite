@@ -39,7 +39,7 @@ kite produce [OPTIONS] [@CLUSTER] TOPIC   one stdin line = one record
   value                         plain value
   key<TAB>value                 keyed record
   key<TAB>name: v<TAB>value     with headers
---json                          {"key":...,"value":...,"headers":{...}} per line; non-string value sent verbatim
+--json                          JSON records; non-string value sent verbatim; key_b64/value_b64 and array-header value_b64 decode padded standard base64
 --csv [--key COL]               RFC 4180 CSV rows -> JSON object values, optional key column
 -H 'name: value'                header on every record (repeatable)
 Produce is batched and idempotent by default. stdout is never written.
@@ -60,7 +60,7 @@ kite consume [OPTIONS] [@CLUSTER] TOPIC   records on stdout
 -n, --max N                     stop after N records
 -t, --idle DUR                  stop after DUR without records (3s, 500ms, 1m)
 -f, --follow                    never stop on idle
---json                          {"topic","partition","offset","timestamp","key","headers","value"} per line
+--json                          UTF-8 JSON per record; invalid UTF-8 key/value/header bytes use sibling *_b64 fields (standard padded base64), safe for jq
 Default when stdout is a pipe or file: stop after 5 s idle, so scripts never hang.
 
 ## Contract

@@ -343,9 +343,8 @@ fn produceSummary(cli: *client.Client, stats: *stats_mod.Stats, total: u64, npar
     }
 }
 
-/// Parse a `--json` input line: {"key":..,"value":..,"headers":{..}}. A
-/// non-string value is forwarded verbatim so JSON objects can be sent
-/// directly; headers may be an object or an array of {"key","value"}.
+/// Parse a `--json` input line. A non-string value is forwarded verbatim so
+/// JSON objects can be sent directly; headers may be an object or an array.
 fn jsonRecord(
     alloc: std.mem.Allocator,
     line: []const u8,
@@ -355,6 +354,10 @@ fn jsonRecord(
     var sc = json.Scanner{ .src = line, .alloc = alloc };
     var key: ?[]const u8 = null;
     var value: ?[]const u8 = null;
+    var key_seen = false;
+    var key_b64_seen = false;
+    var value_seen = false;
+    var value_b64_seen = false;
     var headers: std.ArrayListUnmanaged(protocol.Header) = .empty;
     headers.appendSlice(alloc, static_headers) catch fatal("out of memory", .{});
 
@@ -364,13 +367,33 @@ fn jsonRecord(
     var first = true;
     while (sc.nextMember(first) catch jsonFatal(lineno, shape)) |m| : (first = false) {
         if (std.mem.eql(u8, m.key, "value")) {
+            if (value_b64_seen) fatal("line {d}: use \"value\" or \"value_b64\", not both", .{lineno});
+            value_seen = true;
             value = m.value.bytes() orelse fatal("line {d}: \"value\" must not be null", .{lineno});
+        } else if (std.mem.eql(u8, m.key, "value_b64")) {
+            if (value_seen) fatal("line {d}: use \"value\" or \"value_b64\", not both", .{lineno});
+            value_b64_seen = true;
+            const encoded = switch (m.value) {
+                .string => |v| v,
+                else => fatal("line {d}: \"value_b64\" must be a string", .{lineno}),
+            };
+            value = decodeJsonBase64(alloc, encoded, "value_b64", lineno);
         } else if (std.mem.eql(u8, m.key, "key")) {
+            if (key_b64_seen) fatal("line {d}: use \"key\" or \"key_b64\", not both", .{lineno});
+            key_seen = true;
             key = switch (m.value) {
                 .null => null,
                 .string => |v| v,
                 else => fatal("line {d}: \"key\" must be a string or null", .{lineno}),
             };
+        } else if (std.mem.eql(u8, m.key, "key_b64")) {
+            if (key_seen) fatal("line {d}: use \"key\" or \"key_b64\", not both", .{lineno});
+            key_b64_seen = true;
+            const encoded = switch (m.value) {
+                .string => |v| v,
+                else => fatal("line {d}: \"key_b64\" must be a string", .{lineno}),
+            };
+            key = decodeJsonBase64(alloc, encoded, "key_b64", lineno);
         } else if (std.mem.eql(u8, m.key, "headers")) {
             switch (m.value) {
                 .null => {},
@@ -392,6 +415,8 @@ fn jsonRecord(
                         if (!is_entry) fatal("line {d}: header entries must be {{\"key\",\"value\"}} objects", .{lineno});
                         var hk: ?[]const u8 = null;
                         var hv: ?[]const u8 = null;
+                        var hv_seen = false;
+                        var hv_b64_seen = false;
                         var efirst = true;
                         while (hs.nextMember(efirst) catch jsonFatal(lineno, shape)) |e| : (efirst = false) {
                             if (std.mem.eql(u8, e.key, "key")) {
@@ -400,7 +425,17 @@ fn jsonRecord(
                                     else => fatal("line {d}: header \"key\" must be a string", .{lineno}),
                                 };
                             } else if (std.mem.eql(u8, e.key, "value")) {
+                                if (hv_b64_seen) fatal("line {d}: use \"value\" or \"value_b64\", not both", .{lineno});
+                                hv_seen = true;
                                 hv = jsonHeaderValue(e.value, lineno);
+                            } else if (std.mem.eql(u8, e.key, "value_b64")) {
+                                if (hv_seen) fatal("line {d}: use \"value\" or \"value_b64\", not both", .{lineno});
+                                hv_b64_seen = true;
+                                const encoded = switch (e.value) {
+                                    .string => |v| v,
+                                    else => fatal("line {d}: header \"value_b64\" must be a string", .{lineno}),
+                                };
+                                hv = decodeJsonBase64(alloc, encoded, "value_b64", lineno);
                             }
                         }
                         headers.append(alloc, .{
@@ -416,9 +451,14 @@ fn jsonRecord(
     if (!sc.atEnd()) jsonFatal(lineno, shape);
     return .{
         .key = key,
-        .value = value orelse fatal("line {d}: JSON object has no \"value\" field", .{lineno}),
+        .value = value orelse fatal("line {d}: JSON object has no \"value\" or \"value_b64\" field", .{lineno}),
         .headers = headers.items,
     };
+}
+
+fn decodeJsonBase64(alloc: std.mem.Allocator, encoded: []const u8, field: []const u8, lineno: u64) []const u8 {
+    return json.decodeBase64(alloc, encoded) catch
+        fatal("line {d}: \"{s}\" is not valid base64", .{ lineno, field });
 }
 
 fn jsonFatal(lineno: u64, shape: []const u8) noreturn {

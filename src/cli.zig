@@ -248,7 +248,8 @@ pub const produce_help =
     "Input format:\n" ++
     "  auto/tsv              value | key<TAB>value | key<TAB>h: v<TAB>value\n" ++
     "  value                 The whole line is the value; TAB is not special.\n" ++
-    "  json                  {\"key\":..,\"value\":..,\"headers\":{..}} per line.\n" ++
+    "  json                  JSON record per line; *_b64 fields decode standard\n" ++
+    "                        padded base64 (including array header values).\n" ++
     "\n" ++
     "Examples:\n" ++
     "  kite produce events < examples/data/lines.txt\n" ++
@@ -290,7 +291,9 @@ pub const consume_help =
     "  auto                  Value alone, or key<TAB>h: v<TAB>value when set.\n" ++
     "  value                 Only the record value.\n" ++
     "  tsv                   Always key<TAB>[h: v<TAB>]value (empty key field).\n" ++
-    "  json                  One object per record with full metadata.\n" ++
+    "  json                  Full-metadata UTF-8 JSON; invalid UTF-8 bytes use\n" ++
+    "                        sibling *_b64 fields (standard padded base64),\n" ++
+    "                        making output safe for jq.\n" ++
     "\n" ++
     "By default, start at the latest offset. When stdout is a terminal the read\n" ++
     "follows new records until Ctrl-C; when stdout is a pipe or file and none of\n" ++

@@ -492,23 +492,30 @@ JSON fields are strings.
 ### JSON records (`--json`, i.e. `--format json`)
 
 `kite consume --json` writes one object per record with full metadata, so bytes
-containing TABs or newlines and null-vs-empty distinctions survive:
+containing TABs or newlines and null-vs-empty distinctions survive. Valid
+UTF-8 fields remain strings; fields containing invalid UTF-8 bytes use a
+sibling `*_b64` field with standard padded Base64 instead. Header names remain
+plain strings. The output is valid UTF-8 JSON and safe to pass through `jq`:
 
 ```json
 {"topic":"events","partition":1,"offset":7,"timestamp":1789579403024,"key":null,"headers":[{"key":"h","value":"v"}],"value":"line one"}
+{"topic":"events","partition":1,"offset":8,"timestamp":1789579403025,"key_b64":"AP+A","headers":[{"key":"trace","value_b64":"gA=="}],"value_b64":"AYD+/w=="}
 ```
 
-`kite produce --json TOPIC` reads the same shape (only `value` is required):
+`kite produce --json TOPIC` reads the same shape (only `value` or `value_b64` is required):
 
 ```json
 {"key":"user-1","value":{"a":1},"headers":{"source":"import"}}
+{"key_b64":"AP+A","value_b64":"AYD+/w==","headers":[{"key":"trace","value_b64":"gA=="}]}
 ```
 
 A string `value` is sent as its decoded bytes; any other JSON value (object,
 array, number, boolean) is sent verbatim, so JSON payloads can be embedded
-without double encoding. `headers` may be an object or an array of
-`{"key","value"}`; `-H` headers are added to every record. Malformed lines
-fail with `kite: line N: ...`. `--json` and `--csv` are mutually exclusive.
+without double encoding. The `_b64` fields must be strings containing standard
+RFC 4648 Base64 with padding; they are decoded as record bytes. `headers` may
+be an object or an array of `{"key","value"}`; array entries also accept
+`value_b64`. `-H` headers are added to every record. Malformed lines fail with
+`kite: line N: ...`. `--json` and `--csv` are mutually exclusive.
 
 ## Configuration
 
