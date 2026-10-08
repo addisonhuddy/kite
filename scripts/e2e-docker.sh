@@ -91,12 +91,12 @@ destination_bytes=$(zig-out/bin/kite consume -B -n 1 --idle 3s --json "$B64_DST"
 echo "PASS json-base64 jq roundtrip"
 
 expect_json_produce_error() {
-    local input=$1 expected=$2 label=$3
+    local input=$1 expected=$2 label=$3 rc
     set +e
     printf '%s\n' "$input" | zig-out/bin/kite produce --json "$B64_SRC" >"$TMP/$label.out" 2>"$TMP/$label.err"
-    status=$?
+    rc=$?
     set -e
-    [ "$status" -eq 1 ] && grep -Fq "$expected" "$TMP/$label.err" || {
+    [ "$rc" -eq 1 ] && grep -Fq "$expected" "$TMP/$label.err" || {
         echo "FAIL $label: expected status 1 and '$expected'"
         cat "$TMP/$label.err"
         exit 1
