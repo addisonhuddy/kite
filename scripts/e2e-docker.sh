@@ -13,9 +13,11 @@ IMAGE=${KITE_KAFKA_IMAGE:-apache/kafka:4.0.0}
 NAME=kite-e2e-kafka
 TOPIC=kite-e2e
 TIMEOUT=${KITE_E2E_TIMEOUT:-120}
+TMP=$(mktemp -d)
 status=1
 
 cleanup() {
+    rm -rf "$TMP"
     if [ "${KITE_E2E_KEEP:-0}" = 1 ]; then
         echo "keeping container $NAME (KITE_E2E_KEEP=1)"
         return
@@ -72,6 +74,42 @@ else
 fi
 [ "$got" = "hello" ] || fail "quickstart: expected 'hello' from the README consume line, got '$got'"
 echo "PASS quickstart"
+
+# Invalid UTF-8 in record fields must survive a jq pass and a JSON produce.
+B64_SRC="kite-b64-src-$(date +%s)-$RANDOM"
+B64_DST="kite-b64-dst-$(date +%s)-$RANDOM"
+printf '%s\n' '{"key_b64":"gP9r","value_b64":"AYD+/w==","headers":[{"key":"trace","value_b64":"gGg="}]}' \
+    | zig-out/bin/kite produce --json "$B64_SRC"
+zig-out/bin/kite consume -B -n 1 --idle 3s --json "$B64_SRC" 2>/dev/null \
+    | jq -c . \
+    | zig-out/bin/kite produce --json "$B64_DST"
+source_bytes=$(zig-out/bin/kite consume -B -n 1 --idle 3s --json "$B64_SRC" 2>/dev/null \
+    | jq -c '[.key_b64,.headers,.value_b64]')
+destination_bytes=$(zig-out/bin/kite consume -B -n 1 --idle 3s --json "$B64_DST" 2>/dev/null \
+    | jq -c '[.key_b64,.headers,.value_b64]')
+[ "$destination_bytes" = "$source_bytes" ] || fail "json-base64: bytes changed across consume | jq | produce"
+echo "PASS json-base64 jq roundtrip"
+
+expect_json_produce_error() {
+    local input=$1 expected=$2 label=$3
+    set +e
+    printf '%s\n' "$input" | zig-out/bin/kite produce --json "$B64_SRC" >"$TMP/$label.out" 2>"$TMP/$label.err"
+    status=$?
+    set -e
+    [ "$status" -eq 1 ] && grep -Fq "$expected" "$TMP/$label.err" || {
+        echo "FAIL $label: expected status 1 and '$expected'"
+        cat "$TMP/$label.err"
+        exit 1
+    }
+}
+expect_json_produce_error '{"value_b64":"!!!!"}' 'line 1: "value_b64" is not valid base64' invalid-value-base64
+expect_json_produce_error '{"key_b64":"????","value":"x"}' 'line 1: "key_b64" is not valid base64' invalid-key-base64
+expect_json_produce_error '{"value":"x","value_b64":"eA=="}' 'line 1: use "value" or "value_b64", not both' conflicting-value-fields
+expect_json_produce_error '{"key":"k","key_b64":"aw==","value":"x"}' 'line 1: use "key" or "key_b64", not both' conflicting-key-fields
+expect_json_produce_error '{"value":"x","headers":[{"key":"h","value":"x","value_b64":"eA=="}]}' \
+    'line 1: use "value" or "value_b64", not both' conflicting-header-fields
+expect_json_produce_error '{"key":"k"}' 'JSON object has no "value" or "value_b64" field' missing-json-value
+echo "PASS json-base64 input errors"
 
 # Stopping bounds: `-n 1` on an empty topic bounds records, not time, so it
 # must still be running after 3s; `-n 1 --idle 500ms` must stop on its own.

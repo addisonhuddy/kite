@@ -383,20 +383,41 @@ const RecordSink = struct {
 fn writeJsonRecord(w: *std.Io.Writer, topic: []const u8, pidx: i32, offset: i64, ts: i64, rec: protocol.Record) !void {
     try w.writeAll("{\"topic\":");
     try json.writeString(w, topic);
-    try w.print(",\"partition\":{d},\"offset\":{d},\"timestamp\":{d},\"key\":", .{ pidx, offset, ts });
-    if (rec.key) |key| try json.writeString(w, key) else try w.writeAll("null");
+    try w.print(",\"partition\":{d},\"offset\":{d},\"timestamp\":{d},", .{ pidx, offset, ts });
+    if (rec.key) |key| {
+        try writeJsonBytesField(w, "key", "key_b64", key);
+    } else {
+        try w.writeAll("\"key\":null");
+    }
     try w.writeAll(",\"headers\":[");
     for (rec.headers, 0..) |header, i| {
         if (i > 0) try w.writeByte(',');
         try w.writeAll("{\"key\":");
         try json.writeString(w, header.key);
-        try w.writeAll(",\"value\":");
-        if (header.value) |value| try json.writeString(w, value) else try w.writeAll("null");
+        if (header.value) |value| {
+            try w.writeByte(',');
+            try writeJsonBytesField(w, "value", "value_b64", value);
+        } else {
+            try w.writeAll(",\"value\":null");
+        }
         try w.writeByte('}');
     }
-    try w.writeAll("],\"value\":");
-    try json.writeString(w, rec.value);
+    try w.writeAll("],");
+    try writeJsonBytesField(w, "value", "value_b64", rec.value);
     try w.writeByte('}');
+}
+
+fn writeJsonBytesField(w: *std.Io.Writer, plain_name: []const u8, b64_name: []const u8, bytes: []const u8) !void {
+    if (std.unicode.utf8ValidateSlice(bytes)) {
+        try json.writeString(w, plain_name);
+        try w.writeAll(":");
+        try json.writeString(w, bytes);
+    } else {
+        try w.writeByte('"');
+        try w.writeAll(b64_name);
+        try w.writeAll("\":");
+        try json.writeBase64String(w, bytes);
+    }
 }
 
 /// key<TAB>[h: v<TAB>]*value — the shape `auto` and `tsv` share.
@@ -514,6 +535,36 @@ test "json record output without key or headers" {
     try writeJsonRecord(&w, "t", 0, 0, -1, .{ .value = "x" });
     try std.testing.expectEqualStrings(
         "{\"topic\":\"t\",\"partition\":0,\"offset\":0,\"timestamp\":-1,\"key\":null,\"headers\":[],\"value\":\"x\"}",
+        w.buffered(),
+    );
+}
+
+test "json record output base64-encodes binary fields" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const headers = [_]protocol.Header{.{ .key = "h", .value = &.{0x80} }};
+    try writeJsonRecord(&w, "t", 0, 1, 2, .{
+        .key = &.{ 0, 0xff, 0x80 },
+        .value = &.{ 1, 0x80, 0xfe, 0xff },
+        .headers = &headers,
+    });
+    try std.testing.expectEqualStrings(
+        "{\"topic\":\"t\",\"partition\":0,\"offset\":1,\"timestamp\":2,\"key_b64\":\"AP+A\",\"headers\":[{\"key\":\"h\",\"value_b64\":\"gA==\"}],\"value_b64\":\"AYD+/w==\"}",
+        w.buffered(),
+    );
+}
+
+test "json record output keeps valid UTF-8 and control bytes plain" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const headers = [_]protocol.Header{.{ .key = "h", .value = "é😀\x01\t\n" }};
+    try writeJsonRecord(&w, "t", 0, 1, 2, .{
+        .key = "é😀",
+        .value = "é😀\x01\t\n",
+        .headers = &headers,
+    });
+    try std.testing.expectEqualStrings(
+        "{\"topic\":\"t\",\"partition\":0,\"offset\":1,\"timestamp\":2,\"key\":\"é😀\",\"headers\":[{\"key\":\"h\",\"value\":\"é😀\\u0001\\t\\n\"}],\"value\":\"é😀\\u0001\\t\\n\"}",
         w.buffered(),
     );
 }

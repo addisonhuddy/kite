@@ -5,7 +5,7 @@
 const std = @import("std");
 
 /// Write `s` as a JSON string literal, escaping quotes, backslashes and
-/// control characters. Bytes are passed through as-is (no UTF-8 validation).
+/// control characters.
 pub fn writeString(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('"');
     for (s) |c| {
@@ -20,6 +20,20 @@ pub fn writeString(w: *std.Io.Writer, s: []const u8) !void {
         }
     }
     try w.writeByte('"');
+}
+
+pub fn writeBase64String(w: *std.Io.Writer, bytes: []const u8) !void {
+    try w.writeByte('"');
+    try std.base64.standard.Encoder.encodeWriter(w, bytes);
+    try w.writeByte('"');
+}
+
+pub fn decodeBase64(alloc: std.mem.Allocator, encoded: []const u8) error{ InvalidBase64, OutOfMemory }![]u8 {
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.InvalidBase64;
+    const decoded = alloc.alloc(u8, decoded_len) catch return error.OutOfMemory;
+    errdefer alloc.free(decoded);
+    std.base64.standard.Decoder.decode(decoded, encoded) catch return error.InvalidBase64;
+    return decoded;
 }
 
 pub const Error = error{ Malformed, OutOfMemory };
@@ -270,4 +284,14 @@ test "scanner: unescapes \\u sequences and rejects malformed input" {
         }
         try std.testing.expect(failed);
     }
+}
+
+test "standard padded base64 decoder preserves bytes" {
+    const original = [_]u8{ 0, 1, 0x7f, 0x80, 0xff };
+    const decoded = try decodeBase64(std.testing.allocator, "AAF/gP8=");
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualSlices(u8, &original, decoded);
+    try std.testing.expectError(error.InvalidBase64, decodeBase64(std.testing.allocator, "not base64"));
+    try std.testing.expectError(error.InvalidBase64, decodeBase64(std.testing.allocator, "AAF/gP8"));
+    try std.testing.expectError(error.InvalidBase64, decodeBase64(std.testing.allocator, "!!!!"));
 }
