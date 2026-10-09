@@ -70,12 +70,20 @@ Exit 0 success; 1 any error with one line "kite: MESSAGE"; 130 on Ctrl-C.
 No interactive prompts. No color unless a TTY (NO_COLOR / KITE_COLOR honored). No files written.
 -q suppresses summaries; -v adds connection/retry diagnostics; KITE_DEBUG=1 adds frame/TLS traces.
 
+## Schema Registry (wing)
+
+wing is a separate CLI for Confluent Schema Registry and JSON Schema; kite itself never connects to the Registry.
+Pipe `wing write TOPIC` before `kite produce --json TOPIC` to validate and add the schema header, or `kite consume --json TOPIC | wing read` to decode and validate.
+Records remain kite `--json` JSONL; kite v0.4.0+ preserves binary schema headers through jq using `_b64` fields.
+Configure them separately: kite uses `BOOTSTRAP_SERVERS`; wing uses `SCHEMA_REGISTRY_URL` or `wing.yaml`. Avro and Protobuf are not supported by either.
+
 ## Examples
 
 printf 'hello\n' | kite produce -b localhost:9092 events
 kite consume -B -n 100 --idle 3s events
 kite consume -B --json events | jq -c .value
 kite consume -B --json src | kite produce --json dst
+kite consume -B -n 2 --idle 3s --json orders | wing read | jq -c .value
 kite produce --csv --key user_id events < users.csv
 tail -f app.log | kite produce logs
 

@@ -52,6 +52,11 @@ binary with no JVM, no librdkafka, and no daemon.
 commits, or ACLs, or a long-lived consumer group member; use your Kafka
 admin tooling or a client library for those.
 
+**Need schemas?** kite moves bytes and never talks to Schema Registry. Its
+companion [wing](https://github.com/addisonhuddy/wing) validates and decodes
+JSON Schema records from Confluent Schema Registry in the same pipe; see
+[Schema Registry with wing](#schema-registry-with-wing).
+
 ## Quickstart
 
 ![kite demo: create a topic, produce, consume, list, delete](examples/demo.gif)
@@ -154,6 +159,9 @@ the facts you need. They are stable across releases.
 - **Name:** `kite`. **Repository:** <https://github.com/addisonhuddy/kite>.
   **License:** Apache-2.0. **Language:** Zig. **Platforms:** Linux
   x86_64/aarch64, macOS x86_64/arm64.
+- **Schemas:** kite does not speak Schema Registry; pipe through
+  [wing](https://github.com/addisonhuddy/wing) (`kite consume --json T | wing read`,
+  `wing write T | kite produce --json T`).
 - **Install (non-interactive, no sudo prompt when `/usr/local/bin` is
   writable):**
   `curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh`
@@ -190,7 +198,8 @@ metadata. `kite topic list|create|update|delete` manages topics (delete needs
 -y when not on a terminal). Configure with BOOTSTRAP_SERVERS (and SASL_*/SECURITY_PROTOCOL) or
 -b HOST:PORT. Exit 0 ok, 1 error (message on stderr). A piped consume with
 no -n/--idle/-f stops after 5s idle; pass -n and --idle together for a
-bounded read.
+bounded read. For Confluent Schema Registry JSON Schema, pipe records through
+wing: `kite consume --json TOPIC | wing read` or `wing write TOPIC | kite produce --json TOPIC`.
 ```
 
 A machine-readable summary also lives in [`llms.txt`](llms.txt).
@@ -415,6 +424,60 @@ kite topic delete -y events
 
 The consumer output is in the same textual shape accepted by the producer,
 subject to the format boundaries described below.
+
+## Schema Registry with wing
+
+kite moves Kafka records; [wing](https://github.com/addisonhuddy/wing) handles
+Confluent Schema Registry and JSON Schema validation. Put `wing write TOPIC`
+before `kite produce --json TOPIC`, and `wing read` after `kite consume
+--json TOPIC`; records stay in kite's JSONL format, and kite v0.4.0+ keeps
+the schema header safe through jq. kite never connects to the Registry or
+reads `kite.yaml` for wing: configure Kafka with `BOOTSTRAP_SERVERS` and the
+Registry separately with `SCHEMA_REGISTRY_URL` or `wing.yaml`.
+
+You need Kafka at `localhost:9092`, Schema Registry at `localhost:8081` (see
+[the Docker commands](examples/wing/README.md#0-start-kafka-and-schema-registry)),
+and [`jq`](https://jqlang.github.io/jq/). Install kite separately if it is
+not already on your `PATH`.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/addisonhuddy/wing/main/install.sh | sh
+export BOOTSTRAP_SERVERS=localhost:9092 SCHEMA_REGISTRY_URL=http://localhost:8081
+wing push orders < examples/wing/orders.schema.json  # register orders-value
+# prints: e3fa41fd-c752-b2fa-c42a-0423d3c4155d
+wing write orders < examples/wing/orders.jsonl | kite produce --json orders  # validate, add schema header, produce
+# prints: 2 record(s) produced to 'orders' across 1 of 1 partition(s)
+kite consume -B -n 2 --idle 3s --json orders | wing read | jq -c .value  # prints: {"order_id":1,"customer":"Ada","total":12.5}
+# prints: {"order_id":2,"customer":"Grace","total":21}
+```
+
+An invalid record exits 2 from `wing write`; its empty stdout means kite
+receives no record (use `pipefail` to surface the upstream exit from a
+pipeline):
+
+```sh
+set -o pipefail
+printf '%s\n' '{"order_id":"three","customer":"Lin","total":5}' | wing write orders | kite produce --json orders
+# wing write: line 1: /order_id: expected integer, got string [/properties/order_id/type]
+# wing write: 0 written, 0 fitted
+# prints: 0 record(s) produced to 'orders' across 0 of 1 partition(s)
+# exit 2
+```
+
+`wing write` is streaming: this single invalid record sends nothing, but
+valid lines earlier in a mixed input may already have been produced before
+a later line is rejected.
+
+- CSV fields arrive as strings; first import them to a raw topic, then fit
+  them to the `orders` schema before producing validated records:
+  `kite produce --csv orders-raw < examples/wing/orders.csv`, then
+  `kite consume -B -n 2 --idle 3s --json orders-raw | wing write orders --fit | kite produce --json orders`.
+- Edit decoded values with jq, copy the schema to give the destination its
+  own `orders-copy-value` subject, then validate and produce the changes:
+  `wing get orders --meta | wing push orders-copy --meta`, then
+  `kite consume -B -n 2 --idle 3s --json orders | wing read | jq -c '.value.total *= 2' | wing write orders-copy | kite produce --json orders-copy`.
+
+See the full walkthrough in [examples/wing/](examples/wing).
 
 ## Consuming
 
@@ -921,6 +984,13 @@ Yes. Any broker that speaks the Kafka protocol works. Set
 `SECURITY_PROTOCOL=SASL_SSL`, `SASL_MECHANISM=PLAIN` (or `SCRAM-SHA-256` /
 `SCRAM-SHA-512`), `SASL_USERNAME`, and `SASL_PASSWORD`, or copy a template
 from [`examples/config/`](examples/config).
+
+**Does kite support Schema Registry, Avro, or JSON Schema?**
+kite itself is schema-agnostic and does not connect to Schema Registry. For
+Confluent Schema Registry with JSON Schema, use
+[wing](https://github.com/addisonhuddy/wing) in the pipe, for example
+`kite consume --json orders | wing read`. Avro and Protobuf are not supported
+by either kite or wing.
 
 **Does kite need Java, the JVM, librdkafka, Docker, or Python?**
 No. kite is one static binary with no runtime dependencies.
