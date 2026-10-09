@@ -431,9 +431,9 @@ kite moves Kafka records; [wing](https://github.com/addisonhuddy/wing) handles
 Confluent Schema Registry and JSON Schema validation. Put `wing write TOPIC`
 before `kite produce --json TOPIC`, and `wing read` after `kite consume
 --json TOPIC`; records stay in kite's JSONL format, and kite v0.4.0+ keeps
-the schema header safe through jq. kite never connects to the Registry or
-reads `kite.yaml` for wing: configure Kafka with `BOOTSTRAP_SERVERS` and the
-Registry separately with `SCHEMA_REGISTRY_URL` or `wing.yaml`.
+the schema header safe through jq. kite never connects to the Registry, and
+wing never reads `kite.yaml`: configure Kafka with `BOOTSTRAP_SERVERS` (or
+`kite.yaml`) and the Registry with `SCHEMA_REGISTRY_URL` (or `wing.yaml`).
 
 You need Kafka at `localhost:9092`, Schema Registry at `localhost:8081` (see
 [the Docker commands](examples/wing/README.md#0-start-kafka-and-schema-registry)),
@@ -444,10 +444,11 @@ not already on your `PATH`.
 curl -fsSL https://raw.githubusercontent.com/addisonhuddy/wing/main/install.sh | sh
 export BOOTSTRAP_SERVERS=localhost:9092 SCHEMA_REGISTRY_URL=http://localhost:8081
 wing push orders < examples/wing/orders.schema.json  # register orders-value
-# prints: e3fa41fd-c752-b2fa-c42a-0423d3c4155d
+# prints the new schema GUID
 wing write orders < examples/wing/orders.jsonl | kite produce --json orders  # validate, add schema header, produce
 # prints: 2 record(s) produced to 'orders' across 1 of 1 partition(s)
-kite consume -B -n 2 --idle 3s --json orders | wing read | jq -c .value  # prints: {"order_id":1,"customer":"Ada","total":12.5}
+kite consume -B -n 2 --idle 3s --json orders | wing read | jq -c .value
+# prints: {"order_id":1,"customer":"Ada","total":12.5}
 # prints: {"order_id":2,"customer":"Grace","total":21}
 ```
 
