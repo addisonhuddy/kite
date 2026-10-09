@@ -1,4 +1,6 @@
 #!/bin/sh
+# Exercise the kite + wing JSON Schema walkthrough and assert decoded values.
+# Requires Kafka :9092, SR :8081, kite/wing on PATH (or KITE/WING); run from repo root.
 set -eu
 
 KITE=${KITE:-kite}
@@ -28,18 +30,15 @@ printf 'PASS schema registration\n'
   "$KITE" produce --json orders >/dev/null 2>&1
 printf 'PASS validated produce\n'
 
-mkfifo "$tmp_dir/bad-pipe"
-"$KITE" produce --json orders < "$tmp_dir/bad-pipe" >/dev/null 2>&1 &
-producer_pid=$!
 set +e
 "$WING" write orders < examples/wing/orders-bad.jsonl \
-  > "$tmp_dir/bad-pipe" 2> "$tmp_dir/bad-error"
+  > "$tmp_dir/bad.out" 2> "$tmp_dir/bad.err"
 bad_status=$?
 set -e
-wait "$producer_pid"
 [ "$bad_status" -eq 2 ]
-grep -Fq '/order_id: expected integer, got string' "$tmp_dir/bad-error"
-cat "$tmp_dir/bad-error" >&2
+[ ! -s "$tmp_dir/bad.out" ]
+grep -Fq '/order_id: expected integer, got string' "$tmp_dir/bad.err"
+cat "$tmp_dir/bad.err" >&2
 printf 'PASS bad record rejected (exit %s)\n' "$bad_status"
 
 "$KITE" consume -B -n 3 --idle 1s --json orders > "$tmp_dir/orders.jsonl"
