@@ -43,7 +43,6 @@ independently.
 ```sh
 curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh
 curl -fsSL https://raw.githubusercontent.com/addisonhuddy/wing/main/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
 export BOOTSTRAP_SERVERS=localhost:9092 SCHEMA_REGISTRY_URL=http://localhost:8081
 kite --version  # kite 0.4.0 or later
 wing -V  # wing 0.1.0 or later
