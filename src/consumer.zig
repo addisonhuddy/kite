@@ -84,8 +84,8 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
 
     var count: u64 = 0;
     var last_record = std.Io.Timestamp.now(c.io, .awake);
-    var retry_attempts: u8 = 0;
-    while (true) {
+    var retry: client.Retry = .{};
+    rounds: while (true) {
         if (opts.stop) |flag| if (flag.load(.acquire)) break;
         if (opts.max_records) |max| if (count >= max) break;
         if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
@@ -109,28 +109,27 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
 
             fetchLeader(c, round_alloc, opts, parts.items, out, &scratch, &count, &progress) catch |err| switch (err) {
                 error.RetryFetch => {
-                    retry_attempts += 1;
-                    if (retry_attempts >= 6) {
-                        c.setErr("fetch to broker {d}: giving up after 6 attempts", .{cursor.leader});
+                    c.dropNode(cursor.leader);
+                    if (!retry.pause(c)) {
+                        c.setErr("fetch to broker {d}: recovery timed out after 30s", .{cursor.leader});
                         return error.FetchFailed;
                     }
-                    c.dropConn(client.Client.connKey(cursor.leader, 0));
-                    c.sleep(@min(@as(u64, 100) << @intCast(retry_attempts - 1), 3000));
                     _ = c.refreshMetadata(opts.topic) catch {};
                     for (cursors[0..cursor_count]) |*refresh| {
-                        refresh.leader = c.partitionLeader(refresh.pidx) orelse refresh.leader;
+                        refresh.leader = c.partitionLeader(refresh.pidx) orelse -1;
                     }
-                    continue;
+                    try out.flush();
+                    if (progress) last_record = std.Io.Timestamp.now(c.io, .awake);
+                    continue :rounds;
                 },
                 else => {
-                    retry_attempts = 0;
                     return err;
                 },
             };
-            retry_attempts = 0;
             if (opts.max_records) |max| if (count >= max) break;
         }
         leader_seen.deinit(round_alloc);
+        retry = .{};
         try out.flush();
         if (opts.stats) |s| s.maybeRender();
         if (progress) last_record = std.Io.Timestamp.now(c.io, .awake);
@@ -145,7 +144,31 @@ fn listOffsets(
     cursors: []Cursor,
     start: Options.Start,
 ) !void {
-    const alloc = arena.allocator();
+    var retry: client.Retry = .{};
+    while (true) {
+        listOffsetsOnce(c, arena.allocator(), topic, cursors, start) catch |err| {
+            if (err != error.RetryFetch) return err;
+            for (cursors) |cursor| c.dropNode(cursor.leader);
+            if (!retry.pause(c)) {
+                c.setErr("list offsets: recovery timed out after 30s", .{});
+                return error.FetchFailed;
+            }
+            _ = c.refreshMetadata(topic) catch {};
+            for (cursors) |*cursor| cursor.leader = c.partitionLeader(cursor.pidx) orelse -1;
+            _ = arena.reset(.retain_capacity);
+            continue;
+        };
+        return;
+    }
+}
+
+fn listOffsetsOnce(
+    c: *client.Client,
+    alloc: std.mem.Allocator,
+    topic: []const u8,
+    cursors: []Cursor,
+    start: Options.Start,
+) !void {
     var leaders: std.AutoHashMapUnmanaged(i32, void) = .empty;
     for (cursors) |cursor| try leaders.put(alloc, cursor.leader, {});
 
@@ -189,7 +212,7 @@ fn listOffsetsLeader(
             try e.tagBuffer();
         }
     }.f;
-    const conn = try c.connFor(parts[0].cursor.leader, client.Client.connKey(parts[0].cursor.leader, 0));
+    const conn = c.connFor(parts[0].cursor.leader, client.Client.connKey(parts[0].cursor.leader, 0)) catch return error.RetryFetch;
     const resp = c.sendRequestAlloc(alloc, conn, protocol.api_key.list_offsets, protocol.version.list_offsets, Ctx{
         .topic = topic,
         .parts = parts,
@@ -211,6 +234,7 @@ fn listOffsetsLeader(
             _ = try d.i32v();
             try d.tagBuffer();
             if (code != .none) {
+                if (code.retriable()) return error.RetryFetch;
                 c.setErr("list offsets partition {d}: {s}", .{ pidx, code.name() });
                 return error.FetchFailed;
             }

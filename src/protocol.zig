@@ -50,6 +50,7 @@ pub const ErrorCode = enum(i16) {
     stale_metadata = 11,
     network_exception = 13,
     group_load_in_progress = 14,
+    coordinator_not_available = 15,
     not_coordinator = 16,
     invalid_topic_exception = 17,
     not_enough_replicas = 19,
@@ -96,6 +97,7 @@ pub const ErrorCode = enum(i16) {
             .stale_metadata => "STALE_METADATA",
             .network_exception => "NETWORK_EXCEPTION",
             .group_load_in_progress => "GROUP_LOAD_IN_PROGRESS",
+            .coordinator_not_available => "COORDINATOR_NOT_AVAILABLE",
             .not_coordinator => "NOT_COORDINATOR",
             .invalid_topic_exception => "INVALID_TOPIC_EXCEPTION",
             .not_enough_replicas => "NOT_ENOUGH_REPLICAS",
@@ -144,6 +146,7 @@ pub const ErrorCode = enum(i16) {
             .unknown_leader_epoch,
             .stale_metadata,
             .group_load_in_progress,
+            .coordinator_not_available,
             .not_coordinator,
             => true,
             else => false,
@@ -871,6 +874,15 @@ test "tagBuffer skip" {
     var d = Decoder.init(e.written());
     try d.tagBuffer();
     try std.testing.expectEqual(@as(i16, 42), try d.i16v());
+}
+
+test "election and coordinator errors are retriable" {
+    for ([_]ErrorCode{ .leader_not_available, .not_leader_or_follower, .network_exception, .group_load_in_progress, .coordinator_not_available, .not_coordinator }) |code| {
+        try std.testing.expect(code.retriable());
+    }
+    try std.testing.expect(!ErrorCode.topic_authorization_failed.retriable());
+    try std.testing.expect(!ErrorCode.out_of_order_sequence_number.retriable());
+    try std.testing.expectEqualStrings("COORDINATOR_NOT_AVAILABLE", ErrorCode.coordinator_not_available.name());
 }
 
 test "record batch smoke" {

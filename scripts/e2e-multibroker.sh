@@ -207,15 +207,22 @@ run 03-produce-election produce_fault 03-produce-election all
 restore
 
 consume_fault() {
-    local label=04-consume-election t=mb-consume victim producer consumer rc=0
+    local label=04-consume-election t=mb-consume victim consumer rc=0
     create "$t" 2>"$LOG/$label-create.err"
+    fixture 200000 | cli produce "$t" 2>"$LOG/$label-produce.err"
     victim=$(leader "$t")
-    cli consume -B -n 200000 --idle 30s --json "$t" >"$LOG/$label.jsonl" 2>"$LOG/$label-consume.err" & consumer=$!
-    (fixture 200000 0.1 | cli produce "$t" 2>"$LOG/$label-produce.err") & producer=$!
+    # Backpressure keeps the consumer active until the fault is injected.
+    (cli consume -B -n 200000 --idle 30s --json "$t" 2>"$LOG/$label-consume.err" |
+        python3 -c 'import sys,time
+with open(sys.argv[1], "w") as out:
+    for i,line in enumerate(sys.stdin,1):
+        out.write(line)
+        if i % 1000 == 0:
+            out.flush()
+            time.sleep(0.02)' "$LOG/$label.jsonl") & consumer=$!
     wait_records "$LOG/$label.jsonl" "$consumer"
-    kill -0 "$producer"
+    kill -0 "$consumer"
     docker stop -t 1 "$NAME-$victim"
-    wait "$producer" || rc=$?
     wait "$consumer" || rc=$?
     verify "$LOG/$label.jsonl" 200000 || rc=1
     [ "$rc" -eq 0 ]
