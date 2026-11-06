@@ -31,7 +31,21 @@ pub const Partition = struct { index: i32, leader: i32 };
 
 const ApiRange = struct { min: i16, max: i16 };
 
-const max_attempts = 6;
+pub const Retry = struct {
+    started: ?std.Io.Timestamp = null,
+    backoff_ms: u64 = 100,
+
+    pub fn pause(r: *Retry, c: *Client) bool {
+        const now = std.Io.Timestamp.now(c.io, .awake);
+        const start = r.started orelse now;
+        r.started = start;
+        const elapsed = start.durationTo(now).toMilliseconds();
+        if (elapsed >= 30000) return false;
+        c.sleep(@min(r.backoff_ms, @as(u64, @intCast(30000 - elapsed))));
+        r.backoff_ms = @min(r.backoff_ms * 2, 3000);
+        return start.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds() < 30000;
+    }
+};
 
 pub const Client = struct {
     alloc: std.mem.Allocator,
@@ -482,7 +496,7 @@ pub const Client = struct {
             var p: i64 = 0;
             c.partitions.clearRetainingCapacity();
             while (p < nparts) : (p += 1) {
-                _ = try d.i16v(); // partition error
+                const part_error = try d.i16v();
                 const pidx = try d.i32v();
                 const leader = try d.i32v();
                 _ = try d.i32v(); // leader epoch
@@ -490,7 +504,7 @@ pub const Client = struct {
                 try d.skipCompactI32Array(); // isr
                 try d.skipCompactI32Array(); // offline replicas
                 try d.tagBuffer();
-                try c.partitions.append(c.alloc, .{ .index = pidx, .leader = leader });
+                try c.partitions.append(c.alloc, .{ .index = pidx, .leader = if (part_error == 0) leader else -1 });
             }
             _ = try d.i32v(); // topic_authorized_operations
             try d.tagBuffer();
@@ -605,6 +619,11 @@ pub const Client = struct {
         var attempt: usize = 0;
         while (attempt < 2) : (attempt += 1) {
             const resp = c.sendRequest(conn, protocol.api_key.create_topics, protocol.version.create_topics, Ctx{ .t = topic, .spec = spec }, body) catch {
+                if (attempt == 0 and c.control != null and conn != c.control.?) {
+                    c.dropNode(c.controller_id);
+                    conn = c.control.?;
+                    continue;
+                }
                 c.setErr("CreateTopics request failed", .{});
                 return error.AdminFailed;
             };
@@ -699,35 +718,48 @@ pub const Client = struct {
 
     fn adminRequest(c: *Client, r: AdminReq) !void {
         try c.requireVersion(r.key, r.ver, r.api);
-        const conn = try c.adminConn();
-        const resp = c.sendRequest(conn, r.key, r.ver, r, adminReqBody) catch {
-            c.setErr("{s} request failed", .{r.api});
-            return error.AdminFailed;
-        };
-        defer c.alloc.free(resp.frame);
-        var d = Decoder.init(resp.body);
-        _ = try d.i32v(); // throttle
-        const n = try d.compactArrayLen();
-        if (n < 1) {
-            c.setErr("{s}: empty results array", .{r.api});
-            return error.AdminFailed;
+        var conn = try c.adminConn();
+        var attempt: usize = 0;
+        while (attempt < 2) : (attempt += 1) {
+            const resp = c.sendRequest(conn, r.key, r.ver, r, adminReqBody) catch {
+                if (attempt == 0 and c.control != null and conn != c.control.?) {
+                    c.dropNode(c.controller_id);
+                    conn = c.control.?;
+                    continue;
+                }
+                c.setErr("{s} request failed", .{r.api});
+                return error.AdminFailed;
+            };
+            defer c.alloc.free(resp.frame);
+            var d = Decoder.init(resp.body);
+            _ = try d.i32v(); // throttle
+            const n = try d.compactArrayLen();
+            if (n < 1) {
+                c.setErr("{s}: empty results array", .{r.api});
+                return error.AdminFailed;
+            }
+            var code: protocol.ErrorCode = undefined;
+            var msg: ?[]const u8 = null;
+            if (r.key == protocol.api_key.incremental_alter_configs) {
+                code = @enumFromInt(try d.i16v());
+                msg = try d.compactString();
+                _ = try d.i8v(); // resource_type
+                _ = try d.compactString(); // resource_name
+            } else {
+                _ = try d.compactString(); // name
+                if (r.key == protocol.api_key.delete_topics)
+                    try d.skip(16); // topic_id uuid
+                code = @enumFromInt(try d.i16v());
+                msg = try d.compactString();
+            }
+            try d.tagBuffer();
+            if (code == .not_controller and attempt == 0 and c.control != null and conn != c.control.?) {
+                conn = c.control.?;
+                continue;
+            }
+            try c.adminResult(r.api, r.t, code, msg);
+            return;
         }
-        var code: protocol.ErrorCode = undefined;
-        var msg: ?[]const u8 = null;
-        if (r.key == protocol.api_key.incremental_alter_configs) {
-            code = @enumFromInt(try d.i16v());
-            msg = try d.compactString();
-            _ = try d.i8v(); // resource_type
-            _ = try d.compactString(); // resource_name
-        } else {
-            _ = try d.compactString(); // name
-            if (r.key == protocol.api_key.delete_topics)
-                try d.skip(16); // topic_id uuid
-            code = @enumFromInt(try d.i16v());
-            msg = try d.compactString();
-        }
-        try d.tagBuffer();
-        try c.adminResult(r.api, r.t, code, msg);
     }
 
     /// Delete one topic (DeleteTopics v6).
@@ -793,7 +825,8 @@ pub const Client = struct {
     fn metadataRequest(c: *Client, t: ?[]const u8) !Resp {
         var reconnected = false;
         while (true) {
-            const conn = c.control orelse return error.MetadataFailed;
+            if (c.control == null) try c.reconnectControl();
+            const conn = c.control.?;
             return c.sendRequest(conn, protocol.api_key.metadata, protocol.version.metadata, t, metadataBody) catch {
                 if (reconnected) {
                     c.setErr("metadata request failed", .{});
@@ -872,6 +905,8 @@ pub const Client = struct {
     /// Decode the Metadata broker array into c.brokers.
     fn decodeBrokers(c: *Client, d: *Decoder) !void {
         const nbrokers = try d.compactArrayLen();
+        var old = c.brokers.valueIterator();
+        while (old.next()) |addr| c.alloc.free(addr.host);
         c.brokers.clearRetainingCapacity();
         var i: i64 = 0;
         while (i < nbrokers) : (i += 1) {
@@ -889,7 +924,6 @@ pub const Client = struct {
     /// Ask the broker for a producer id + epoch (idempotent produce). Sends
     /// InitProducerId v4 on the control connection; retries transient errors.
     fn initProducerId(c: *Client) !void {
-        const conn = c.control orelse return error.MetadataFailed;
         if (!c.checkVersion(protocol.api_key.init_producer_id, protocol.version.init_producer_id)) {
             const r = c.api_ranges.get(protocol.api_key.init_producer_id);
             c.setErr(
@@ -908,11 +942,17 @@ pub const Client = struct {
                 try e.tagBuffer();
             }
         }.f;
-        var attempt: usize = 0;
-        var backoff_ms: u64 = 100;
-        while (attempt < 3) : (attempt += 1) {
+        var retry: Retry = .{};
+        while (true) {
+            if (c.control == null) c.reconnectControl() catch {
+                if (retry.pause(c)) continue;
+                return error.ProduceFailed;
+            };
+            const conn = c.control.?;
             const resp = c.sendRequest(conn, protocol.api_key.init_producer_id, protocol.version.init_producer_id, Ctx{}, body) catch {
                 c.setErr("InitProducerId request failed", .{});
+                c.reconnectControl() catch {};
+                if (retry.pause(c)) continue;
                 return error.ProduceFailed;
             };
             defer c.alloc.free(resp.frame);
@@ -928,12 +968,10 @@ pub const Client = struct {
                 c.vlog("idempotent producer: id={d} epoch={d}", .{ pid, epoch });
                 return;
             }
-            if (!code.retriable() or attempt == 2) {
+            if (!code.retriable() or !retry.pause(c)) {
                 c.setErr("InitProducerId: {s}", .{code.name()});
                 return error.ProduceFailed;
             }
-            c.sleep(backoff_ms);
-            backoff_ms = @min(backoff_ms * 2, 2000);
         }
     }
 
@@ -965,7 +1003,7 @@ pub const Client = struct {
     const conns_per_partition = 2;
 
     pub fn connKey(node: i32, slot: u32) u64 {
-        return (@as(u64, @intCast(node)) << 32) | slot;
+        return (@as(u64, @as(u32, @bitCast(node))) << 32) | slot;
     }
 
     /// Pick (and pin) the connection for partition `pidx`: if the partition
@@ -1065,18 +1103,20 @@ pub const Client = struct {
             if (c.connFor(claim.node, claim.key)) |conn| {
                 o.conn = conn;
                 o.corr = c.produceSend(conn, topic, o.pidx, o.batches) catch {
-                    c.dropConn(claim.key);
+                    c.dropNode(claim.node);
                     try c.outstanding.append(c.alloc, o);
                     continue;
                 };
                 o.sent = std.Io.Timestamp.now(c.io, .awake);
-            } else |_| {}
+            } else |_| {
+                c.dropNode(claim.node);
+            }
             try c.outstanding.append(c.alloc, o);
         }
     }
 
     /// Drain every outstanding ProduceResponse in send order, then retry
-    /// retriable partitions (backoff + metadata refresh) up to max_attempts.
+    /// retriable partitions (backoff + metadata refresh) for up to 30s.
     pub fn produceDrain(c: *Client, topic: []const u8) !void {
         return c.produceDrainUntil(topic, 0);
     }
@@ -1125,12 +1165,12 @@ pub const Client = struct {
             c.outstanding.items.len = rest;
         }
 
-        while (done < c.outstanding.items.len and c.drainStopActive(stop)) {
+        while (done < c.outstanding.items.len and (retry.items.len > 0 or c.drainStopActive(stop))) {
             const o = &c.outstanding.items[done];
             done += 1;
             c.outstanding_bytes -= o.bytes;
             c.releaseConn(o.pidx[0]);
-            if (o.corr >= 0) {
+            if (o.corr >= 0 and c.conns.contains(o.ckey)) {
                 var codes = std.AutoHashMapUnmanaged(i32, protocol.ErrorCode).empty;
                 defer codes.deinit(c.alloc);
                 if (c.produceRecv(o.conn, o.corr, &codes, o, null)) |_| {
@@ -1142,6 +1182,7 @@ pub const Client = struct {
                             // appended this batch — dedup success.
                             .none, .duplicate_sequence_number => {},
                             else => if (code.retriable()) {
+                                c.dropNode(o.node);
                                 try retry.append(c.alloc, .{ .pidx = pi, .batch = b, .count = count });
                             } else {
                                 c.produceErr(topic, pi, code, b.len);
@@ -1150,7 +1191,7 @@ pub const Client = struct {
                         }
                     }
                 } else |_| {
-                    c.dropConn(o.ckey);
+                    c.dropNode(o.node);
                     for (o.pidx, o.batches, o.counts) |pi, b, count|
                         try retry.append(c.alloc, .{ .pidx = pi, .batch = b, .count = count });
                 }
@@ -1160,29 +1201,39 @@ pub const Client = struct {
             }
         }
 
-        var attempt: usize = 0;
-        var backoff_ms: u64 = 100;
-        while (retry.items.len > 0 and attempt < max_attempts) : (attempt += 1) {
+        var budget: Retry = .{};
+        while (retry.items.len > 0 and budget.pause(c)) {
             c.produce_retries += retry.items.len;
-            c.vlog("retrying {d} partition(s) — attempt {d}/{d}, backoff {d}ms", .{ retry.items.len, attempt + 1, max_attempts, backoff_ms });
-            c.sleep(backoff_ms);
-            backoff_ms = @min(backoff_ms * 2, 3000);
-            _ = c.refreshMetadata(topic) catch {};
+            c.vlog("retrying {d} batch(es) after metadata refresh", .{retry.items.len});
+            c.refreshMetadata(topic) catch continue;
 
             const items = try retry.toOwnedSlice(c.alloc);
             defer c.alloc.free(items);
             for (items) |pp| {
+                // A later sequence must not pass an earlier failed batch.
+                var blocked = false;
+                for (retry.items) |pending| {
+                    if (pending.pidx == pp.pidx) {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if (blocked) {
+                    try retry.append(c.alloc, pp);
+                    continue;
+                }
                 const claim = c.claimConn(pp.pidx) catch {
                     try retry.append(c.alloc, pp);
                     continue;
                 };
                 const conn = c.connFor(claim.node, claim.key) catch {
+                    c.dropNode(claim.node);
                     c.releaseConn(pp.pidx);
                     try retry.append(c.alloc, pp);
                     continue;
                 };
                 const corr = c.produceSend(conn, topic, &.{pp.pidx}, &.{pp.batch}) catch {
-                    c.dropConn(claim.key);
+                    c.dropNode(claim.node);
                     c.releaseConn(pp.pidx);
                     try retry.append(c.alloc, pp);
                     continue;
@@ -1191,7 +1242,7 @@ pub const Client = struct {
                 var codes = std.AutoHashMapUnmanaged(i32, protocol.ErrorCode).empty;
                 defer codes.deinit(c.alloc);
                 c.produceRecv(conn, corr, &codes, null, pp.count) catch {
-                    c.dropConn(claim.key);
+                    c.dropNode(claim.node);
                     c.releaseConn(pp.pidx);
                     try retry.append(c.alloc, pp);
                     continue;
@@ -1201,6 +1252,7 @@ pub const Client = struct {
                 switch (code) {
                     .none, .duplicate_sequence_number => c.releaseConn(pp.pidx),
                     else => if (code.retriable()) {
+                        c.dropNode(claim.node);
                         c.releaseConn(pp.pidx);
                         try retry.append(c.alloc, pp);
                     } else {
@@ -1211,7 +1263,7 @@ pub const Client = struct {
             }
         }
         if (retry.items.len > 0) {
-            c.setErr("produce to {s}: giving up after {d} attempts", .{ topic, max_attempts });
+            c.setErr("produce to {s}: delivery timed out after 30s", .{topic});
             return error.ProduceFailed;
         }
     }
@@ -1231,17 +1283,24 @@ pub const Client = struct {
 
     pub fn partitionLeader(c: *Client, pidx: i32) ?i32 {
         for (c.partitions.items) |p|
-            if (p.index == pidx) return p.leader;
+            if (p.index == pidx) return if (p.leader >= 0) p.leader else null;
         return null;
     }
 
-    /// Drop the control connection (dead or unreachable socket) and rebuild
-    /// it through the configured bootstrap servers with the full handshake.
+    /// Rebuild control through discovered brokers, then configured bootstrap
+    /// servers, with the full handshake.
     fn reconnectControl(c: *Client) !void {
         if (c.control) |old| {
             old.close();
             c.alloc.destroy(old);
             c.control = null;
+        }
+        var brokers = c.brokers.valueIterator();
+        while (brokers.next()) |addr| {
+            const conn = c.connectOne(addr.host, addr.port) catch continue;
+            c.control = conn;
+            c.vlog("control connected {s}:{d}", .{ addr.host, addr.port });
+            return;
         }
         try c.bootstrap();
     }
@@ -1251,6 +1310,7 @@ pub const Client = struct {
     }
 
     pub fn connFor(c: *Client, node: i32, key: u64) !*Conn {
+        if (node < 0) return error.MetadataFailed;
         if (c.conns.get(key)) |conn| return conn;
         const addr = c.brokers.get(node) orelse {
             c.setErr("no address for broker node {d}", .{node});
@@ -1267,6 +1327,21 @@ pub const Client = struct {
             c.vlog("dropping connection to broker {d}", .{key >> 32});
             kv.value.close();
             c.alloc.destroy(kv.value);
+        }
+    }
+
+    pub fn dropNode(c: *Client, node: i32) void {
+        if (node < 0) return;
+        while (true) {
+            var keys = c.conns.keyIterator();
+            var found: ?u64 = null;
+            while (keys.next()) |key| {
+                if (key.* >> 32 == @as(u32, @intCast(node))) {
+                    found = key.*;
+                    break;
+                }
+            }
+            c.dropConn(found orelse return);
         }
     }
 
@@ -1402,6 +1477,65 @@ test "avgAckMs averages send-to-ack nanoseconds" {
     const now: std.Io.Timestamp = .{ .nanoseconds = 2_500 };
     try std.testing.expectEqual(@as(u64, 1_500), ackNanos(sent, now));
     try std.testing.expectEqual(@as(u64, 0), ackNanos(now, sent));
+}
+
+test "leaderless partitions cannot be claimed or connected" {
+    var c: Client = undefined;
+    c.partitions = .empty;
+    try std.testing.expectEqual(@as(?i32, null), c.partitionLeader(0));
+    try c.partitions.append(std.testing.allocator, .{ .index = 0, .leader = -1 });
+    defer c.partitions.deinit(std.testing.allocator);
+    c.inflight = .empty;
+    try std.testing.expectEqual(@as(?i32, null), c.partitionLeader(0));
+    try std.testing.expectError(error.MetadataFailed, c.claimConn(0));
+    try std.testing.expectError(error.MetadataFailed, c.connFor(-1, Client.connKey(-1, 0)));
+    c.dropNode(-1);
+    c.partitions.items[0].leader = 2;
+    try std.testing.expectEqual(@as(?i32, 2), c.partitionLeader(0));
+}
+
+test "draining all inflight batches releases the old leader binding" {
+    var c: Client = undefined;
+    c.alloc = std.testing.allocator;
+    c.partitions = .empty;
+    defer c.partitions.deinit(c.alloc);
+    try c.partitions.append(c.alloc, .{ .index = 0, .leader = 2 });
+    c.inflight = .empty;
+    defer c.inflight.deinit(c.alloc);
+    c.alt = .empty;
+    defer c.alt.deinit(c.alloc);
+    try c.inflight.put(c.alloc, 0, .{ .node = 1, .key = Client.connKey(1, 0), .n = 2 });
+    c.releaseConn(0);
+    try std.testing.expect(c.inflight.contains(0));
+    c.releaseConn(0);
+    try std.testing.expect(!c.inflight.contains(0));
+    const claim = try c.claimConn(0);
+    try std.testing.expectEqual(@as(i32, 2), claim.node);
+    try std.testing.expectEqual(Client.connKey(2, 0), claim.key);
+}
+
+test "rebuilding broker metadata releases old hosts including an empty update" {
+    var c: Client = undefined;
+    c.alloc = std.testing.allocator;
+    c.brokers = .empty;
+    defer c.brokers.deinit(c.alloc);
+    var e = Encoder.init(c.alloc);
+    defer e.deinit();
+    try e.compactArrayLen(1);
+    try e.i32v(1);
+    try e.compactString("localhost");
+    try e.i32v(9092);
+    try e.compactString(null);
+    try e.tagBuffer();
+    var d = Decoder.init(e.written());
+    try c.decodeBrokers(&d);
+    d = Decoder.init(e.written());
+    try c.decodeBrokers(&d);
+    try std.testing.expectEqualStrings("localhost", c.brokers.get(1).?.host);
+    const empty = [_]u8{1};
+    d = Decoder.init(&empty);
+    try c.decodeBrokers(&d);
+    try std.testing.expectEqual(@as(u32, 0), c.brokers.count());
 }
 
 test "bootstrap server parser rejects invalid explicit ports" {
