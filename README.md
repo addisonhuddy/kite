@@ -941,6 +941,7 @@ First run against a local broker:
 
 General:
 
+- **Broker failover:** kite follows partition leader changes and reconnects via discovered brokers before configured bootstraps, with a ~30s recovery budget (consume idle limits still apply).
 - **`no broker configured`:** pass `-b HOST:PORT`, set
   `BOOTSTRAP_SERVERS`, or copy a template to one of the search-path
   locations and edit `bootstrap.servers`. `-v` prints which sources were
