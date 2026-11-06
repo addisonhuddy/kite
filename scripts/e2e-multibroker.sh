@@ -130,8 +130,8 @@ baseline() {
     fixture 20000 | cli produce mb-baseline 2>"$LOG/01-routing-produce.err"
     dump mb-baseline 01-routing 20000
     for i in 1 2 3; do
-        rg -q "connected broker $i at" "$LOG/01-routing-consume.err"
-        rg -q "connected broker $i at" "$LOG/01-routing-produce.err"
+        grep -q "connected broker $i at" "$LOG/01-routing-consume.err"
+        grep -q "connected broker $i at" "$LOG/01-routing-produce.err"
     done
 }
 run 01-routing baseline
@@ -173,11 +173,11 @@ admin_ops() {
     cli topic create -p 6 -r 3 "$t"
     cli topic update --partitions 9 "$t"
     cli topic update --set retention.ms=7200000 "$t"
-    admin kafka-topics.sh --bootstrap-server "$NAME-1:9092" --describe --topic "$t" | rg 'PartitionCount: 9'
-    admin kafka-configs.sh --bootstrap-server "$NAME-1:9092" --entity-type topics --entity-name "$t" --describe | rg 'retention.ms=7200000'
+    admin kafka-topics.sh --bootstrap-server "$NAME-1:9092" --describe --topic "$t" | grep 'PartitionCount: 9'
+    admin kafka-configs.sh --bootstrap-server "$NAME-1:9092" --entity-type topics --entity-name "$t" --describe | grep 'retention.ms=7200000'
     cli topic delete -y "$t"
     local deadline=$((SECONDS + 30))
-    while cli topic list | rg -x "$t"; do
+    while cli topic list | grep -x "$t"; do
         [ "$SECONDS" -lt "$deadline" ] || return 1
         sleep 1
     done
