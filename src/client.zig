@@ -1084,16 +1084,9 @@ pub const Client = struct {
             o.counts[0] = @intCast(sets[i].len);
             o.bytes = be.written().len;
             c.outstanding_bytes += o.bytes;
-            // Idempotent produce allows at most 5 un-acked requests per
-            // partition (broker dedup window); drain for a free slot BEFORE
-            // this send so the partition never reaches 6 in flight.
-            if (c.producer_inited) {
-                if (c.inflight.get(pidx)) |inf| {
-                    if (inf.n >= max_inflight)
-                        c.vlog("partition {d}: {d} in flight — draining for a slot", .{ pidx, inf.n });
-                }
-                try c.produceDrainStop(topic, .{ .partition_inflight = .{ .pidx = pidx, .max = max_inflight - 1 } });
-            }
+            // A broker may reject an early batch before its log is ready,
+            // then append a later sequence. Resolve the predecessor first.
+            try c.produceDrainStop(topic, .{ .partition_inflight = .{ .pidx = pidx, .max = 0 } });
             const claim = c.claimConn(pidx) catch {
                 try c.outstanding.append(c.alloc, o);
                 continue;
@@ -1129,10 +1122,6 @@ pub const Client = struct {
         return c.produceDrainStop(topic, .{ .bytes_floor = floor });
     }
 
-    /// Broker requires ≤5 in-flight produce requests per partition for
-    /// sequence dedup to hold.
-    const max_inflight = 5;
-
     const DrainStop = union(enum) {
         /// Drain while outstanding_bytes exceeds the floor.
         bytes_floor: usize,
@@ -1143,7 +1132,24 @@ pub const Client = struct {
     fn drainStopActive(c: *Client, stop: DrainStop) bool {
         return switch (stop) {
             .bytes_floor => |f| c.outstanding_bytes > f,
-            .partition_inflight => |s| if (c.inflight.get(s.pidx)) |inf| inf.n > s.max else false,
+            .partition_inflight => |s| blk: {
+                if (c.inflight.get(s.pidx)) |inf| {
+                    if (inf.n > s.max) break :blk true;
+                }
+                for (c.outstanding.items) |o| {
+                    if (o.corr < 0) {
+                        for (o.pidx) |pi| if (pi == s.pidx) break :blk true;
+                    }
+                }
+                break :blk false;
+            },
+        };
+    }
+
+    fn produceErrorDropsNode(code: protocol.ErrorCode) bool {
+        return switch (code) {
+            .not_leader_or_follower, .leader_not_available, .fenced_leader_epoch, .unknown_leader_epoch => true,
+            else => false,
         };
     }
 
@@ -1182,7 +1188,7 @@ pub const Client = struct {
                             // appended this batch — dedup success.
                             .none, .duplicate_sequence_number => {},
                             else => if (code.retriable()) {
-                                c.dropNode(o.node);
+                                if (produceErrorDropsNode(code)) c.dropNode(o.node);
                                 try retry.append(c.alloc, .{ .pidx = pi, .batch = b, .count = count });
                             } else {
                                 c.produceErr(topic, pi, code, b.len);
@@ -1252,7 +1258,7 @@ pub const Client = struct {
                 switch (code) {
                     .none, .duplicate_sequence_number => c.releaseConn(pp.pidx),
                     else => if (code.retriable()) {
-                        c.dropNode(claim.node);
+                        if (produceErrorDropsNode(code)) c.dropNode(claim.node);
                         c.releaseConn(pp.pidx);
                         try retry.append(c.alloc, pp);
                     } else {
@@ -1555,6 +1561,47 @@ test "leaderless partitions cannot be claimed or connected" {
     c.dropNode(-1);
     c.partitions.items[0].leader = 2;
     try std.testing.expectEqual(@as(?i32, 2), c.partitionLeader(0));
+}
+
+test "partition send barrier waits for sent, invalidated and never claimed predecessors" {
+    var c: Client = undefined;
+    c.alloc = std.testing.allocator;
+    c.inflight = .empty;
+    defer c.inflight.deinit(c.alloc);
+    c.outstanding = .empty;
+    const stop: Client.DrainStop = .{ .partition_inflight = .{ .pidx = 0, .max = 0 } };
+    try std.testing.expect(!c.drainStopActive(stop));
+
+    var conn: Conn = undefined;
+    var partitions = [_]i32{0};
+    var entries: [1]Client.Outstanding = undefined;
+    entries[0].pidx = &partitions;
+    entries[0].corr = 1;
+    entries[0].conn = &conn;
+    c.outstanding.items = &entries;
+    try c.inflight.put(c.alloc, 0, .{ .node = 1, .key = Client.connKey(1, 0), .n = 1 });
+    try std.testing.expect(c.drainStopActive(stop));
+
+    c.invalidateOutstanding(&conn);
+    try std.testing.expect(c.drainStopActive(stop));
+    c.releaseConn(0);
+    // A failed claim has no inflight binding, but still owns a sequence.
+    try std.testing.expect(c.drainStopActive(stop));
+    partitions[0] = 1;
+    try std.testing.expect(!c.drainStopActive(stop));
+    c.outstanding = .empty;
+    try std.testing.expect(!c.drainStopActive(stop));
+}
+
+test "partition retry responses keep healthy connections except for leadership errors" {
+    for ([_]protocol.ErrorCode{
+        .none,              .duplicate_sequence_number, .unknown_topic_or_partition,
+        .request_timed_out, .not_enough_replicas,       .not_enough_replicas_after_append,
+        .network_exception, .broker_not_available,
+    }) |code| try std.testing.expect(!Client.produceErrorDropsNode(code));
+    for ([_]protocol.ErrorCode{
+        .not_leader_or_follower, .leader_not_available, .fenced_leader_epoch, .unknown_leader_epoch,
+    }) |code| try std.testing.expect(Client.produceErrorDropsNode(code));
 }
 
 test "draining all inflight batches releases the old leader binding" {
