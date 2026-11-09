@@ -1441,18 +1441,11 @@ pub const Client = struct {
                 _ = try d.compactString(); // error_message
                 try d.tagBuffer(); // partition tags
                 try codes.put(c.alloc, pidx, code);
-                if (code == .none) {
-                    const count = if (outstanding) |o| blk: {
-                        for (o.pidx, o.counts) |op, oc| if (op == pidx) break :blk oc;
-                        break :blk 0;
-                    } else retry_count orelse 0;
-                    if (count > 0) {
-                        const last = base_offset + @as(i64, count) - 1;
-                        if (c.last_offset == null or last > c.last_offset.?) c.last_offset = last;
-                        try c.noteLastOffset(pidx, last);
-                        c.acked_records += count;
-                    }
-                }
+                const count = if (outstanding) |o| blk: {
+                    for (o.pidx, o.counts) |op, oc| if (op == pidx) break :blk oc;
+                    break :blk 0;
+                } else retry_count orelse 0;
+                try c.noteProduceAck(pidx, code, base_offset, count);
             }
             try d.tagBuffer(); // topic tags
         }
@@ -1464,6 +1457,16 @@ pub const Client = struct {
                 std.debug.print("kite: broker throttled produce {d}ms\n", .{throttle});
         }
         try d.tagBuffer();
+    }
+
+    fn noteProduceAck(c: *Client, pidx: i32, code: protocol.ErrorCode, base_offset: i64, count: u32) !void {
+        if ((code != .none and code != .duplicate_sequence_number) or count == 0) return;
+        if (base_offset >= 0) {
+            const last = base_offset + @as(i64, count) - 1;
+            if (c.last_offset == null or last > c.last_offset.?) c.last_offset = last;
+            try c.noteLastOffset(pidx, last);
+        }
+        c.acked_records += count;
     }
 };
 
@@ -1498,6 +1501,30 @@ test "dropped connection requests stay invalid when its key and address are reus
     try std.testing.expectEqual(@as(i32, -1), entries[1].corr);
     try std.testing.expectEqual(@as(i32, 2), entries[2].corr);
     try std.testing.expectEqual(@as(i32, -1), entries[3].corr);
+}
+
+test "duplicate produce acknowledgments count delivery without inventing offsets" {
+    var c: Client = undefined;
+    c.alloc = std.testing.allocator;
+    c.acked_records = 0;
+    c.last_offset = null;
+    c.last_offsets = .empty;
+    defer c.last_offsets.deinit(c.alloc);
+    try c.noteProduceAck(0, .duplicate_sequence_number, -1, 3);
+    try std.testing.expectEqual(@as(u64, 3), c.acked_records);
+    try std.testing.expectEqual(@as(?i64, null), c.last_offset);
+    try std.testing.expectEqual(@as(usize, 0), c.last_offsets.items.len);
+    try c.noteProduceAck(0, .none, 10, 2);
+    try c.noteProduceAck(0, .duplicate_sequence_number, 12, 3);
+    try std.testing.expectEqual(@as(u64, 8), c.acked_records);
+    try std.testing.expectEqual(@as(?i64, 14), c.last_offset);
+    try std.testing.expectEqual(@as(i64, 14), c.last_offsets.items[0].offset);
+    try c.noteProduceAck(0, .duplicate_sequence_number, -1, 2);
+    try c.noteProduceAck(0, .not_leader_or_follower, -1, 100);
+    try c.noteProduceAck(0, .none, 99, 0);
+    try std.testing.expectEqual(@as(u64, 10), c.acked_records);
+    try std.testing.expectEqual(@as(?i64, 14), c.last_offset);
+    try std.testing.expectEqual(@as(i64, 14), c.last_offsets.items[0].offset);
 }
 
 test "avgAckMs averages send-to-ack nanoseconds" {
