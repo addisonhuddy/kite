@@ -1170,7 +1170,7 @@ pub const Client = struct {
             done += 1;
             c.outstanding_bytes -= o.bytes;
             c.releaseConn(o.pidx[0]);
-            if (o.corr >= 0 and c.conns.contains(o.ckey)) {
+            if (o.corr >= 0) {
                 var codes = std.AutoHashMapUnmanaged(i32, protocol.ErrorCode).empty;
                 defer codes.deinit(c.alloc);
                 if (c.produceRecv(o.conn, o.corr, &codes, o, null)) |_| {
@@ -1325,8 +1325,15 @@ pub const Client = struct {
     pub fn dropConn(c: *Client, key: u64) void {
         if (c.conns.fetchRemove(key)) |kv| {
             c.vlog("dropping connection to broker {d}", .{key >> 32});
+            c.invalidateOutstanding(kv.value);
             kv.value.close();
             c.alloc.destroy(kv.value);
+        }
+    }
+
+    fn invalidateOutstanding(c: *Client, conn: *Conn) void {
+        for (c.outstanding.items) |*o| {
+            if (o.corr >= 0 and o.conn == conn) o.corr = -1;
         }
     }
 
@@ -1462,6 +1469,35 @@ pub const Client = struct {
 
 fn ackNanos(sent: std.Io.Timestamp, now: std.Io.Timestamp) u64 {
     return @intCast(@max(0, sent.durationTo(now).toNanoseconds()));
+}
+
+test "dropped connection requests stay invalid when its key and address are reused" {
+    var c: Client = undefined;
+    c.outstanding = .empty;
+    var old: Conn = undefined;
+    var other: Conn = undefined;
+    c.invalidateOutstanding(&old);
+    var entries: [4]Client.Outstanding = undefined;
+    for (&entries, 0..) |*o, i| {
+        o.corr = @intCast(i);
+        o.conn = if (i == 2) &other else &old;
+    }
+    entries[3].corr = -1;
+    entries[3].conn = undefined;
+    c.outstanding.items = &entries;
+    c.conns = .empty;
+    defer c.conns.deinit(std.testing.allocator);
+    const key = Client.connKey(1, 0);
+    try c.conns.put(std.testing.allocator, key, &old);
+    _ = c.conns.remove(key);
+    c.invalidateOutstanding(&old);
+    // A replacement may reuse both the map key and the allocation address.
+    try c.conns.put(std.testing.allocator, key, &old);
+    try std.testing.expect(c.conns.contains(key));
+    try std.testing.expectEqual(@as(i32, -1), entries[0].corr);
+    try std.testing.expectEqual(@as(i32, -1), entries[1].corr);
+    try std.testing.expectEqual(@as(i32, 2), entries[2].corr);
+    try std.testing.expectEqual(@as(i32, -1), entries[3].corr);
 }
 
 test "avgAckMs averages send-to-ack nanoseconds" {
