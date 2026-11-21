@@ -275,4 +275,5 @@ assert [(r['offset'],r['value']) for r in rows]==[(i,f'value-{i}') for i in rang
 PY
 }
 run 07-offset-cursor offset_cursor
+run 08-idle-during-recovery python3 scripts/check-idle-recovery.py "$KITE"
 exit "$status"

@@ -91,7 +91,9 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
         if (opts.idle_ms) |idle| {
             const elapsed = last_record.durationTo(std.Io.Timestamp.now(c.io, .awake));
-            if (elapsed.toMilliseconds() >= idle) break;
+            // After a leader error, fetch from the refreshed routes before
+            // treating the lack of records as idle.
+            if (retry.started == null and elapsed.toMilliseconds() >= idle) break;
         }
 
         _ = round_arena.reset(.retain_capacity);
