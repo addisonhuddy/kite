@@ -262,4 +262,17 @@ idle_election() {
     [ "$rc" -eq 0 ]
 }
 run 06-idle-election idle_election
+
+offset_cursor() {
+    local t=mb-offset-cursor
+    cli topic create -p 1 -r 3 "$t"
+    fixture 10 | cli produce "$t"
+    cli consume --partition 0 --offset 4 -n 3 --idle 5s --json "$t" >"$LOG/07-offset-cursor.jsonl"
+    python3 - "$LOG/07-offset-cursor.jsonl" <<'PY'
+import json,sys
+rows=[json.loads(s) for s in open(sys.argv[1])]
+assert [(r['offset'],r['value']) for r in rows]==[(i,f'value-{i}') for i in range(4,7)], rows
+PY
+}
+run 07-offset-cursor offset_cursor
 exit "$status"

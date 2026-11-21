@@ -609,7 +609,7 @@ fn waitForTopic(cli: *client.Client, topic: []const u8, access: []const u8, quie
             if (attempt > 0 and !quiet) note("topic '{s}' is ready", .{topic});
             return;
         } else |err| switch (err) {
-            error.TopicNotFound, error.MetadataFailed => {
+            error.TopicNotFound, error.MetadataFailed, error.MetadataUnavailable => {
                 attempt += 1;
                 if (attempt >= max_attempts)
                     fatalErr(cli, "topic was created but its metadata did not appear in time; retry the command in a moment");
@@ -632,17 +632,25 @@ fn waitForTopic(cli: *client.Client, topic: []const u8, access: []const u8, quie
 /// treats it as a plain error.
 fn connectAndResolve(cli: *client.Client, topic: []const u8, access: []const u8, quiet: bool, create_missing: bool) void {
     cli.bootstrap() catch fatalErr(cli, "could not reach any bootstrap server");
-    cli.refreshMetadata(topic) catch |err| switch (err) {
-        error.TopicNotFound => if (create_missing)
-            createAndResolve(cli, topic, access, quiet)
-        else
-            fatal("topic '{s}' does not exist", .{topic}),
-        error.TopicAuthorizationFailed => fatal(
-            "not authorized to {s} topic '{s}' (check ACLs for this principal; on managed clusters this is also what a missing topic looks like)",
-            .{ access, topic },
-        ),
-        else => fatalErr(cli, "metadata lookup failed"),
-    };
+    var retry: client.Retry = .{};
+    while (true) {
+        cli.refreshMetadata(topic) catch |err| switch (err) {
+            error.MetadataUnavailable => {
+                if (retry.pause(cli)) continue;
+                fatalErr(cli, "metadata lookup failed");
+            },
+            error.TopicNotFound => if (create_missing)
+                createAndResolve(cli, topic, access, quiet)
+            else
+                fatal("topic '{s}' does not exist", .{topic}),
+            error.TopicAuthorizationFailed => fatal(
+                "not authorized to {s} topic '{s}' (check ACLs for this principal; on managed clusters this is also what a missing topic looks like)",
+                .{ access, topic },
+            ),
+            else => fatalErr(cli, "metadata lookup failed"),
+        };
+        return;
+    }
 }
 
 fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.Allocator) noreturn {
