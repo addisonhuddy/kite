@@ -120,6 +120,7 @@ pub const Client = struct {
     }
 
     pub fn deinit(c: *Client) void {
+        c.dropControl();
         var it = c.conns.valueIterator();
         while (it.next()) |conn| {
             conn.*.close();
@@ -128,7 +129,7 @@ pub const Client = struct {
         c.conns.deinit(c.alloc);
         c.inflight.deinit(c.alloc);
         c.alt.deinit(c.alloc);
-        c.brokers.deinit(c.alloc);
+        c.freeBrokers(&c.brokers);
         c.partitions.deinit(c.alloc);
         c.api_ranges.deinit(c.alloc);
         for (c.outstanding.items) |*o| {
@@ -485,43 +486,43 @@ pub const Client = struct {
         _ = try d.compactString(); // cluster id
         c.controller_id = try d.i32v();
 
-        const ntopics = try d.compactArrayLen();
-        var t: i64 = 0;
-        while (t < ntopics) : (t += 1) {
-            const terr: protocol.ErrorCode = @enumFromInt(try d.i16v());
-            _ = try d.compactString(); // name (we requested exactly one topic)
-            try d.skip(16); // topic_id uuid
-            _ = try d.boolean(); // is_internal
-            const nparts = try d.compactArrayLen();
-            var p: i64 = 0;
-            c.partitions.clearRetainingCapacity();
-            while (p < nparts) : (p += 1) {
-                const part_error = try d.i16v();
-                const pidx = try d.i32v();
-                const leader = try d.i32v();
-                _ = try d.i32v(); // leader epoch
-                try d.skipCompactI32Array(); // replicas
-                try d.skipCompactI32Array(); // isr
-                try d.skipCompactI32Array(); // offline replicas
-                try d.tagBuffer();
-                try c.partitions.append(c.alloc, .{ .index = pidx, .leader = if (part_error == 0) leader else -1 });
-            }
-            _ = try d.i32v(); // topic_authorized_operations
-            try d.tagBuffer();
-
-            if (terr != .none) {
-                c.setErr("metadata for topic '{s}': {s}", .{ topic, terr.name() });
-                return switch (terr) {
-                    .unknown_topic_or_partition => error.TopicNotFound,
-                    .topic_authorization_failed => error.TopicAuthorizationFailed,
-                    else => error.MetadataFailed,
-                };
-            }
+        if (try d.compactArrayLen() != 1) return error.MalformedResponse;
+        const terr: protocol.ErrorCode = @enumFromInt(try d.i16v());
+        const name = (try d.compactString()) orelse return error.MalformedResponse;
+        if (!std.mem.eql(u8, name, topic)) return error.MalformedResponse;
+        if (terr != .none) {
+            c.setErr("metadata for topic '{s}': {s}", .{ topic, terr.name() });
+            return switch (terr) {
+                .unknown_topic_or_partition => error.TopicNotFound,
+                .topic_authorization_failed => error.TopicAuthorizationFailed,
+                else => if (terr.retriable()) error.MetadataUnavailable else error.MetadataFailed,
+            };
         }
-        if (c.partitions.items.len == 0) {
+        try d.skip(16); // topic_id uuid
+        _ = try d.boolean(); // is_internal
+        const nparts = try d.compactArrayLen();
+        if (nparts <= 0) {
             c.setErr("topic '{s}' has no partitions", .{topic});
             return error.MetadataFailed;
         }
+        var partitions: std.ArrayListUnmanaged(Partition) = .empty;
+        defer partitions.deinit(c.alloc);
+        var p: i64 = 0;
+        while (p < nparts) : (p += 1) {
+            const part_error = try d.i16v();
+            const pidx = try d.i32v();
+            const leader = try d.i32v();
+            _ = try d.i32v(); // leader epoch
+            try d.skipCompactI32Array(); // replicas
+            try d.skipCompactI32Array(); // isr
+            try d.skipCompactI32Array(); // offline replicas
+            try d.tagBuffer();
+            try partitions.append(c.alloc, .{ .index = pidx, .leader = if (part_error == 0) leader else -1 });
+        }
+        _ = try d.i32v(); // topic_authorized_operations
+        try d.tagBuffer();
+        try d.tagBuffer();
+        std.mem.swap(std.ArrayListUnmanaged(Partition), &c.partitions, &partitions);
         c.vlog("metadata: topic '{s}' has {d} partition(s)", .{ topic, c.partitions.items.len });
     }
 
@@ -820,27 +821,39 @@ pub const Client = struct {
         try e.tagBuffer();
     }
 
-    /// Metadata on the control connection; a dead socket gets one reconnect
-    /// retry — it would otherwise steer every produce retry at a dead broker.
+    /// Metadata on the control connection, falling back to discovered and
+    /// configured addresses until one answers.
     fn metadataRequest(c: *Client, t: ?[]const u8) !Resp {
-        var reconnected = false;
-        while (true) {
-            if (c.control == null) try c.reconnectControl();
-            const conn = c.control.?;
-            return c.sendRequest(conn, protocol.api_key.metadata, protocol.version.metadata, t, metadataBody) catch {
-                if (reconnected) {
-                    c.setErr("metadata request failed", .{});
-                    return error.MetadataFailed;
-                }
-                reconnected = true;
+        if (c.control) |conn| {
+            if (c.sendRequest(conn, protocol.api_key.metadata, protocol.version.metadata, t, metadataBody)) |resp| {
+                return resp;
+            } else |_| {
                 c.vlog("metadata request failed — reconnecting control connection", .{});
-                c.reconnectControl() catch {
-                    c.setErr("metadata request failed", .{});
-                    return error.MetadataFailed;
-                };
-                continue;
-            };
+                c.dropControl();
+            }
         }
+        var brokers = c.brokers.valueIterator();
+        while (brokers.next()) |addr| {
+            return c.connectMetadata(t, addr.*) catch continue;
+        }
+        for (c.cfg.bootstrap_servers) |server| {
+            const addr = parseBootstrapServer(server) catch continue;
+            return c.connectMetadata(t, addr) catch continue;
+        }
+        c.setErr("metadata request failed", .{});
+        return error.MetadataFailed;
+    }
+
+    fn connectMetadata(c: *Client, t: ?[]const u8, addr: BrokerAddr) !Resp {
+        const conn = try c.connectOne(addr.host, addr.port);
+        errdefer {
+            conn.close();
+            c.alloc.destroy(conn);
+        }
+        const resp = try c.sendRequest(conn, protocol.api_key.metadata, protocol.version.metadata, t, metadataBody);
+        c.control = conn;
+        c.vlog("control connected {s}:{d}", .{ addr.host, addr.port });
+        return resp;
     }
 
     /// Every topic the principal can see (Metadata v12, topics = null),
@@ -903,11 +916,19 @@ pub const Client = struct {
     }
 
     /// Decode the Metadata broker array into c.brokers.
+    const BrokerMap = std.AutoHashMapUnmanaged(i32, BrokerAddr);
+
+    fn freeBrokers(c: *Client, brokers: *BrokerMap) void {
+        var it = brokers.valueIterator();
+        while (it.next()) |addr| c.alloc.free(addr.host);
+        brokers.deinit(c.alloc);
+    }
+
     fn decodeBrokers(c: *Client, d: *Decoder) !void {
         const nbrokers = try d.compactArrayLen();
-        var old = c.brokers.valueIterator();
-        while (old.next()) |addr| c.alloc.free(addr.host);
-        c.brokers.clearRetainingCapacity();
+        if (nbrokers < 0) return error.MalformedResponse;
+        var brokers: BrokerMap = .empty;
+        defer c.freeBrokers(&brokers);
         var i: i64 = 0;
         while (i < nbrokers) : (i += 1) {
             const node = try d.i32v();
@@ -915,8 +936,20 @@ pub const Client = struct {
             const port = try d.i32v();
             _ = try d.compactString(); // rack
             try d.tagBuffer();
-            try c.brokers.put(c.alloc, node, .{ .host = try c.alloc.dupe(u8, host), .port = @intCast(@max(0, port)) });
+            if (node < 0 or host.len == 0 or port < 1 or port > 65535) continue;
+            if (brokers.contains(node)) return error.MalformedResponse;
+            const owned_host = try c.alloc.dupe(u8, host);
+            errdefer c.alloc.free(owned_host);
+            try brokers.put(c.alloc, node, .{ .host = owned_host, .port = @intCast(port) });
         }
+        var old = c.brokers.iterator();
+        while (old.next()) |entry| {
+            if (brokers.get(entry.key_ptr.*)) |next| {
+                if (next.port == entry.value_ptr.port and std.mem.eql(u8, next.host, entry.value_ptr.host)) continue;
+            }
+            c.dropNode(entry.key_ptr.*);
+        }
+        std.mem.swap(BrokerMap, &c.brokers, &brokers);
     }
 
     // -- Idempotent produce: InitProducerId ----------------------------------
@@ -986,9 +1019,7 @@ pub const Client = struct {
     /// A sent ProduceRequest awaiting its response. Batches stay alive in the
     /// encoders so retriable partitions can be resent verbatim.
     const Outstanding = struct {
-        node: i32,
         ckey: u64,
-        conn: *Conn,
         corr: i32, // <0 = the send never completed; all parts retriable
         pidx: []i32,
         batches: [][]const u8,
@@ -1048,10 +1079,16 @@ pub const Client = struct {
         try c.ensureProducerId();
         for (parts, 0..) |pi, i| {
             const pidx: i32 = @intCast(pi);
+            // Drain before allocating a sequence and queuing another batch.
+            if (c.producer_inited) {
+                if (c.inflight.get(pidx)) |inf| {
+                    if (inf.n >= max_inflight)
+                        c.vlog("partition {d}: {d} in flight — draining for a slot", .{ pidx, inf.n });
+                }
+                try c.produceDrainStop(topic, .{ .partition_inflight = .{ .pidx = pidx, .max = max_inflight - 1 } });
+            }
             var o: Outstanding = .{
-                .node = -1,
                 .ckey = 0,
-                .conn = undefined,
                 .corr = -1,
                 .pidx = try c.alloc.alloc(i32, 1),
                 .batches = try c.alloc.alloc([]const u8, 1),
@@ -1084,34 +1121,22 @@ pub const Client = struct {
             o.counts[0] = @intCast(sets[i].len);
             o.bytes = be.written().len;
             c.outstanding_bytes += o.bytes;
-            // Idempotent produce allows at most 5 un-acked requests per
-            // partition (broker dedup window); drain for a free slot BEFORE
-            // this send so the partition never reaches 6 in flight.
-            if (c.producer_inited) {
-                if (c.inflight.get(pidx)) |inf| {
-                    if (inf.n >= max_inflight)
-                        c.vlog("partition {d}: {d} in flight — draining for a slot", .{ pidx, inf.n });
-                }
-                try c.produceDrainStop(topic, .{ .partition_inflight = .{ .pidx = pidx, .max = max_inflight - 1 } });
-            }
-            const claim = c.claimConn(pidx) catch {
-                try c.outstanding.append(c.alloc, o);
-                continue;
-            };
-            o.node = claim.node;
-            o.ckey = claim.key;
-            if (c.connFor(claim.node, claim.key)) |conn| {
-                o.conn = conn;
-                o.corr = c.produceSend(conn, topic, o.pidx, o.batches) catch {
-                    c.dropNode(claim.node);
-                    try c.outstanding.append(c.alloc, o);
-                    continue;
-                };
-                o.sent = std.Io.Timestamp.now(c.io, .awake);
-            } else |_| {
-                c.dropNode(claim.node);
-            }
+            if (c.claimConn(pidx)) |claim| {
+                o.ckey = claim.key;
+                if (c.connFor(claim.node, claim.key)) |conn| {
+                    o.corr = c.produceSend(conn, topic, o.pidx, o.batches) catch -1;
+                    if (o.corr < 0)
+                        c.dropConn(claim.key)
+                    else
+                        o.sent = std.Io.Timestamp.now(c.io, .awake);
+                } else |_| {}
+            } else |_| {}
             try c.outstanding.append(c.alloc, o);
+            // Do not send a higher sequence on a new socket before retrying
+            // requests lost with the old socket (or a batch with no leader).
+            if (o.corr < 0) {
+                try c.produceDrain(topic);
+            }
         }
     }
 
@@ -1173,7 +1198,7 @@ pub const Client = struct {
             if (o.corr >= 0 and c.conns.contains(o.ckey)) {
                 var codes = std.AutoHashMapUnmanaged(i32, protocol.ErrorCode).empty;
                 defer codes.deinit(c.alloc);
-                if (c.produceRecv(o.conn, o.corr, &codes, o, null)) |_| {
+                if (c.produceRecv(c.conns.get(o.ckey).?, o.corr, &codes, o, null)) |_| {
                     c.recordAck(o.sent);
                     for (o.pidx, o.batches, o.counts) |pi, b, count| {
                         const code = codes.get(pi) orelse .none;
@@ -1182,7 +1207,7 @@ pub const Client = struct {
                             // appended this batch — dedup success.
                             .none, .duplicate_sequence_number => {},
                             else => if (code.retriable()) {
-                                c.dropNode(o.node);
+                                c.dropConn(o.ckey);
                                 try retry.append(c.alloc, .{ .pidx = pi, .batch = b, .count = count });
                             } else {
                                 c.produceErr(topic, pi, code, b.len);
@@ -1191,7 +1216,7 @@ pub const Client = struct {
                         }
                     }
                 } else |_| {
-                    c.dropNode(o.node);
+                    c.dropConn(o.ckey);
                     for (o.pidx, o.batches, o.counts) |pi, b, count|
                         try retry.append(c.alloc, .{ .pidx = pi, .batch = b, .count = count });
                 }
@@ -1227,13 +1252,12 @@ pub const Client = struct {
                     continue;
                 };
                 const conn = c.connFor(claim.node, claim.key) catch {
-                    c.dropNode(claim.node);
                     c.releaseConn(pp.pidx);
                     try retry.append(c.alloc, pp);
                     continue;
                 };
                 const corr = c.produceSend(conn, topic, &.{pp.pidx}, &.{pp.batch}) catch {
-                    c.dropNode(claim.node);
+                    c.dropConn(claim.key);
                     c.releaseConn(pp.pidx);
                     try retry.append(c.alloc, pp);
                     continue;
@@ -1242,7 +1266,7 @@ pub const Client = struct {
                 var codes = std.AutoHashMapUnmanaged(i32, protocol.ErrorCode).empty;
                 defer codes.deinit(c.alloc);
                 c.produceRecv(conn, corr, &codes, null, pp.count) catch {
-                    c.dropNode(claim.node);
+                    c.dropConn(claim.key);
                     c.releaseConn(pp.pidx);
                     try retry.append(c.alloc, pp);
                     continue;
@@ -1252,7 +1276,7 @@ pub const Client = struct {
                 switch (code) {
                     .none, .duplicate_sequence_number => c.releaseConn(pp.pidx),
                     else => if (code.retriable()) {
-                        c.dropNode(claim.node);
+                        c.dropConn(claim.key);
                         c.releaseConn(pp.pidx);
                         try retry.append(c.alloc, pp);
                     } else {
@@ -1287,14 +1311,18 @@ pub const Client = struct {
         return null;
     }
 
-    /// Rebuild control through discovered brokers, then configured bootstrap
-    /// servers, with the full handshake.
-    fn reconnectControl(c: *Client) !void {
+    fn dropControl(c: *Client) void {
         if (c.control) |old| {
             old.close();
             c.alloc.destroy(old);
             c.control = null;
         }
+    }
+
+    /// Rebuild control through discovered brokers, then configured bootstrap
+    /// servers, with the full handshake.
+    fn reconnectControl(c: *Client) !void {
+        c.dropControl();
         var brokers = c.brokers.valueIterator();
         while (brokers.next()) |addr| {
             const conn = c.connectOne(addr.host, addr.port) catch continue;
@@ -1317,6 +1345,10 @@ pub const Client = struct {
             return error.MetadataFailed;
         };
         const conn = try c.connectOne(addr.host, addr.port);
+        errdefer {
+            conn.close();
+            c.alloc.destroy(conn);
+        }
         c.vlog("connected broker {d} at {s}:{d}", .{ node, addr.host, addr.port });
         try c.conns.put(c.alloc, key, conn);
         return conn;
@@ -1324,6 +1356,9 @@ pub const Client = struct {
 
     pub fn dropConn(c: *Client, key: u64) void {
         if (c.conns.fetchRemove(key)) |kv| {
+            for (c.outstanding.items) |*o| {
+                if (o.ckey == key) o.corr = -1;
+            }
             c.vlog("dropping connection to broker {d}", .{key >> 32});
             kv.value.close();
             c.alloc.destroy(kv.value);
@@ -1518,7 +1553,8 @@ test "rebuilding broker metadata releases old hosts including an empty update" {
     var c: Client = undefined;
     c.alloc = std.testing.allocator;
     c.brokers = .empty;
-    defer c.brokers.deinit(c.alloc);
+    defer c.freeBrokers(&c.brokers);
+    c.conns = .empty;
     var e = Encoder.init(c.alloc);
     defer e.deinit();
     try e.compactArrayLen(1);
@@ -1532,10 +1568,42 @@ test "rebuilding broker metadata releases old hosts including an empty update" {
     d = Decoder.init(e.written());
     try c.decodeBrokers(&d);
     try std.testing.expectEqualStrings("localhost", c.brokers.get(1).?.host);
+    d = Decoder.init(e.written()[0 .. e.written().len - 1]);
+    try std.testing.expectError(error.Truncated, c.decodeBrokers(&d));
+    try std.testing.expectEqualStrings("localhost", c.brokers.get(1).?.host);
     const empty = [_]u8{1};
     d = Decoder.init(&empty);
     try c.decodeBrokers(&d);
     try std.testing.expectEqual(@as(u32, 0), c.brokers.count());
+}
+
+test "dropping a produce socket invalidates only its outstanding responses" {
+    var c: Client = undefined;
+    const cfg: config.Config = .{ .bootstrap_servers = &.{} };
+    c.cfg = &cfg;
+    c.alloc = std.testing.allocator;
+    c.conns = .empty;
+    defer c.conns.deinit(c.alloc);
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    const server = try addr.listen(std.testing.io, .{});
+    const conn = try c.alloc.create(Conn);
+    conn.stream = .{ .socket = server.socket };
+    conn.io = std.testing.io;
+    const dropped = Client.connKey(1, 0);
+    try c.conns.put(c.alloc, dropped, conn);
+    defer c.dropConn(dropped);
+
+    var pending = [_]Client.Outstanding{
+        .{ .ckey = dropped, .corr = 1, .pidx = &.{}, .batches = &.{}, .counts = &.{}, .bytes = 0 },
+        .{ .ckey = Client.connKey(1, 1), .corr = 2, .pidx = &.{}, .batches = &.{}, .counts = &.{}, .bytes = 0 },
+        .{ .ckey = dropped, .corr = 3, .pidx = &.{}, .batches = &.{}, .counts = &.{}, .bytes = 0 },
+    };
+    c.outstanding = .{ .items = &pending, .capacity = pending.len };
+    c.dropConn(dropped);
+    try std.testing.expect(!c.conns.contains(dropped));
+    try std.testing.expectEqual(@as(i32, -1), pending[0].corr);
+    try std.testing.expectEqual(@as(i32, 2), pending[1].corr);
+    try std.testing.expectEqual(@as(i32, -1), pending[2].corr);
 }
 
 test "bootstrap server parser rejects invalid explicit ports" {

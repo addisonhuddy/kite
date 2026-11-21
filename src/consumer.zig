@@ -63,7 +63,7 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         cursors[cursor_count] = .{
             .pidx = p.index,
             .leader = p.leader,
-            .offset = if (opts.start == .offset) opts.offset else 0,
+            .offset = if (opts.start == .offset) opts.offset else -1,
         };
         cursor_count += 1;
     }
@@ -85,7 +85,7 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
     var count: u64 = 0;
     var last_record = std.Io.Timestamp.now(c.io, .awake);
     var retry: client.Retry = .{};
-    rounds: while (true) {
+    while (true) {
         if (opts.stop) |flag| if (flag.load(.acquire)) break;
         if (opts.max_records) |max| if (count >= max) break;
         if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
@@ -97,6 +97,7 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         _ = round_arena.reset(.retain_capacity);
         round_alloc = round_arena.allocator();
         var progress = false;
+        var failed_leader: ?i32 = null;
         var leader_seen: std.AutoHashMapUnmanaged(i32, void) = .empty;
         for (cursors[0..cursor_count]) |*cursor| {
             if (leader_seen.contains(cursor.leader)) continue;
@@ -110,17 +111,7 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             fetchLeader(c, round_alloc, opts, parts.items, out, &scratch, &count, &progress) catch |err| switch (err) {
                 error.RetryFetch => {
                     c.dropNode(cursor.leader);
-                    if (!retry.pause(c)) {
-                        c.setErr("fetch to broker {d}: recovery timed out after 30s", .{cursor.leader});
-                        return error.FetchFailed;
-                    }
-                    _ = c.refreshMetadata(opts.topic) catch {};
-                    for (cursors[0..cursor_count]) |*refresh| {
-                        refresh.leader = c.partitionLeader(refresh.pidx) orelse -1;
-                    }
-                    try out.flush();
-                    if (progress) last_record = std.Io.Timestamp.now(c.io, .awake);
-                    continue :rounds;
+                    failed_leader = cursor.leader;
                 },
                 else => {
                     return err;
@@ -129,12 +120,26 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             if (opts.max_records) |max| if (count >= max) break;
         }
         leader_seen.deinit(round_alloc);
-        retry = .{};
         try out.flush();
         if (opts.stats) |s| s.maybeRender();
         if (progress) last_record = std.Io.Timestamp.now(c.io, .awake);
+        if (opts.max_records) |max| if (count >= max) break;
+        if (failed_leader) |node| {
+            if (!retry.pause(c)) {
+                c.setErr("fetch to broker {d}: recovery timed out after 30s", .{node});
+                return error.FetchFailed;
+            }
+            refreshLeaders(c, opts.topic, cursors[0..cursor_count]);
+        } else {
+            retry = .{};
+        }
     }
     return count;
+}
+
+fn refreshLeaders(c: *client.Client, topic: []const u8, cursors: []Cursor) void {
+    c.refreshMetadata(topic) catch return;
+    for (cursors) |*cursor| cursor.leader = c.partitionLeader(cursor.pidx) orelse -1;
 }
 
 fn listOffsets(
@@ -148,13 +153,11 @@ fn listOffsets(
     while (true) {
         listOffsetsOnce(c, arena.allocator(), topic, cursors, start) catch |err| {
             if (err != error.RetryFetch) return err;
-            for (cursors) |cursor| c.dropNode(cursor.leader);
             if (!retry.pause(c)) {
                 c.setErr("list offsets: recovery timed out after 30s", .{});
                 return error.FetchFailed;
             }
-            _ = c.refreshMetadata(topic) catch {};
-            for (cursors) |*cursor| cursor.leader = c.partitionLeader(cursor.pidx) orelse -1;
+            refreshLeaders(c, topic, cursors);
             _ = arena.reset(.retain_capacity);
             continue;
         };
@@ -170,17 +173,25 @@ fn listOffsetsOnce(
     start: Options.Start,
 ) !void {
     var leaders: std.AutoHashMapUnmanaged(i32, void) = .empty;
-    for (cursors) |cursor| try leaders.put(alloc, cursor.leader, {});
+    for (cursors) |cursor| {
+        if (cursor.offset < 0) try leaders.put(alloc, cursor.leader, {});
+    }
+    defer leaders.deinit(alloc);
 
+    var needs_retry = false;
     var it = leaders.keyIterator();
     while (it.next()) |leader_ptr| {
         const leader = leader_ptr.*;
         var parts: std.ArrayListUnmanaged(ListPart) = .empty;
-        for (cursors) |*cursor| if (cursor.leader == leader)
+        for (cursors) |*cursor| if (cursor.offset < 0 and cursor.leader == leader)
             try parts.append(alloc, .{ .pidx = cursor.pidx, .cursor = cursor });
-        try listOffsetsLeader(c, alloc, topic, parts.items, start);
+        listOffsetsLeader(c, alloc, topic, parts.items, start) catch |err| {
+            if (err != error.RetryFetch) return err;
+            c.dropNode(leader);
+            needs_retry = true;
+        };
     }
-    leaders.deinit(alloc);
+    if (needs_retry) return error.RetryFetch;
 }
 
 fn listOffsetsLeader(
@@ -221,6 +232,7 @@ fn listOffsetsLeader(
     var d = Decoder.init(resp.body);
     _ = try d.i32v();
     const topics = try d.compactArrayLen();
+    var resolved: usize = 0;
     var ti: i64 = 0;
     while (ti < topics) : (ti += 1) {
         _ = try d.compactString();
@@ -234,17 +246,22 @@ fn listOffsetsLeader(
             _ = try d.i32v();
             try d.tagBuffer();
             if (code != .none) {
-                if (code.retriable()) return error.RetryFetch;
+                if (code.retriable()) continue;
                 c.setErr("list offsets partition {d}: {s}", .{ pidx, code.name() });
                 return error.FetchFailed;
             }
             for (parts) |part| {
-                if (part.pidx == pidx) part.cursor.offset = offset;
+                if (part.pidx == pidx and offset >= 0) {
+                    part.cursor.offset = offset;
+                    resolved += 1;
+                    break;
+                }
             }
         }
         try d.tagBuffer();
     }
     try d.tagBuffer();
+    if (resolved != parts.len) return error.RetryFetch;
 }
 
 fn fetchLeader(
@@ -303,8 +320,13 @@ fn fetchLeader(
     _ = try d.i32v();
     const top_code: protocol.ErrorCode = @enumFromInt(try d.i16v());
     _ = try d.i32v();
-    if (top_code != .none) return error.RetryFetch;
+    if (top_code != .none) {
+        if (top_code.retriable()) return error.RetryFetch;
+        c.setErr("fetch from broker {d}: {s}", .{ leader, top_code.name() });
+        return error.FetchFailed;
+    }
     const topics = try d.compactArrayLen();
+    var needs_retry = false;
     var ti: i64 = 0;
     while (ti < topics) : (ti += 1) {
         _ = try d.compactString();
@@ -333,11 +355,17 @@ fn fetchLeader(
                     try reportOffsetRange(c, alloc, opts, part.cursor);
                     return error.OffsetOutOfRange;
                 }
-                try resetOffset(c, alloc, opts, part.cursor);
+                resetOffset(c, alloc, opts, part.cursor) catch |err| {
+                    if (err != error.RetryFetch) return err;
+                    needs_retry = true;
+                };
                 continue;
             }
             if (code != .none) {
-                if (code.retriable()) return error.RetryFetch;
+                if (code.retriable()) {
+                    needs_retry = true;
+                    continue;
+                }
                 c.setErr("fetch partition {d}: {s}", .{ pidx, code.name() });
                 return error.FetchFailed;
             }
@@ -348,6 +376,7 @@ fn fetchLeader(
                     .out = out,
                     .count = count,
                     .max = opts.max_records,
+                    .min_offset = part.cursor.offset,
                     .range = &range,
                     .stats = opts.stats,
                     .format = opts.format,
@@ -384,6 +413,7 @@ fn fetchLeader(
         try d.tagBuffer();
     }
     try d.tagBuffer();
+    if (needs_retry) return error.RetryFetch;
 }
 
 const Range = struct {
@@ -395,6 +425,7 @@ const RecordSink = struct {
     out: *std.Io.Writer,
     count: *u64,
     max: ?u64,
+    min_offset: i64,
     range: *Range,
     stats: ?*stats.Stats,
     format: format_mod.Format,
@@ -480,6 +511,7 @@ fn writeJsonRecordColored(
 }
 
 fn onRecord(ctx: *RecordSink, offset: i64, timestamp_ms: i64, rec: protocol.Record) !void {
+    if (offset < ctx.min_offset) return;
     if (ctx.max) |max| if (ctx.count.* >= max) return;
     if (ctx.stats) |s| s.beforeOutput();
     switch (ctx.format) {
@@ -603,6 +635,7 @@ test "text record output honors value and tsv formats" {
         .out = &w,
         .count = &count,
         .max = null,
+        .min_offset = 0,
         .range = &range,
         .stats = null,
         .format = .value,
@@ -622,4 +655,11 @@ test "text record output honors value and tsv formats" {
     try onRecord(&sink, 2, 0, .{ .value = "plain" });
     try onRecord(&sink, 3, 0, .{ .key = "k", .value = "v3" });
     try std.testing.expectEqualStrings("plain\nk\tv3\n", w.buffered());
+
+    w = .fixed(&buf);
+    sink.min_offset = 5;
+    try onRecord(&sink, 4, 0, .{ .value = "before cursor" });
+    try onRecord(&sink, 5, 0, .{ .value = "at cursor" });
+    try std.testing.expectEqualStrings("at cursor\n", w.buffered());
+    try std.testing.expectEqual(@as(u64, 5), count);
 }
