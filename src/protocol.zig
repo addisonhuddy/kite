@@ -99,6 +99,7 @@ pub const ErrorCode = enum(i16) {
     fenced_member_epoch = 110,
     unreleased_instance_id = 111,
     stale_member_epoch = 113,
+    unstable_offset_commit = 88,
     _,
 
     pub fn name(self: ErrorCode) []const u8 {
@@ -110,6 +111,7 @@ pub const ErrorCode = enum(i16) {
             .fenced_member_epoch => "FENCED_MEMBER_EPOCH",
             .unreleased_instance_id => "UNRELEASED_INSTANCE_ID",
             .stale_member_epoch => "STALE_MEMBER_EPOCH",
+            .unstable_offset_commit => "UNSTABLE_OFFSET_COMMIT",
             .none => "NONE",
             .unknown_server_error => "UNKNOWN_SERVER_ERROR",
             .offset_out_of_range => "OFFSET_OUT_OF_RANGE",
@@ -826,6 +828,7 @@ pub fn offsetCommitRequest(e: *Encoder, req: OffsetCommit) ProtoError!void {
         for (t.partitions) |p| {
             try e.i32v(p.partition);
             try e.i64v(p.offset);
+            // TODO: KIP-320: retain and commit the consumed batch's leader epoch.
             try e.i32v(-1);
             try e.compactString(null);
             try e.tagBuffer();
@@ -843,6 +846,7 @@ pub const Heartbeat = struct {
     rebalance_timeout_ms: i32 = -1,
     topics: ?[]const []const u8 = null,
     assignment: ?[]const TopicAssignment = null,
+    retry_assignment: ?[]const TopicAssignment = null,
 };
 
 pub fn heartbeatRequest(e: *Encoder, req: Heartbeat) ProtoError!void {

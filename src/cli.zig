@@ -407,6 +407,8 @@ pub const consume_help =
     "empty assignment; a member with zero partitions exits after that window.\n" ++
     "Commits mean records reached stdout, not that a downstream reader processed\n" ++
     "them. Failed output is not committed; records may be replayed after a crash.\n" ++
+    "Drain stdout within the group session timeout (45s default), or the broker\n" ++
+    "may fence this member and replay uncommitted records.\n" ++
     "\n" ++
     "Examples:\n" ++
     "  kite consume events\n" ++

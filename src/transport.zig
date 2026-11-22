@@ -53,9 +53,9 @@ pub const Conn = struct {
 };
 
 /// Connect TCP to host:port. host may be DNS or IP literal.
-fn tcpConnect(io: std.Io, host: []const u8, port: u16) !std.Io.net.Stream {
+fn tcpConnect(io: std.Io, host: []const u8, port: u16, timeout_ms: ?u64) !std.Io.net.Stream {
     const hn = std.Io.net.HostName.init(host) catch return error.HostNotFound;
-    const s = hn.connect(io, port, .{ .mode = .stream }) catch |err| return switch (err) {
+    const s = hn.connect(io, port, .{ .mode = .stream, .timeout = if (timeout_ms) |ms| .{ .duration = .{ .raw = .fromMilliseconds(@intCast(ms)), .clock = .awake } } else .none }) catch |err| return switch (err) {
         error.ConnectionRefused => error.ConnectionRefused,
         error.Timeout, error.HostUnreachable, error.NetworkUnreachable => error.ConnectTimedOut,
         error.UnknownHostName, error.NameServerFailure, error.NoAddressReturned => error.HostNotFound,
@@ -80,8 +80,9 @@ pub fn connect(
     host: []const u8,
     port: u16,
     ca: ?*std.crypto.Certificate.Bundle,
+    timeout_ms: ?u64,
 ) TransportError!*Conn {
-    const stream = tcpConnect(io, host, port) catch |err| return switch (err) {
+    const stream = tcpConnect(io, host, port, timeout_ms) catch |err| return switch (err) {
         error.ConnectionRefused, error.ConnectTimedOut, error.HostNotFound => err,
         else => error.ConnectFailed,
     };
@@ -111,6 +112,7 @@ pub fn connect(
     c.net_writer = stream.writer(io, &c.wbuf);
     c.input = &c.net_reader.interface;
     c.output = &c.net_writer.interface;
+    if (timeout_ms) |ms| setTimeout(c, ms);
 
     if (ca) |bundle| {
         var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
@@ -137,6 +139,12 @@ pub fn connect(
         c.output = &c.tls_client.?.writer;
     }
     return c;
+}
+
+pub fn setTimeout(c: *Conn, ms: u64) void {
+    const tv = std.posix.timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
+    std.posix.setsockopt(c.stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+    std.posix.setsockopt(c.stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
 }
 
 /// Send a framed request (4-byte big-endian length + payload).

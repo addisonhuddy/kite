@@ -394,6 +394,12 @@ Missing commits and lag appear as `-` (JSON `null`); unassigned partitions have
 empty member/client IDs in JSON. These commands are read-only, accept common
 connection flags and `@CLUSTER`, and do not change consumer offsets. Lag is a
 snapshot: producing or committing concurrently can change it during the query.
+Classic groups show offsets and lag without member/client IDs. Deleted topics
+or partitions retain committed offsets but show unavailable end/lag (`-`, or
+JSON null). Negative lag after truncation is clamped to zero with a warning.
+Lag uses the high watermark (`read_uncommitted`), like the stock tools, not
+the last stable offset used by `read_committed` consumers. Group listing warns
+and returns partial results when some brokers are unreachable.
 
 `consume -g GROUP` (or `--group GROUP`) joins a Kafka 4.0 consumer-protocol
 group and shares partitions with its other members. It resumes committed
@@ -401,8 +407,10 @@ offsets; `-B` selects earliest only for partitions without a commit, otherwise
 new groups start at latest. `--offset` and `--partition` cannot be used with
 groups. Without `-g`, consuming remains independent and does not commit.
 
-Offsets are committed after each successful stdout flush, using the last
-emitted offset plus one. **A commit means the record reached stdout, not that
+Offsets are committed after successful stdout flushes, at most once per second
+(and always on revoke or exit), using the fetch position or the last emitted
+offset plus one when `-n` stops mid-batch. **A commit means the record reached
+stdout, not that
 the downstream reader processed it.** Output errors do not commit the failed
 round; a crash can replay records (at-least-once delivery). `-n` commits only
 the records emitted within the limit. On idle, SIGINT, or reaching `-n`, kite
@@ -413,6 +421,8 @@ Group idle time starts at the first assignment heartbeat (even an empty
 assignment), not while joining. A member assigned zero partitions exits after
 that idle window unless `--follow` is used. `-v` logs joins, assignments, and
 commits. Heartbeats run between fetches; no background process is started.
+The stdout reader must drain within the broker's group session timeout (45s
+by default). A slower reader can cause fencing and replay of uncommitted records.
 
 ## Common recipes
 

@@ -41,13 +41,16 @@ pub const Retry = struct {
         r.started = start;
         const elapsed = start.durationTo(now).toMilliseconds();
         if (elapsed >= 30000) return false;
-        c.sleep(@min(r.backoff_ms, @as(u64, @intCast(30000 - elapsed))));
+        const remaining = c.groupRemainingMs() catch return false;
+        c.sleep(@min(remaining, @min(r.backoff_ms, @as(u64, @intCast(30000 - elapsed)))));
         r.backoff_ms = @min(r.backoff_ms * 2, 3000);
+        _ = c.groupRemainingMs() catch return false;
         return start.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds() < 30000;
     }
 };
 
 pub const Client = struct {
+    group_deadline: ?std.Io.Timestamp = null,
     alloc: std.mem.Allocator,
     io: std.Io,
     env: *std.process.Environ.Map,
@@ -219,11 +222,12 @@ pub const Client = struct {
     }
 
     fn connectOne(c: *Client, host: []const u8, port: u16) !*Conn {
+        const remaining = try c.groupRemainingMs();
         const ca: ?*std.crypto.Certificate.Bundle = if (c.cfg.needsTls())
             try c.loadCa()
         else
             null;
-        const conn = transport.connect(c.io, c.alloc, c.env, host, port, ca) catch |err| {
+        const conn = transport.connect(c.io, c.alloc, c.env, host, port, ca, if (c.group_deadline != null) remaining else null) catch |err| {
             switch (err) {
                 error.TlsHandshakeAuthFailed => c.setErr(
                     "TLS certificate verification failed for {s}:{d} (check ssl.truststore.location)",
@@ -331,7 +335,8 @@ pub const Client = struct {
         ctx: anytype,
         comptime body_fn: fn (*Encoder, @TypeOf(ctx)) protocol.ProtoError!void,
     ) !Resp {
-        _ = c;
+        const remaining = try c.groupRemainingMs();
+        transport.setTimeout(conn, remaining);
         var e = Encoder.init(alloc);
         defer e.deinit();
         // ApiVersions and SaslHandshake are the non-/semi-flexible oddballs:
@@ -546,11 +551,13 @@ pub const Client = struct {
         while (true) {
             if (c.control == null) c.reconnectControl() catch |err| {
                 if (retry.pause(c)) continue;
+                _ = try c.groupRemainingMs();
                 return err;
             };
             const resp = c.sendRequest(c.control.?, protocol.api_key.find_coordinator, protocol.version.find_coordinator, group, protocol.findCoordinatorRequest) catch |err| {
                 c.dropControl();
                 if (retry.pause(c)) continue;
+                _ = try c.groupRemainingMs();
                 return err;
             };
             defer c.alloc.free(resp.frame);
@@ -573,6 +580,13 @@ pub const Client = struct {
         }
     }
 
+    pub fn groupRemainingMs(c: *Client) !u64 {
+        const deadline = c.group_deadline orelse return 15000;
+        const remaining = std.Io.Timestamp.now(c.io, .awake).durationTo(deadline).toMilliseconds();
+        if (remaining <= 0) return error.GroupDeadlineExceeded;
+        return @intCast(@min(remaining, 15000));
+    }
+
     pub fn isCoordinatorError(code: protocol.ErrorCode) bool {
         return code == .not_coordinator or code == .coordinator_not_available or code == .group_load_in_progress;
     }
@@ -582,6 +596,8 @@ pub const Client = struct {
         c.setErr("consumer group: {s}", .{code.name()});
         if (code == .fenced_member_epoch) return error.FencedMemberEpoch;
         if (code == .unknown_member_id) return error.UnknownMemberId;
+        if (code == .stale_member_epoch) return error.StaleMemberEpoch;
+        if (code == .group_id_not_found) return error.GroupNotFound;
         return error.GroupFailed;
     }
 
@@ -593,16 +609,21 @@ pub const Client = struct {
     pub fn groupRequest(c: *Client, alloc: std.mem.Allocator, group: []const u8, key: i16, ver: i16, api: []const u8, ctx: anytype, comptime encode: fn (*Encoder, @TypeOf(ctx)) protocol.ProtoError!void) !Resp {
         try c.requireVersion(key, ver, api);
         var retry: Retry = .{};
+        var request = ctx;
         while (true) {
             const node = try c.findCoordinator(group);
             const conn = c.connFor(node, connKey(node, 0xFFFF_FFFE)) catch |err| {
                 c.invalidateCoordinator();
+                if (comptime @TypeOf(ctx) == protocol.Heartbeat) request.assignment = ctx.retry_assignment orelse ctx.assignment;
                 if (retry.pause(c)) continue;
+                _ = try c.groupRemainingMs();
                 return err;
             };
-            return c.sendRequestAlloc(alloc, conn, key, ver, ctx, encode) catch |err| {
+            return c.sendRequestAlloc(alloc, conn, key, ver, request, encode) catch |err| {
                 c.invalidateCoordinator();
+                if (comptime @TypeOf(ctx) == protocol.Heartbeat) request.assignment = ctx.retry_assignment orelse ctx.assignment;
                 if (retry.pause(c)) continue;
+                _ = try c.groupRemainingMs();
                 return err;
             };
         }
@@ -610,12 +631,14 @@ pub const Client = struct {
 
     pub fn heartbeat(c: *Client, alloc: std.mem.Allocator, req: protocol.Heartbeat) !protocol.HeartbeatResult {
         var retry: Retry = .{};
+        var request = req;
         while (true) {
-            const resp = try c.groupRequest(alloc, req.group, protocol.api_key.consumer_group_heartbeat, protocol.version.consumer_group_heartbeat, "ConsumerGroupHeartbeat", req, protocol.heartbeatRequest);
+            const resp = try c.groupRequest(alloc, req.group, protocol.api_key.consumer_group_heartbeat, protocol.version.consumer_group_heartbeat, "ConsumerGroupHeartbeat", request, protocol.heartbeatRequest);
             var d = Decoder.init(resp.body);
             const result = try protocol.heartbeatResponse(&d, alloc);
             if (isCoordinatorError(result.code)) {
                 c.invalidateCoordinator();
+                request.assignment = req.retry_assignment orelse req.assignment;
                 if (retry.pause(c)) continue;
             }
             return result;
@@ -704,6 +727,7 @@ pub const Client = struct {
                 c.invalidateCoordinator();
                 if (retry.pause(c)) continue;
             }
+            if (code == .unstable_offset_commit and retry.pause(c)) continue;
             try c.groupResult(code);
             return result;
         }
@@ -1673,6 +1697,20 @@ pub const Client = struct {
         try d.tagBuffer();
     }
 };
+
+test "group retry deadline is shared across nested retries" {
+    var c: Client = undefined;
+    c.io = std.testing.io;
+    c.group_deadline = std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(-1));
+    var outer: Retry = .{};
+    var inner: Retry = .{};
+    try std.testing.expect(!outer.pause(&c));
+    try std.testing.expect(!inner.pause(&c));
+    try std.testing.expectError(error.GroupDeadlineExceeded, c.groupRemainingMs());
+    c.group_deadline = null;
+    try std.testing.expectEqual(@as(u64, 15000), try c.groupRemainingMs());
+    try std.testing.expectError(error.StaleMemberEpoch, c.groupResult(.stale_member_epoch));
+}
 
 fn ackNanos(sent: std.Io.Timestamp, now: std.Io.Timestamp) u64 {
     return @intCast(@max(0, sent.durationTo(now).toNanoseconds()));

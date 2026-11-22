@@ -144,27 +144,55 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
     return count;
 }
 
+const group_rebalance_timeout_ms = 30000;
+const group_commit_floor_ms = 1000;
+const heartbeat_slack_ms = 100;
+
 const GroupSession = struct {
     c: *client.Client,
     opts: Options,
     member: [32]u8,
     epoch: i32 = 0,
-    interval: u64 = 1000,
+    interval: u64 = 5000,
     owned: std.ArrayList(Cursor) = .empty,
     assignment_seen: bool = false,
     heartbeat_due: bool = true,
     last_heartbeat: std.Io.Timestamp,
     last_record: std.Io.Timestamp,
+    last_commit: ?std.Io.Timestamp = null,
+    stale_retries: u8 = 0,
+
+    fn beginAttempt(s: *GroupSession) void {
+        s.c.group_deadline = std.Io.Timestamp.now(s.c.io, .awake).addDuration(.fromMilliseconds(@intCast(@min(30000, s.interval *| 3))));
+    }
+
+    fn recoverEpoch(s: *GroupSession, err: anyerror) bool {
+        switch (err) {
+            error.FencedMemberEpoch, error.UnknownMemberId, error.GroupDeadlineExceeded => s.rejoin(),
+            error.StaleMemberEpoch => {
+                if (s.stale_retries != 0) return false;
+                s.stale_retries += 1;
+                s.heartbeat_due = true;
+            },
+            else => return false,
+        }
+        return true;
+    }
 
     fn rejoin(s: *GroupSession) void {
         s.owned.clearRetainingCapacity();
         s.epoch = 0;
         s.heartbeat_due = true;
         s.assignment_seen = false;
+        s.stale_retries = 0;
         s.c.vlog("group '{s}': fenced; rejoining", .{s.opts.group.?});
     }
 
-    fn commit(s: *GroupSession, alloc: std.mem.Allocator) !void {
+    fn commit(s: *GroupSession, alloc: std.mem.Allocator, force: bool) !void {
+        const now = std.Io.Timestamp.now(s.c.io, .awake);
+        if (!force) if (s.last_commit) |last| {
+            if (last.durationTo(now).toMilliseconds() < group_commit_floor_ms) return;
+        };
         var parts: std.ArrayList(protocol.CommitPartition) = .empty;
         for (s.owned.items) |cursor| {
             if (pendingCommit(cursor)) |offset| try parts.append(alloc, .{ .partition = cursor.pidx, .offset = offset });
@@ -176,6 +204,7 @@ const GroupSession = struct {
             .member_epoch = s.epoch,
             .topics = &.{.{ .name = s.opts.topic, .partitions = parts.items }},
         });
+        s.last_commit = std.Io.Timestamp.now(s.c.io, .awake);
         for (s.owned.items) |*cursor| if (pendingCommit(cursor.*)) |offset| {
             cursor.committed = offset;
         };
@@ -187,13 +216,15 @@ const GroupSession = struct {
         const parts = try alloc.alloc(i32, s.owned.items.len);
         for (s.owned.items, parts) |cursor, *p| p.* = cursor.pidx;
         const joining = s.epoch == 0;
+        const full = joining or s.heartbeat_due;
         const result = try s.c.heartbeat(alloc, .{
             .group = s.opts.group.?,
             .member_id = &s.member,
             .member_epoch = s.epoch,
-            .rebalance_timeout_ms = if (joining) 30000 else -1,
-            .topics = if (joining) &.{s.opts.topic} else null,
-            .assignment = if (parts.len == 0) &.{} else &.{.{ .topic_id = s.c.topic_id, .partitions = parts }},
+            .rebalance_timeout_ms = if (full) group_rebalance_timeout_ms else -1,
+            .topics = if (full) &.{s.opts.topic} else null,
+            .assignment = if (full) (if (parts.len == 0) &.{} else &.{.{ .topic_id = s.c.topic_id, .partitions = parts }}) else null,
+            .retry_assignment = if (parts.len == 0) &.{} else &.{.{ .topic_id = s.c.topic_id, .partitions = parts }},
         });
         if (result.code == .fenced_member_epoch or result.code == .unknown_member_id) {
             s.rejoin();
@@ -209,12 +240,21 @@ const GroupSession = struct {
             if (!s.assignment_seen) s.last_record = std.Io.Timestamp.now(s.c.io, .awake);
             s.assignment_seen = true;
             var assigned: []const i32 = &.{};
+            var refreshed = false;
             for (assignment) |t| {
-                if (!std.mem.eql(u8, &t.topic_id, &s.c.topic_id)) return error.UnknownTopicAssignment;
+                if (!std.mem.eql(u8, &t.topic_id, &s.c.topic_id)) {
+                    if (!refreshed) try s.c.refreshMetadata(s.opts.topic);
+                    refreshed = true;
+                    if (!std.mem.eql(u8, &t.topic_id, &s.c.topic_id)) return error.UnknownTopicAssignment;
+                }
                 assigned = t.partitions;
             }
             if (!assignmentChanged(s.owned.items, assigned)) return;
-            try s.commit(alloc);
+            s.commit(alloc, true) catch |err| {
+                // Leaving after a failed revoke commit lets the next owner replay progress.
+                s.c.vlog("group '{s}': revoke commit failed ({s}); progress may replay", .{ s.opts.group.?, @errorName(err) });
+                return err;
+            };
             var next: std.ArrayList(Cursor) = .empty;
             errdefer next.deinit(s.c.alloc);
             var added: std.ArrayList(i32) = .empty;
@@ -257,6 +297,7 @@ const GroupSession = struct {
 
     fn leave(s: *GroupSession) void {
         if (s.epoch <= 0) return;
+        s.beginAttempt();
         var arena = std.heap.ArenaAllocator.init(s.c.alloc);
         defer arena.deinit();
         _ = s.c.heartbeat(arena.allocator(), .{ .group = s.opts.group.?, .member_id = &s.member, .member_epoch = -1 }) catch {};
@@ -314,7 +355,27 @@ test "fenced group discards cursors without committing" {
     try std.testing.expect(!session.assignment_seen);
 }
 
+test "stale epochs request one heartbeat and retry" {
+    var session: GroupSession = undefined;
+    session.stale_retries = 0;
+    session.heartbeat_due = false;
+    try std.testing.expect(session.recoverEpoch(error.StaleMemberEpoch));
+    try std.testing.expect(session.heartbeat_due);
+    try std.testing.expect(!session.recoverEpoch(error.StaleMemberEpoch));
+    try std.testing.expect(!session.recoverEpoch(error.GroupFailed));
+}
+
+test "commit floor skips network requests until due" {
+    var c: client.Client = undefined;
+    c.io = std.testing.io;
+    var session: GroupSession = undefined;
+    session.c = &c;
+    session.last_commit = std.Io.Timestamp.now(c.io, .awake);
+    try session.commit(std.testing.allocator, false);
+}
+
 fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
+    defer c.group_deadline = null;
     var random: [16]u8 = undefined;
     c.io.randomSecure(&random) catch c.io.random(&random);
     const now = std.Io.Timestamp.now(c.io, .awake);
@@ -333,11 +394,11 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         if (opts.max_records) |max| if (count >= max) break;
         if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
         _ = arena.reset(.retain_capacity);
+        session.beginAttempt();
         const elapsed = session.last_heartbeat.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds();
-        if (session.heartbeat_due or elapsed >= session.interval / 2) {
-            session.beat(&arena) catch |err| switch (err) {
-                error.FencedMemberEpoch, error.UnknownMemberId => session.rejoin(),
-                else => return err,
+        if (session.heartbeat_due or elapsed >= session.interval) {
+            session.beat(&arena) catch |err| {
+                if (!session.recoverEpoch(err)) return err;
             };
             if (session.heartbeat_due) continue;
         }
@@ -355,7 +416,13 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             try parts.append(arena.allocator(), .{ .pidx = cursor.pidx, .cursor = cursor });
         };
         var fetch_opts = opts;
-        fetch_opts.fetch_wait_ms = @min(c.cfg.fetch_max_wait_ms, @max(1, session.interval / 2));
+        const since_beat = session.last_heartbeat.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds();
+        const until_beat = session.interval -| @as(u64, @intCast(@max(0, since_beat)));
+        if (until_beat <= heartbeat_slack_ms) {
+            c.sleep(until_beat);
+            continue;
+        }
+        fetch_opts.fetch_wait_ms = @min(c.cfg.fetch_max_wait_ms, @max(1, until_beat -| heartbeat_slack_ms));
         var progress = false;
         var failed = false;
         fetchLeader(c, arena.allocator(), fetch_opts, parts.items, out, &scratch, &count, &progress) catch |err| switch (err) {
@@ -367,13 +434,11 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         };
         try out.flush();
         if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
-        session.commit(arena.allocator()) catch |err| switch (err) {
-            error.FencedMemberEpoch, error.UnknownMemberId => {
-                session.rejoin();
-                continue;
-            },
-            else => return err,
+        session.commit(arena.allocator(), false) catch |err| {
+            if (!session.recoverEpoch(err)) return err;
+            continue;
         };
+        session.stale_retries = 0;
         if (progress) session.last_record = std.Io.Timestamp.now(c.io, .awake);
         if (opts.stats) |s| s.maybeRender();
         if (failed) {
@@ -383,7 +448,14 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
     }
     try out.flush();
     if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
-    try session.commit(arena.allocator());
+    session.beginAttempt();
+    session.commit(arena.allocator(), true) catch |err| {
+        if (!session.recoverEpoch(err)) return err;
+        if (session.epoch > 0) {
+            try session.beat(&arena);
+            try session.commit(arena.allocator(), true);
+        }
+    };
     return count;
 }
 
@@ -621,6 +693,7 @@ fn fetchLeader(
             }
             var range = Range{};
             var next_from_batches: ?i64 = null;
+            var limited = false;
             if (records) |blob| {
                 var ctx = RecordSink{
                     .out = out,
@@ -642,16 +715,18 @@ fn fetchLeader(
                         return error.FetchFailed;
                     },
                 };
+                limited = ctx.limited;
             }
             if (range.last) |last| {
                 if (part.cursor.offset <= last + 1) part.cursor.offset = last + 1;
                 if (opts.group != null) part.cursor.emitted = last + 1;
             }
             if (next_from_batches) |next| {
-                if (opts.group == null or opts.max_records == null or count.* < opts.max_records.?) {
+                if (opts.group == null or !limited) {
                     if (part.cursor.offset < next) part.cursor.offset = next;
                 }
             }
+            if (opts.group != null and !limited) part.cursor.emitted = part.cursor.offset;
             if (range.first != null) {
                 progress.* = true;
                 c.vlog("fetch partition {d}: offsets {d}..{d}, high watermark {d}, records bytes {d}", .{
@@ -675,6 +750,7 @@ const Range = struct {
 };
 
 const RecordSink = struct {
+    limited: bool = false,
     out: *std.Io.Writer,
     count: *u64,
     max: ?u64,
@@ -765,7 +841,10 @@ fn writeJsonRecordColored(
 
 fn onRecord(ctx: *RecordSink, offset: i64, timestamp_ms: i64, rec: protocol.Record) !void {
     if (offset < ctx.min_offset) return;
-    if (ctx.max) |max| if (ctx.count.* >= max) return;
+    if (ctx.max) |max| if (ctx.count.* >= max) {
+        ctx.limited = true;
+        return;
+    };
     if (ctx.stats) |s| s.beforeOutput();
     switch (ctx.format) {
         .json => if (ctx.color)
