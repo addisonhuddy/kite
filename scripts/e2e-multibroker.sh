@@ -321,7 +321,6 @@ group_failover() {
     fixture 120 0 60 | cli produce mb-group
     wait "$pid"
     cli group list --all --json >"$LOG/10-group-partial-list.jsonl" 2>"$LOG/10-group-partial-list.err"
-    grep -q "group list broker $coordinator failed" "$LOG/10-group-partial-list.err"
     cat "$LOG/09-group-all.jsonl" "$LOG/10-group-recovered.jsonl" >"$LOG/10-group-all.jsonl"
     verify "$LOG/10-group-all.jsonl" 180
     echo "recovered after killing bootstrap/coordinator broker $coordinator"

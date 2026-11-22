@@ -434,6 +434,7 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         };
         try out.flush();
         if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
+        session.beginAttempt();
         session.commit(arena.allocator(), false) catch |err| {
             if (!session.recoverEpoch(err)) return err;
             continue;
