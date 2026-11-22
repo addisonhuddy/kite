@@ -544,7 +544,15 @@ pub const Client = struct {
         try c.requireVersion(protocol.api_key.find_coordinator, protocol.version.find_coordinator, "FindCoordinator");
         var retry: Retry = .{};
         while (true) {
-            const resp = try c.sendRequest(c.control orelse return error.NotConnected, protocol.api_key.find_coordinator, protocol.version.find_coordinator, group, protocol.findCoordinatorRequest);
+            if (c.control == null) c.reconnectControl() catch |err| {
+                if (retry.pause(c)) continue;
+                return err;
+            };
+            const resp = c.sendRequest(c.control.?, protocol.api_key.find_coordinator, protocol.version.find_coordinator, group, protocol.findCoordinatorRequest) catch |err| {
+                c.dropControl();
+                if (retry.pause(c)) continue;
+                return err;
+            };
             defer c.alloc.free(resp.frame);
             var d = Decoder.init(resp.body);
             const coord = try protocol.coordinatorResponse(&d);

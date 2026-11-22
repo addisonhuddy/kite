@@ -303,4 +303,27 @@ assert len(rows)==6 and all(r['lag']==0 and not r['member_id'] for r in rows), r
 PY
 }
 run 09-group-nonbootstrap-coordinator group_coordinator
+
+group_failover() {
+    local coordinator g pid deadline
+    g=$(awk 'NR==3 {print $1}' "$LOG/09-group-state.txt")
+    coordinator=$(awk 'NR==3 {for(i=2;i<=NF;i++) if($i ~ /^\([0-9]+\)$/) {gsub(/[()]/,"",$i); print $i}}' "$LOG/09-group-state.txt")
+    [ -n "$g" ] && [ -n "$coordinator" ]
+    BOOTSTRAP_SERVERS="127.0.0.1:$((19091 + coordinator))" cli consume -g "$g" -B -n 120 --idle 60s --json mb-group >"$LOG/10-group-recovered.jsonl" 2>"$LOG/10-group-recovered.err" &
+    pid=$!
+    deadline=$((SECONDS + 30))
+    until rg -q 'joined group' "$LOG/10-group-recovered.err"; do
+        kill -0 "$pid"
+        [ "$SECONDS" -lt "$deadline" ]
+        sleep 0.2
+    done
+    docker kill "$NAME-$coordinator" >/dev/null
+    fixture 120 0 60 | cli produce mb-group
+    wait "$pid"
+    cat "$LOG/09-group-all.jsonl" "$LOG/10-group-recovered.jsonl" >"$LOG/10-group-all.jsonl"
+    verify "$LOG/10-group-all.jsonl" 180
+    echo "recovered after killing bootstrap/coordinator broker $coordinator"
+    restore
+}
+run 10-group-bootstrap-coordinator-loss group_failover
 exit "$status"
