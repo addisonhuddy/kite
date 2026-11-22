@@ -386,7 +386,7 @@ kite consume -g orders -B events
 ```
 
 `group list` queries every broker and lists consumer-protocol groups by default.
-`group describe` requires Kafka's consumer group protocol (KIP-848). It prints
+`group describe` supports consumer-protocol and classic groups. It prints
 one row per assigned or committed partition with `group`, `topic`, `partition`,
 `committed`, `end`, `lag`, `member_id`, and `client_id`. Output is tab-separated
 (with a header on terminals), or one JSON object per partition with `--json`.

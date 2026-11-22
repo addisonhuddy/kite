@@ -1007,7 +1007,16 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
         std.process.exit(0);
     }
     const group = opts.group.?;
-    const described = c.describeGroup(alloc, group) catch fatalErr(&c, "could not describe group (requires consumer group protocol / KIP-848)");
+    const described = c.describeGroup(alloc, group) catch |err| switch (err) {
+        error.GroupNotFound => classic: {
+            const groups = c.listGroups(alloc, true) catch fatalErr(&c, "could not list classic groups");
+            for (groups) |g| {
+                if (std.mem.eql(u8, g.group, group)) break :classic protocol.DescribedGroup{ .code = .none, .message = null, .group = group, .state = g.state, .partitions = &.{} };
+            }
+            fatalErr(&c, "could not describe group");
+        },
+        else => fatalErr(&c, "could not describe group"),
+    };
     const fetched = c.fetchGroupOffsets(alloc, .{ .group = group }) catch fatalErr(&c, "could not fetch group offsets");
     const Row = struct { topic: []const u8, partition: i32, committed: i64 = -1, member: []const u8 = "", client_id: []const u8 = "" };
     var rows: std.ArrayList(Row) = .empty;
@@ -1033,20 +1042,28 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
     var i: usize = 0;
     while (i < rows.items.len) {
         const topic = rows.items[i].topic;
-        c.refreshMetadata(topic) catch fatalErr(&c, "could not resolve topic");
-        const cursors = alloc.alloc(consumer.Cursor, c.partitions.items.len) catch oom();
-        for (c.partitions.items, cursors) |p, *cursor| cursor.* = .{ .pidx = p.index, .leader = p.leader, .offset = -1 };
+        const available = if (c.refreshMetadata(topic)) |_| true else |err| switch (err) {
+            error.TopicNotFound => false,
+            else => fatalErr(&c, "could not resolve topic"),
+        };
+        const cursors = alloc.alloc(consumer.Cursor, if (available) c.partitions.items.len else 0) catch oom();
+        if (available) for (c.partitions.items, cursors) |p, *cursor| {
+            cursor.* = .{ .pidx = p.index, .leader = p.leader, .offset = -1 };
+        };
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
-        consumer.listOffsets(&c, &arena, topic, cursors, .latest) catch fatalErr(&c, "could not fetch end offsets");
+        if (available) consumer.listOffsets(&c, &arena, topic, cursors, .latest) catch fatalErr(&c, "could not fetch end offsets");
         while (i < rows.items.len and std.mem.eql(u8, topic, rows.items[i].topic)) : (i += 1) {
             const r = rows.items[i];
             var end: ?i64 = null;
             for (cursors) |cursor| if (cursor.pidx == r.partition) {
                 end = cursor.offset;
             };
-            const latest = end orelse fatal("partition {s}/{d} no longer exists", .{ topic, r.partition });
-            const lag = latest - r.committed;
+            if (end == null) note("warning: {s}/{d} no longer exists; end and lag unavailable", .{ topic, r.partition });
+            if (end) |latest| {
+                if (r.committed > latest) note("warning: {s}/{d} committed offset exceeds end; lag clamped to 0", .{ topic, r.partition });
+            }
+            const lag = groupLag(r.committed, end);
             if (as_json) {
                 outw.writeAll("{\"group\":") catch {};
                 json.writeString(outw, group) catch {};
@@ -1054,8 +1071,10 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
                 json.writeString(outw, topic) catch {};
                 outw.print(",\"partition\":{d},\"committed\":", .{r.partition}) catch {};
                 if (r.committed < 0) outw.writeAll("null") catch {} else outw.print("{d}", .{r.committed}) catch {};
-                outw.print(",\"end\":{d},\"lag\":", .{latest}) catch {};
-                if (r.committed < 0) outw.writeAll("null") catch {} else outw.print("{d}", .{lag}) catch {};
+                outw.writeAll(",\"end\":") catch {};
+                if (end) |latest| outw.print("{d}", .{latest}) catch {} else outw.writeAll("null") catch {};
+                outw.writeAll(",\"lag\":") catch {};
+                if (lag) |value| outw.print("{d}", .{value}) catch {} else outw.writeAll("null") catch {};
                 outw.writeAll(",\"member_id\":") catch {};
                 json.writeString(outw, r.member) catch {};
                 outw.writeAll(",\"client_id\":") catch {};
@@ -1064,8 +1083,10 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
             } else {
                 outw.print("{s}\t{s}\t{d}\t", .{ group, topic, r.partition }) catch {};
                 if (r.committed < 0) outw.writeByte('-') catch {} else outw.print("{d}", .{r.committed}) catch {};
-                outw.print("\t{d}\t", .{latest}) catch {};
-                if (r.committed < 0) outw.writeByte('-') catch {} else outw.print("{d}", .{lag}) catch {};
+                outw.writeByte('\t') catch {};
+                if (end) |latest| outw.print("{d}", .{latest}) catch {} else outw.writeByte('-') catch {};
+                outw.writeByte('\t') catch {};
+                if (lag) |value| outw.print("{d}", .{value}) catch {} else outw.writeByte('-') catch {};
                 outw.print("\t{s}\t{s}\n", .{ if (r.member.len == 0) "-" else r.member, if (r.client_id.len == 0) "-" else r.client_id }) catch {};
             }
         }
@@ -1073,6 +1094,18 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
     outw.flush() catch {};
     if (!opts.common.quiet) note("{s}: {s}, {d} partition(s)", .{ group, described.state, rows.items.len });
     std.process.exit(0);
+}
+
+fn groupLag(committed: i64, end: ?i64) ?i64 {
+    if (committed < 0) return null;
+    return @max(0, (end orelse return null) - committed);
+}
+
+test "group lag handles missing and truncated offsets" {
+    try std.testing.expectEqual(@as(?i64, 3), groupLag(2, 5));
+    try std.testing.expectEqual(@as(?i64, 0), groupLag(8, 5));
+    try std.testing.expect(groupLag(-1, 5) == null);
+    try std.testing.expect(groupLag(2, null) == null);
 }
 
 /// `kite topic [list|create|delete|update]`: topic administration over the

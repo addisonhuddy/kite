@@ -670,32 +670,43 @@ pub const Client = struct {
         for (topics) |t| c.alloc.free(t.name);
         c.alloc.free(topics);
         var groups: std.ArrayList(protocol.ListedGroup) = .empty;
+        var answered: usize = 0;
         var nodes = c.brokers.keyIterator();
         while (nodes.next()) |node| {
-            const conn = try c.connFor(node.*, connKey(node.*, 0xFFFF_FFFE));
-            var retry: Retry = .{};
-            while (true) {
-                const resp = try c.sendRequestAlloc(alloc, conn, protocol.api_key.list_groups, protocol.version.list_groups, all, protocol.listGroupsRequest);
-                var d = Decoder.init(resp.body);
-                const result = try protocol.listGroupsResponse(&d, alloc);
-                if (isCoordinatorError(result.code) and retry.pause(c)) continue;
-                try c.groupResult(result.code);
-                for (result.groups) |g| {
-                    var duplicate = false;
-                    for (groups.items) |old| {
-                        if (std.mem.eql(u8, old.group, g.group)) duplicate = true;
-                    }
-                    if (!duplicate) try groups.append(alloc, g);
+            const result = c.listGroupsOnNode(alloc, node.*, all) catch |err| {
+                c.dropConn(connKey(node.*, 0xFFFF_FFFE));
+                std.debug.print("kite: warning: group list broker {d} failed ({s}); results may be incomplete\n", .{ node.*, @errorName(err) });
+                continue;
+            };
+            answered += 1;
+            for (result) |g| {
+                var duplicate = false;
+                for (groups.items) |old| {
+                    if (std.mem.eql(u8, old.group, g.group)) duplicate = true;
                 }
-                break;
+                if (!duplicate) try groups.append(alloc, g);
             }
         }
+        if (answered == 0) return error.GroupFailed;
         std.mem.sort(protocol.ListedGroup, groups.items, {}, struct {
             fn less(_: void, a: protocol.ListedGroup, b: protocol.ListedGroup) bool {
                 return std.mem.lessThan(u8, a.group, b.group);
             }
         }.less);
         return groups.toOwnedSlice(alloc);
+    }
+
+    fn listGroupsOnNode(c: *Client, alloc: std.mem.Allocator, node: i32, all: bool) ![]protocol.ListedGroup {
+        const conn = try c.connFor(node, connKey(node, 0xFFFF_FFFE));
+        var retry: Retry = .{};
+        while (true) {
+            const resp = try c.sendRequestAlloc(alloc, conn, protocol.api_key.list_groups, protocol.version.list_groups, all, protocol.listGroupsRequest);
+            var d = Decoder.init(resp.body);
+            const result = try protocol.listGroupsResponse(&d, alloc);
+            if (isCoordinatorError(result.code) and retry.pause(c)) continue;
+            try c.groupResult(result.code);
+            return result.groups;
+        }
     }
 
     pub fn describeGroup(c: *Client, alloc: std.mem.Allocator, group: []const u8) !protocol.DescribedGroup {

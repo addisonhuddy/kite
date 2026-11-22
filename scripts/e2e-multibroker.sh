@@ -312,7 +312,7 @@ group_failover() {
     BOOTSTRAP_SERVERS="127.0.0.1:$((19091 + coordinator))" cli consume -g "$g" -B -n 120 --idle 60s --json mb-group >"$LOG/10-group-recovered.jsonl" 2>"$LOG/10-group-recovered.err" &
     pid=$!
     deadline=$((SECONDS + 30))
-    until rg -q 'joined group' "$LOG/10-group-recovered.err"; do
+    until grep -q 'joined group' "$LOG/10-group-recovered.err"; do
         kill -0 "$pid"
         [ "$SECONDS" -lt "$deadline" ]
         sleep 0.2
@@ -320,6 +320,8 @@ group_failover() {
     docker kill "$NAME-$coordinator" >/dev/null
     fixture 120 0 60 | cli produce mb-group
     wait "$pid"
+    cli group list --all --json >"$LOG/10-group-partial-list.jsonl" 2>"$LOG/10-group-partial-list.err"
+    grep -q "group list broker $coordinator failed" "$LOG/10-group-partial-list.err"
     cat "$LOG/09-group-all.jsonl" "$LOG/10-group-recovered.jsonl" >"$LOG/10-group-all.jsonl"
     verify "$LOG/10-group-all.jsonl" 180
     echo "recovered after killing bootstrap/coordinator broker $coordinator"

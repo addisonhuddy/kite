@@ -91,7 +91,7 @@ pub const group_help =
     "  -v, --verbose                 Verbose diagnostics.\n" ++
     "  -h, --help                    Show this help.\n\n" ++
     "Examples:\n  kite group list @prod --json\n  kite group describe orders\n\n" ++
-    "Describe requires the consumer group protocol (KIP-848); classic groups are list-only.\n" ++
+    "Describe shows offsets only for classic groups (member/client IDs are empty).\n" ++
     "A missing commit is shown as '-' (JSON null), including lag.\n";
 
 pub fn parseGroup(alloc: std.mem.Allocator, args: []const []const u8) Result(GroupArgs) {

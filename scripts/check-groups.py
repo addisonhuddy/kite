@@ -129,6 +129,34 @@ try:
     replay = consume("kite-broken", broken, "-B", "--idle", "2s")
     assert [r["offset"] for r in replay] == list(range(64)), [r["offset"] for r in replay]
     print("PASS groups broken pipe replays uncommitted round without skips", flush=True)
+
+    transactional = "kite-group-transactional"
+    run("topic", "create", "-p", "1", transactional)
+    result = subprocess.run([
+        "docker", "exec", "kite-e2e-kafka", "/opt/kafka/bin/kafka-producer-perf-test.sh",
+        "--topic", transactional, "--num-records", "20", "--record-size", "16",
+        "--throughput", "-1", "--transactional-id", "kite-txn-writer",
+        "--transaction-duration-ms", "100", "--producer-props", "bootstrap.servers=localhost:9092",
+    ], text=True, capture_output=True, timeout=90)
+    assert result.returncode == 0, result.stderr
+    records = consume("kite-txn", transactional, "-B", "--idle", "10s")
+    assert len(records) == 20, len(records)
+    description = rows(run("group", "describe", "kite-txn", "--json"))
+    assert len(description) == 1 and description[0]["lag"] == 0, description
+    assert description[0]["end"] > 20, description
+    print("PASS groups transactional control markers commit fetch position and lag zero", flush=True)
+
+    result = subprocess.run([
+        "docker", "exec", "kite-e2e-kafka", "/opt/kafka/bin/kafka-console-consumer.sh",
+        "--bootstrap-server", "localhost:9092", "--topic", topic,
+        "--group", "kite-classic", "--from-beginning", "--max-messages", "13",
+        "--consumer-property", "group.protocol=classic",
+    ], text=True, capture_output=True, timeout=90)
+    assert result.returncode == 0, result.stderr
+    description = rows(run("group", "describe", "kite-classic", "--json"))
+    assert len(description) == 1 and description[0]["lag"] == 0, description
+    assert not description[0]["member_id"] and not description[0]["client_id"], description
+    print("PASS groups classic describe falls back to committed offsets", flush=True)
 finally:
     for process, _, _ in workers:
         if process.poll() is None:
