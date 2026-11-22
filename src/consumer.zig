@@ -38,7 +38,7 @@ pub const Error = error{
     OffsetOutOfRange,
 };
 
-const Cursor = struct {
+pub const Cursor = struct {
     pidx: i32,
     leader: i32,
     offset: i64,
@@ -144,7 +144,7 @@ fn refreshLeaders(c: *client.Client, topic: []const u8, cursors: []Cursor) void 
     for (cursors) |*cursor| cursor.leader = c.partitionLeader(cursor.pidx) orelse -1;
 }
 
-fn listOffsets(
+pub fn listOffsets(
     c: *client.Client,
     arena: *std.heap.ArenaAllocator,
     topic: []const u8,

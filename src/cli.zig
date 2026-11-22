@@ -55,6 +55,7 @@ pub const Command = enum {
     consume,
     cluster,
     topic,
+    group,
     update,
 };
 
@@ -65,6 +66,89 @@ pub const ClusterArgs = struct {
     name: ?[]const u8 = null,
     common: Common = .{},
 };
+
+pub const GroupArgs = struct {
+    action: enum { list, describe } = .list,
+    group: ?[]const u8 = null,
+    all: bool = false,
+    common: Common = .{},
+};
+
+pub const group_usage = "Usage: kite group [list|describe GROUP] [--json] [OPTIONS] [@CLUSTER]\n" ++
+    "Try 'kite group --help' for examples.\n";
+
+pub const group_help =
+    "kite group - List consumer groups and describe partition lag\n\n" ++
+    group_usage ++ "\n" ++
+    "  kite group list [--all]       List consumer groups on every broker.\n" ++
+    "  kite group describe GROUP     Show committed offsets, end offsets, lag, and members.\n\n" ++
+    "  --json                        One JSON object per group or partition.\n" ++
+    "  -a, --all                     Include classic groups (list only).\n" ++
+    "  -b, --bootstrap HOST:PORT     Bootstrap broker(s).\n" ++
+    "  --config PATH                 Kafka properties file.\n" ++
+    "  -q, --quiet                   Suppress summary.\n" ++
+    "  -v, --verbose                 Verbose diagnostics.\n" ++
+    "  -h, --help                    Show this help.\n\n" ++
+    "Examples:\n  kite group list @prod --json\n  kite group describe orders\n\n" ++
+    "Describe requires the consumer group protocol (KIP-848); classic groups are list-only.\n" ++
+    "A missing commit is shown as '-' (JSON null), including lag.\n";
+
+pub fn parseGroup(alloc: std.mem.Allocator, args: []const []const u8) Result(GroupArgs) {
+    var parsed: GroupArgs = .{};
+    var action_seen = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return .help;
+        if (parseCommon(alloc, &parsed.common, args, &i)) |step| {
+            switch (step) {
+                .ok => continue,
+                .err => |m| return .{ .err = m },
+            }
+        }
+        if (std.mem.eql(u8, arg, "--all") or std.mem.eql(u8, arg, "-a")) {
+            parsed.all = true;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return .{ .err = unknownOption(alloc, .group, arg) };
+        } else if (!action_seen) {
+            if (std.mem.eql(u8, arg, "list")) {
+                parsed.action = .list;
+            } else if (std.mem.eql(u8, arg, "describe")) {
+                parsed.action = .describe;
+            } else return errorResult(GroupArgs, alloc, "unknown group action '{s}' (want list or describe)", .{arg});
+            action_seen = true;
+        } else if (parsed.action == .describe and parsed.group == null) {
+            if (arg.len == 0) return .{ .err = "GROUP must not be empty" };
+            parsed.group = arg;
+        } else return errorResult(GroupArgs, alloc, "unexpected argument '{s}'", .{arg});
+    }
+    if (parsed.action == .describe and parsed.group == null) return .{ .err = "missing GROUP" };
+    if (parsed.action == .describe and parsed.all) return .{ .err = "--all is only valid for group list" };
+    if (parsed.common.format != .auto and parsed.common.format != .json and parsed.common.format != .tsv)
+        return .{ .err = "group supports --json or --format tsv" };
+    if (finishCommon(parsed.common)) |m| return .{ .err = m };
+    return .{ .ok = parsed };
+}
+
+test "group parser actions flags and cluster selector" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const list = parseGroup(a, &.{ "list", "--all", "--json", "@prod", "-b", "localhost:9092" }).ok;
+    try std.testing.expect(list.all);
+    try std.testing.expectEqual(Format.json, list.common.format);
+    try std.testing.expectEqualStrings("prod", list.common.target.?);
+    const desc = parseGroup(a, &.{ "@prod", "describe", "g" }).ok;
+    try std.testing.expectEqualStrings("g", desc.group.?);
+    try std.testing.expect(parseGroup(a, &.{}).ok.action == .list);
+    try std.testing.expect(parseGroup(a, &.{ "describe", "--help" }) == .help);
+    for ([_][]const []const u8{
+        &.{"describe"},                 &.{ "describe", "" }, &.{ "list", "g" },  &.{ "describe", "g", "extra" },
+        &.{ "describe", "g", "--all" }, &.{"delete"},         &.{"--bogus"},      &.{ "-q", "-v" },
+        &.{ "--format", "csv" },        &.{ "@a", "@b" },     &.{"--bootstrap="},
+    }) |args| try std.testing.expect(parseGroup(a, args) == .err);
+    try std.testing.expectEqual(Command.group, splitCommand(a, &.{ "group", "list" }).ok.command);
+}
 
 pub const TopicAction = enum { list, create, delete, update };
 
@@ -95,6 +179,7 @@ pub const CommandSplit = struct {
 };
 
 fn matchCommand(arg: []const u8) ?Command {
+    if (std.mem.eql(u8, arg, "group")) return .group;
     if (std.mem.eql(u8, arg, "produce") or std.mem.eql(u8, arg, "p")) return .produce;
     if (std.mem.eql(u8, arg, "consume") or std.mem.eql(u8, arg, "c")) return .consume;
     if (std.mem.eql(u8, arg, "cluster")) return .cluster;
@@ -103,7 +188,7 @@ fn matchCommand(arg: []const u8) ?Command {
     return null;
 }
 
-const command_names = [_][]const u8{ "produce", "consume", "cluster", "topic", "update" };
+const command_names = [_][]const u8{ "produce", "consume", "cluster", "topic", "group", "update" };
 
 /// Closest command name when exactly one is within distance 2.
 fn suggestCommand(name: []const u8) ?[]const u8 {
@@ -143,7 +228,7 @@ pub fn splitCommand(alloc: std.mem.Allocator, args: []const []const u8) Result(C
         return .{ .err = firstArgError(alloc, arg) };
     }
     if (want_help) return .help;
-    return .{ .err = "missing command (want produce, consume, cluster, or topic)" };
+    return .{ .err = "missing command (want produce, consume, cluster, topic, or group)" };
 }
 
 /// Migration errors for the 0.1 flag-mode spellings and the removed
@@ -201,6 +286,8 @@ pub const overview_help =
     "  kite consume [OPTIONS] [@CLUSTER] TOPIC   Read TOPIC to stdout.\n" ++
     "  kite topic [ACTION] [OPTIONS] [@CLUSTER] [TOPIC...]\n" ++
     "                                            List, create, delete, update topics.\n" ++
+    "  kite group [list|describe GROUP] [OPTIONS] [@CLUSTER]\n" ++
+    "                                            List groups and inspect lag.\n" ++
     "  kite cluster [list|set NAME|init]         Pick or set the current cluster.\n" ++
     "  kite update [VERSION]                     Install the latest kite release.\n" ++
     "  kite --help                               Show this help.\n" ++
@@ -550,6 +637,7 @@ fn suggestOption(command: Command, name: []const u8) ?[]const u8 {
         .consume => &consume_options,
         .cluster => &cluster_options,
         .topic => &topic_options,
+        .group => &.{ "--bootstrap", "--config", "--json", "--all", "--quiet", "--verbose", "--help" },
         .update => &update_options,
     };
     var best: ?[]const u8 = null;
@@ -592,7 +680,7 @@ fn unknownOption(alloc: std.mem.Allocator, command: Command, arg: []const u8) []
             return errMsg(alloc, "'{s}' is a consume option; use 'kite consume [OPTIONS] TOPIC'", .{name}),
         .consume => if (isOneOf(name, &produce_only))
             return errMsg(alloc, "'{s}' is a produce option; use 'kite produce [OPTIONS] TOPIC'", .{name}),
-        .cluster, .topic, .update => {},
+        .cluster, .topic, .group, .update => {},
     }
     if (suggestOption(command, name)) |candidate|
         return errMsg(alloc, "unknown option '{s}' (did you mean '{s}'?)", .{ arg, candidate });
@@ -1297,7 +1385,7 @@ test "the first argument names the command" {
     // -h / --help with no command asks for the top-level overview.
     try std.testing.expectEqual(Result(CommandSplit).help, splitCommand(alloc, &.{"--help"}));
     try std.testing.expectEqual(Result(CommandSplit).help, splitCommand(alloc, &.{"-h"}));
-    try expectErr(CommandSplit, splitCommand(alloc, &.{}), "missing command (want produce, consume, cluster, or topic)");
+    try expectErr(CommandSplit, splitCommand(alloc, &.{}), "missing command (want produce, consume, cluster, topic, or group)");
 }
 
 test "update takes an optional release tag" {

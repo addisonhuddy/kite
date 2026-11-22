@@ -68,6 +68,8 @@ pub const Client = struct {
     brokers: std.AutoHashMapUnmanaged(i32, BrokerAddr),
     /// controller node_id from the last Metadata response (-1 = unknown)
     controller_id: i32 = -1,
+    coordinator_group: ?[]const u8 = null,
+    coordinator_node: i32 = -1,
     /// partition index -> leader node_id for the target topic
     partitions: std.ArrayListUnmanaged(Partition),
     /// api_key -> negotiated range, from the last ApiVersions response
@@ -120,6 +122,7 @@ pub const Client = struct {
     }
 
     pub fn deinit(c: *Client) void {
+        if (c.coordinator_group) |g| c.alloc.free(g);
         c.dropControl();
         var it = c.conns.valueIterator();
         while (it.next()) |conn| {
@@ -528,6 +531,168 @@ pub const Client = struct {
 
     pub fn partitionCount(c: *const Client) usize {
         return c.partitions.items.len;
+    }
+
+    pub fn findCoordinator(c: *Client, group: []const u8) !i32 {
+        if (c.coordinator_group) |cached| {
+            if (std.mem.eql(u8, cached, group) and c.coordinator_node >= 0) return c.coordinator_node;
+        }
+        try c.requireVersion(protocol.api_key.find_coordinator, protocol.version.find_coordinator, "FindCoordinator");
+        var retry: Retry = .{};
+        while (true) {
+            const resp = try c.sendRequest(c.control orelse return error.NotConnected, protocol.api_key.find_coordinator, protocol.version.find_coordinator, group, protocol.findCoordinatorRequest);
+            defer c.alloc.free(resp.frame);
+            var d = Decoder.init(resp.body);
+            const coord = try protocol.coordinatorResponse(&d);
+            if (isCoordinatorError(coord.code) and retry.pause(c)) continue;
+            try c.groupResult(coord.code);
+            if (coord.node < 0 or coord.host.len == 0 or coord.port < 1 or coord.port > 65535) return error.MalformedResponse;
+            const name = try c.alloc.dupe(u8, group);
+            errdefer c.alloc.free(name);
+            const host = try c.alloc.dupe(u8, coord.host);
+            errdefer c.alloc.free(host);
+            const entry = try c.brokers.getOrPut(c.alloc, coord.node);
+            if (entry.found_existing) c.alloc.free(entry.value_ptr.host);
+            entry.value_ptr.* = .{ .host = host, .port = @intCast(coord.port) };
+            if (c.coordinator_group) |old| c.alloc.free(old);
+            c.coordinator_group = name;
+            c.coordinator_node = coord.node;
+            return coord.node;
+        }
+    }
+
+    pub fn isCoordinatorError(code: protocol.ErrorCode) bool {
+        return code == .not_coordinator or code == .coordinator_not_available or code == .group_load_in_progress;
+    }
+
+    pub fn groupResult(c: *Client, code: protocol.ErrorCode) !void {
+        if (code == .none) return;
+        c.setErr("consumer group: {s}", .{code.name()});
+        return error.GroupFailed;
+    }
+
+    pub fn invalidateCoordinator(c: *Client) void {
+        if (c.coordinator_node >= 0) c.dropConn(connKey(c.coordinator_node, 0xFFFF_FFFE));
+        c.coordinator_node = -1;
+    }
+
+    pub fn groupRequest(c: *Client, alloc: std.mem.Allocator, group: []const u8, key: i16, ver: i16, api: []const u8, ctx: anytype, comptime encode: fn (*Encoder, @TypeOf(ctx)) protocol.ProtoError!void) !Resp {
+        try c.requireVersion(key, ver, api);
+        var retry: Retry = .{};
+        while (true) {
+            const node = try c.findCoordinator(group);
+            const conn = c.connFor(node, connKey(node, 0xFFFF_FFFE)) catch |err| {
+                c.invalidateCoordinator();
+                if (retry.pause(c)) continue;
+                return err;
+            };
+            return c.sendRequestAlloc(alloc, conn, key, ver, ctx, encode) catch |err| {
+                c.invalidateCoordinator();
+                if (retry.pause(c)) continue;
+                return err;
+            };
+        }
+    }
+
+    pub fn heartbeat(c: *Client, alloc: std.mem.Allocator, req: protocol.Heartbeat) !protocol.HeartbeatResult {
+        var retry: Retry = .{};
+        while (true) {
+            const resp = try c.groupRequest(alloc, req.group, protocol.api_key.consumer_group_heartbeat, protocol.version.consumer_group_heartbeat, "ConsumerGroupHeartbeat", req, protocol.heartbeatRequest);
+            var d = Decoder.init(resp.body);
+            const result = try protocol.heartbeatResponse(&d, alloc);
+            if (isCoordinatorError(result.code)) {
+                c.invalidateCoordinator();
+                if (retry.pause(c)) continue;
+            }
+            return result;
+        }
+    }
+
+    pub fn commitGroupOffsets(c: *Client, alloc: std.mem.Allocator, req: protocol.OffsetCommit) !void {
+        var retry: Retry = .{};
+        while (true) {
+            const resp = try c.groupRequest(alloc, req.group, protocol.api_key.offset_commit, protocol.version.offset_commit, "OffsetCommit", req, protocol.offsetCommitRequest);
+            var d = Decoder.init(resp.body);
+            const result = try protocol.offsetCommitResponse(&d, alloc);
+            var code: protocol.ErrorCode = .none;
+            for (result) |p| {
+                if (p.code != .none) code = p.code;
+            }
+            if (isCoordinatorError(code)) {
+                c.invalidateCoordinator();
+                if (retry.pause(c)) continue;
+            }
+            try c.groupResult(code);
+            return;
+        }
+    }
+
+    pub fn listGroups(c: *Client, alloc: std.mem.Allocator, all: bool) ![]protocol.ListedGroup {
+        try c.requireVersion(protocol.api_key.list_groups, protocol.version.list_groups, "ListGroups");
+        const topics = try c.listTopics();
+        for (topics) |t| c.alloc.free(t.name);
+        c.alloc.free(topics);
+        var groups: std.ArrayList(protocol.ListedGroup) = .empty;
+        var nodes = c.brokers.keyIterator();
+        while (nodes.next()) |node| {
+            const conn = try c.connFor(node.*, connKey(node.*, 0xFFFF_FFFE));
+            var retry: Retry = .{};
+            while (true) {
+                const resp = try c.sendRequestAlloc(alloc, conn, protocol.api_key.list_groups, protocol.version.list_groups, all, protocol.listGroupsRequest);
+                var d = Decoder.init(resp.body);
+                const result = try protocol.listGroupsResponse(&d, alloc);
+                if (isCoordinatorError(result.code) and retry.pause(c)) continue;
+                try c.groupResult(result.code);
+                for (result.groups) |g| {
+                    var duplicate = false;
+                    for (groups.items) |old| {
+                        if (std.mem.eql(u8, old.group, g.group)) duplicate = true;
+                    }
+                    if (!duplicate) try groups.append(alloc, g);
+                }
+                break;
+            }
+        }
+        std.mem.sort(protocol.ListedGroup, groups.items, {}, struct {
+            fn less(_: void, a: protocol.ListedGroup, b: protocol.ListedGroup) bool {
+                return std.mem.lessThan(u8, a.group, b.group);
+            }
+        }.less);
+        return groups.toOwnedSlice(alloc);
+    }
+
+    pub fn describeGroup(c: *Client, alloc: std.mem.Allocator, group: []const u8) !protocol.DescribedGroup {
+        var retry: Retry = .{};
+        while (true) {
+            const resp = try c.groupRequest(alloc, group, protocol.api_key.consumer_group_describe, protocol.version.consumer_group_describe, "ConsumerGroupDescribe", group, protocol.describeGroupRequest);
+            var d = Decoder.init(resp.body);
+            const result = try protocol.describeGroupResponse(&d, alloc);
+            if (isCoordinatorError(result.code)) {
+                c.invalidateCoordinator();
+                if (retry.pause(c)) continue;
+            }
+            try c.groupResult(result.code);
+            return result;
+        }
+    }
+
+    pub fn fetchGroupOffsets(c: *Client, alloc: std.mem.Allocator, req: protocol.OffsetFetch) !protocol.FetchedOffsets {
+        var retry: Retry = .{};
+        while (true) {
+            const resp = try c.groupRequest(alloc, req.group, protocol.api_key.offset_fetch, protocol.version.offset_fetch, "OffsetFetch", req, protocol.offsetFetchRequest);
+            var d = Decoder.init(resp.body);
+            const result = try protocol.offsetFetchResponse(&d, alloc);
+            var code = result.code;
+            for (result.offsets) |p| {
+                if (p.code != .none) code = p.code;
+            }
+            if (isCoordinatorError(code)) {
+                c.invalidateCoordinator();
+                if (retry.pause(c)) continue;
+            }
+            try c.groupResult(code);
+            return result;
+        }
     }
 
     // -- Topic administration --------------------------------------------------
@@ -1619,4 +1784,28 @@ test "bootstrap server parser rejects invalid explicit ports" {
     try std.testing.expectError(error.InvalidBootstrapServer, parseBootstrapServer("localhost:nope"));
     try std.testing.expectError(error.InvalidBootstrapServer, parseBootstrapServer("localhost:0"));
     try std.testing.expectError(error.InvalidBootstrapServer, parseBootstrapServer("localhost:65536"));
+}
+
+test "group APIs check versions lazily and coordinator cache is group scoped" {
+    var c: Client = undefined;
+    c.alloc = std.testing.allocator;
+    c.api_ranges = .empty;
+    defer c.api_ranges.deinit(c.alloc);
+    c.err_ctx = std.mem.zeroes([512]u8);
+    c.coordinator_group = "g";
+    c.coordinator_node = 7;
+    try std.testing.expectEqual(@as(i32, 7), try c.findCoordinator("g"));
+    try std.testing.expectError(error.AdminFailed, c.findCoordinator("other"));
+    try std.testing.expectError(error.AdminFailed, c.listGroups(c.alloc, false));
+    try std.testing.expectError(error.AdminFailed, c.describeGroup(c.alloc, "g"));
+    try std.testing.expectError(error.AdminFailed, c.fetchGroupOffsets(c.alloc, .{ .group = "g" }));
+    try std.testing.expectError(error.AdminFailed, c.heartbeat(c.alloc, .{ .group = "g", .member_id = "m", .member_epoch = 0 }));
+    try std.testing.expectError(error.AdminFailed, c.commitGroupOffsets(c.alloc, .{ .group = "g", .topics = &.{} }));
+    try c.api_ranges.put(c.alloc, protocol.api_key.list_groups, .{ .min = 3, .max = 5 });
+    try c.requireVersion(protocol.api_key.list_groups, 5, "ListGroups");
+    try std.testing.expectError(error.AdminFailed, c.requireVersion(protocol.api_key.list_groups, 6, "ListGroups"));
+    try std.testing.expect(Client.isCoordinatorError(.group_load_in_progress));
+    try std.testing.expect(Client.isCoordinatorError(.not_coordinator));
+    try std.testing.expect(Client.isCoordinatorError(.coordinator_not_available));
+    try std.testing.expect(!Client.isCoordinatorError(.group_authorization_failed));
 }

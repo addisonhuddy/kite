@@ -6,6 +6,12 @@ const builtin = @import("builtin");
 const decompress = @import("decompress.zig");
 
 pub const api_key = struct {
+    pub const find_coordinator: i16 = 10;
+    pub const offset_commit: i16 = 8;
+    pub const offset_fetch: i16 = 9;
+    pub const list_groups: i16 = 16;
+    pub const consumer_group_heartbeat: i16 = 68;
+    pub const consumer_group_describe: i16 = 69;
     pub const produce: i16 = 0;
     pub const fetch: i16 = 1;
     pub const list_offsets: i16 = 2;
@@ -22,6 +28,12 @@ pub const api_key = struct {
 
 /// Request versions this client pins, all flexible (Kafka 4.x baseline).
 pub const version = struct {
+    pub const find_coordinator: i16 = 6;
+    pub const offset_commit: i16 = 9;
+    pub const offset_fetch: i16 = 9;
+    pub const list_groups: i16 = 5;
+    pub const consumer_group_heartbeat: i16 = 1;
+    pub const consumer_group_describe: i16 = 0;
     pub const api_versions: i16 = 3;
     pub const metadata: i16 = 12;
     pub const produce: i16 = 11;
@@ -80,10 +92,24 @@ pub const ErrorCode = enum(i16) {
     unknown_leader_epoch = 75,
     unsupported_compression_type = 76,
     unknown_topic_id = 100,
+    unknown_member_id = 25,
+    group_authorization_failed = 30,
+    group_id_not_found = 69,
+    non_empty_group = 68,
+    fenced_member_epoch = 110,
+    unreleased_instance_id = 111,
+    stale_member_epoch = 113,
     _,
 
     pub fn name(self: ErrorCode) []const u8 {
         return switch (self) {
+            .unknown_member_id => "UNKNOWN_MEMBER_ID",
+            .group_authorization_failed => "GROUP_AUTHORIZATION_FAILED",
+            .group_id_not_found => "GROUP_ID_NOT_FOUND",
+            .non_empty_group => "NON_EMPTY_GROUP",
+            .fenced_member_epoch => "FENCED_MEMBER_EPOCH",
+            .unreleased_instance_id => "UNRELEASED_INSTANCE_ID",
+            .stale_member_epoch => "STALE_MEMBER_EPOCH",
             .none => "NONE",
             .unknown_server_error => "UNKNOWN_SERVER_ERROR",
             .offset_out_of_range => "OFFSET_OUT_OF_RANGE",
@@ -96,7 +122,7 @@ pub const ErrorCode = enum(i16) {
             .message_too_large => "MESSAGE_TOO_LARGE",
             .stale_metadata => "STALE_METADATA",
             .network_exception => "NETWORK_EXCEPTION",
-            .group_load_in_progress => "GROUP_LOAD_IN_PROGRESS",
+            .group_load_in_progress => "COORDINATOR_LOAD_IN_PROGRESS",
             .coordinator_not_available => "COORDINATOR_NOT_AVAILABLE",
             .not_coordinator => "NOT_COORDINATOR",
             .invalid_topic_exception => "INVALID_TOPIC_EXCEPTION",
@@ -417,6 +443,432 @@ pub const Decoder = struct {
         d.pos += @as(usize, @intCast(n)) * 4;
     }
 };
+
+// ---------------------------------------------------------------------------
+// Group APIs (Apache Kafka 4.0 flexible schemas)
+// ---------------------------------------------------------------------------
+
+test "group requests golden bytes" {
+    var e = Encoder.init(std.testing.allocator);
+    defer e.deinit();
+    try findCoordinatorRequest(&e, "g");
+    try std.testing.expectEqualStrings("\x00\x02\x02g\x00", e.written());
+    e.reset();
+    try describeGroupRequest(&e, "g");
+    try std.testing.expectEqualStrings("\x02\x02g\x00\x00", e.written());
+    e.reset();
+    try listGroupsRequest(&e, false);
+    try std.testing.expectEqualStrings("\x01\x02\x09consumer\x00", e.written());
+    e.reset();
+    try listGroupsRequest(&e, true);
+    try std.testing.expectEqualStrings("\x01\x01\x00", e.written());
+    e.reset();
+    try offsetFetchRequest(&e, .{ .group = "g" });
+    try std.testing.expectEqualStrings("\x02\x02g\x00\xff\xff\xff\xff\x00\x00\x00\x00", e.written());
+    e.reset();
+    try offsetFetchRequest(&e, .{ .group = "g", .member_id = "m", .member_epoch = 2, .topics = &.{.{ .name = "t", .partitions = &.{0} }} });
+    try std.testing.expectEqualStrings("\x02\x02g\x02m\x00\x00\x00\x02\x02\x02t\x02\x00\x00\x00\x00\x00\x00\x00\x00", e.written());
+    e.reset();
+    try offsetCommitRequest(&e, .{ .group = "g", .topics = &.{} });
+    try std.testing.expectEqualStrings("\x02g\xff\xff\xff\xff\x01\x00\x01\x00", e.written());
+    e.reset();
+    try offsetCommitRequest(&e, .{ .group = "g", .member_id = "m", .member_epoch = 2, .topics = &.{.{ .name = "t", .partitions = &.{.{ .partition = 0, .offset = 3 }} }} });
+    try std.testing.expectEqualStrings("\x02g\x00\x00\x00\x02\x02m\x00\x02\x02t\x02" ++
+        "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\xff\xff\xff\xff\x00\x00\x00\x00", e.written());
+    e.reset();
+    try heartbeatRequest(&e, .{ .group = "g", .member_id = "m", .member_epoch = 0, .rebalance_timeout_ms = 30000, .topics = &.{"t"}, .assignment = &.{} });
+    try std.testing.expectEqualStrings("\x02g\x02m\x00\x00\x00\x00\x00\x00\x00\x00\x75\x30\x02\x02t\x00\x00\x01\x00", e.written());
+    e.reset();
+    try heartbeatRequest(&e, .{ .group = "g", .member_id = "m", .member_epoch = 2 });
+    try std.testing.expectEqualStrings("\x02g\x02m\x00\x00\x00\x02\x00\x00\xff\xff\xff\xff\x00\x00\x00\x00\x00", e.written());
+    e.reset();
+    try heartbeatRequest(&e, .{ .group = "g", .member_id = "m", .member_epoch = -1 });
+    try std.testing.expectEqualStrings("\x02g\x02m\xff\xff\xff\xff\x00\x00\xff\xff\xff\xff\x00\x00\x00\x00\x00", e.written());
+}
+
+test "group responses empty errors tags and truncation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var coord = Decoder.init("\x00\x00\x00\x00\x02\x02g\x00\x00\x00\x01\x02h\x00\x00\x23\x84\x00\x00\x00\x00\x01\x04\x02ab");
+    const c = try coordinatorResponse(&coord);
+    try std.testing.expectEqual(@as(i32, 1), c.node);
+    try std.testing.expectEqualStrings("h", c.host);
+    try std.testing.expectEqual(coord.data.len, coord.pos);
+    var listed = Decoder.init("\x00\x00\x00\x00\x00\x00\x02\x02g\x09consumer\x06Empty\x09consumer\x00\x00");
+    const l = try listGroupsResponse(&listed, a);
+    try std.testing.expectEqualStrings("g", l.groups[0].group);
+    try std.testing.expectEqualStrings("Empty", l.groups[0].state);
+    var empty = Decoder.init("\x00\x00\x00\x00\x00\x0e\x01\x00");
+    const el = try listGroupsResponse(&empty, a);
+    try std.testing.expectEqual(ErrorCode.group_load_in_progress, el.code);
+    try std.testing.expectEqual(@as(usize, 0), el.groups.len);
+    var offsets = Decoder.init("\x00\x00\x00\x00\x02\x02g\x02\x02t\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00");
+    const fetched = try offsetFetchResponse(&offsets, a);
+    try std.testing.expectEqual(@as(i64, 3), fetched.offsets[0].offset);
+    try std.testing.expectEqualStrings("t", fetched.offsets[0].topic);
+    var no_offsets = Decoder.init("\x00\x00\x00\x00\x02\x02g\x01\x00\x10\x00\x00");
+    try std.testing.expectEqual(ErrorCode.not_coordinator, (try offsetFetchResponse(&no_offsets, a)).code);
+    var commit = Decoder.init("\x00\x00\x00\x00\x02\x02t\x02\x00\x00\x00\x01\x00\x1e\x00\x00\x00");
+    try std.testing.expectEqual(ErrorCode.group_authorization_failed, (try offsetCommitResponse(&commit, a))[0].code);
+    var no_commits = Decoder.init("\x00\x00\x00\x00\x01\x00");
+    try std.testing.expectEqual(@as(usize, 0), (try offsetCommitResponse(&no_commits, a)).len);
+    var hb = Decoder.init("\x00\x00\x00\x00\x00\x00\x00\x02m\x00\x00\x00\x02\x00\x00\x13\x88\x01\x01\x00\x00");
+    const h = try heartbeatResponse(&hb, a);
+    try std.testing.expectEqual(@as(i32, 5000), h.heartbeat_interval_ms);
+    try std.testing.expectEqual(@as(usize, 0), h.assignment.?.len);
+    var fenced = Decoder.init("\x00\x00\x00\x00\x00\x6e\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\x00");
+    const f = try heartbeatResponse(&fenced, a);
+    try std.testing.expectEqual(ErrorCode.fenced_member_epoch, f.code);
+    try std.testing.expect(f.assignment == null);
+    var describe = Decoder.init("\x00\x00\x00\x00\x02\x00\x45\x00\x02g\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x01\x80\x00\x00\x00\x00\x00");
+    const desc = try describeGroupResponse(&describe, a);
+    try std.testing.expectEqual(ErrorCode.group_id_not_found, desc.code);
+    try std.testing.expectEqual(@as(usize, 0), desc.partitions.len);
+    var truncated = Decoder.init("");
+    try std.testing.expectError(error.Truncated, coordinatorResponse(&truncated));
+    try std.testing.expectError(error.Truncated, listGroupsResponse(&truncated, a));
+    try std.testing.expectError(error.Truncated, offsetFetchResponse(&truncated, a));
+    try std.testing.expectError(error.Truncated, offsetCommitResponse(&truncated, a));
+    try std.testing.expectError(error.Truncated, heartbeatResponse(&truncated, a));
+    try std.testing.expectError(error.Truncated, describeGroupResponse(&truncated, a));
+}
+
+test "describe group member assignment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var e = Encoder.init(std.testing.allocator);
+    defer e.deinit();
+    try e.raw("\x00\x00\x00\x00\x02\x00\x00\x00\x02g\x07Stable\x00\x00\x00\x01\x00\x00\x00\x01\x06range\x02\x02m\x00\x00\x00\x00\x00\x01\x02c\x02h\x02\x02t\x00\x02");
+    try e.raw(&([_]u8{0} ** 16));
+    try e.raw("\x02t\x02\x00\x00\x00\x00\x00\x00\x01\x00\x00\x80\x00\x00\x00\x00\x00");
+    var d = Decoder.init(e.written());
+    const result = try describeGroupResponse(&d, arena.allocator());
+    try std.testing.expectEqual(ErrorCode.none, result.code);
+    try std.testing.expectEqualStrings("Stable", result.state);
+    try std.testing.expectEqual(@as(usize, 1), result.partitions.len);
+    try std.testing.expectEqualStrings("m", result.partitions[0].member_id);
+    try std.testing.expectEqualStrings("c", result.partitions[0].client_id);
+    try std.testing.expectEqualStrings("t", result.partitions[0].topic);
+    try std.testing.expectEqual(d.data.len, d.pos);
+}
+
+test "heartbeat owned assignment golden bytes and decode" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var e = Encoder.init(std.testing.allocator);
+    defer e.deinit();
+    const id = [_]u8{0} ** 16;
+    try heartbeatRequest(&e, .{ .group = "g", .member_id = "m", .member_epoch = 2, .assignment = &.{.{ .topic_id = id, .partitions = &.{3} }} });
+    const assignment = "\x02" ++ ([_]u8{0} ** 16) ++ "\x02\x00\x00\x00\x03\x00";
+    try std.testing.expectEqualStrings("\x02g\x02m\x00\x00\x00\x02\x00\x00\xff\xff\xff\xff\x00\x00\x00" ++ assignment ++ "\x00", e.written());
+    var d = Decoder.init("\x00\x00\x00\x00\x00\x00\x00\x02m\x00\x00\x00\x02\x00\x00\x13\x88\x01" ++ assignment ++ "\x00\x00");
+    const result = try heartbeatResponse(&d, arena.allocator());
+    try std.testing.expectEqual(@as(i32, 3), result.assignment.?[0].partitions[0]);
+    try std.testing.expectEqualSlices(u8, &id, &result.assignment.?[0].topic_id);
+    try std.testing.expectEqual(d.data.len, d.pos);
+}
+
+pub fn findCoordinatorRequest(e: *Encoder, group: []const u8) ProtoError!void {
+    try e.i8v(0);
+    try e.compactArrayLen(1);
+    try e.compactString(group);
+    try e.tagBuffer();
+}
+
+pub const Coordinator = struct {
+    key: []const u8,
+    node: i32,
+    host: []const u8,
+    port: i32,
+    code: ErrorCode,
+    message: ?[]const u8,
+};
+
+pub fn coordinatorResponse(d: *Decoder) ProtoError!Coordinator {
+    _ = try d.i32v();
+    if (try d.compactArrayLen() != 1) return error.NegativeLength;
+    const result: Coordinator = .{
+        .key = (try d.compactString()) orelse return error.NegativeLength,
+        .node = try d.i32v(),
+        .host = (try d.compactString()) orelse return error.NegativeLength,
+        .port = try d.i32v(),
+        .code = @enumFromInt(try d.i16v()),
+        .message = try d.compactString(),
+    };
+    try d.tagBuffer();
+    try d.tagBuffer();
+    return result;
+}
+
+pub fn listGroupsRequest(e: *Encoder, all: bool) ProtoError!void {
+    try e.compactArrayLen(0);
+    try e.compactArrayLen(if (all) 0 else 1);
+    if (!all) try e.compactString("consumer");
+    try e.tagBuffer();
+}
+
+pub fn describeGroupRequest(e: *Encoder, group: []const u8) ProtoError!void {
+    try e.compactArrayLen(1);
+    try e.compactString(group);
+    try e.boolean(false);
+    try e.tagBuffer();
+}
+
+pub const ListedGroup = struct { group: []const u8, protocol_type: []const u8, state: []const u8, group_type: []const u8 };
+pub const ListedGroups = struct { code: ErrorCode, groups: []ListedGroup };
+
+pub fn listGroupsResponse(d: *Decoder, alloc: std.mem.Allocator) ProtoError!ListedGroups {
+    _ = try d.i32v();
+    const code: ErrorCode = @enumFromInt(try d.i16v());
+    const n = try groupArrayLen(d);
+    const groups = try alloc.alloc(ListedGroup, n);
+    for (groups) |*g| {
+        g.* = .{ .group = try groupString(d), .protocol_type = try groupString(d), .state = try groupString(d), .group_type = try groupString(d) };
+        try d.tagBuffer();
+    }
+    try d.tagBuffer();
+    return .{ .code = code, .groups = groups };
+}
+
+fn groupString(d: *Decoder) ProtoError![]const u8 {
+    return (try d.compactString()) orelse error.NegativeLength;
+}
+
+fn groupArrayLen(d: *Decoder) ProtoError!usize {
+    const n = try d.compactArrayLen();
+    if (n < 0 or n > d.data.len - d.pos) return error.NegativeLength;
+    return @intCast(n);
+}
+
+pub const GroupOffset = struct { topic: []const u8, partition: i32, offset: i64, code: ErrorCode };
+pub const FetchedOffsets = struct { group: []const u8, code: ErrorCode, offsets: []GroupOffset };
+
+pub fn offsetFetchResponse(d: *Decoder, alloc: std.mem.Allocator) ProtoError!FetchedOffsets {
+    _ = try d.i32v();
+    if (try d.compactArrayLen() != 1) return error.NegativeLength;
+    const group = try groupString(d);
+    var offsets: std.ArrayList(GroupOffset) = .empty;
+    const nt = try groupArrayLen(d);
+    for (0..nt) |_| {
+        const topic = try groupString(d);
+        const np = try groupArrayLen(d);
+        for (0..np) |_| {
+            const p = try d.i32v();
+            const offset = try d.i64v();
+            _ = try d.i32v();
+            _ = try d.compactString();
+            const code: ErrorCode = @enumFromInt(try d.i16v());
+            try d.tagBuffer();
+            try offsets.append(alloc, .{ .topic = topic, .partition = p, .offset = offset, .code = code });
+        }
+        try d.tagBuffer();
+    }
+    const code: ErrorCode = @enumFromInt(try d.i16v());
+    try d.tagBuffer();
+    try d.tagBuffer();
+    return .{ .group = group, .code = code, .offsets = try offsets.toOwnedSlice(alloc) };
+}
+
+pub fn offsetCommitResponse(d: *Decoder, alloc: std.mem.Allocator) ProtoError![]GroupOffset {
+    _ = try d.i32v();
+    var offsets: std.ArrayList(GroupOffset) = .empty;
+    const nt = try groupArrayLen(d);
+    for (0..nt) |_| {
+        const topic = try groupString(d);
+        const np = try groupArrayLen(d);
+        for (0..np) |_| {
+            const p = try d.i32v();
+            const code: ErrorCode = @enumFromInt(try d.i16v());
+            try d.tagBuffer();
+            try offsets.append(alloc, .{ .topic = topic, .partition = p, .offset = -1, .code = code });
+        }
+        try d.tagBuffer();
+    }
+    try d.tagBuffer();
+    return offsets.toOwnedSlice(alloc);
+}
+
+pub const AssignedPartition = struct { topic: []const u8, partition: i32, member_id: []const u8, client_id: []const u8 };
+pub const DescribedGroup = struct { code: ErrorCode, message: ?[]const u8, group: []const u8, state: []const u8, partitions: []AssignedPartition };
+
+fn describeAssignment(d: *Decoder, alloc: std.mem.Allocator, rows: ?*std.ArrayList(AssignedPartition), member: []const u8, client_id: []const u8) ProtoError!void {
+    const nt = try groupArrayLen(d);
+    for (0..nt) |_| {
+        try d.skip(16);
+        const topic = try groupString(d);
+        const np = try groupArrayLen(d);
+        for (0..np) |_| {
+            const p = try d.i32v();
+            if (rows) |r| try r.append(alloc, .{ .topic = topic, .partition = p, .member_id = member, .client_id = client_id });
+        }
+        try d.tagBuffer();
+    }
+    try d.tagBuffer();
+}
+
+pub fn describeGroupResponse(d: *Decoder, alloc: std.mem.Allocator) ProtoError!DescribedGroup {
+    _ = try d.i32v();
+    if (try d.compactArrayLen() != 1) return error.NegativeLength;
+    const code: ErrorCode = @enumFromInt(try d.i16v());
+    const message = try d.compactString();
+    const group = try groupString(d);
+    const state = try groupString(d);
+    _ = try d.i32v();
+    _ = try d.i32v();
+    _ = try groupString(d);
+    var rows: std.ArrayList(AssignedPartition) = .empty;
+    const nm = try groupArrayLen(d);
+    for (0..nm) |_| {
+        const member = try groupString(d);
+        _ = try d.compactString();
+        _ = try d.compactString();
+        _ = try d.i32v();
+        const client_id = try groupString(d);
+        _ = try groupString(d);
+        const ns = try groupArrayLen(d);
+        for (0..ns) |_| _ = try groupString(d);
+        _ = try d.compactString();
+        try describeAssignment(d, alloc, &rows, member, client_id);
+        try describeAssignment(d, alloc, null, member, client_id);
+        try d.tagBuffer();
+    }
+    _ = try d.i32v();
+    try d.tagBuffer();
+    try d.tagBuffer();
+    return .{ .code = code, .message = message, .group = group, .state = state, .partitions = try rows.toOwnedSlice(alloc) };
+}
+
+pub const HeartbeatResult = struct {
+    code: ErrorCode,
+    message: ?[]const u8,
+    member_id: ?[]const u8,
+    member_epoch: i32,
+    heartbeat_interval_ms: i32,
+    assignment: ?[]TopicAssignment,
+};
+
+pub fn heartbeatResponse(d: *Decoder, alloc: std.mem.Allocator) ProtoError!HeartbeatResult {
+    _ = try d.i32v();
+    var result: HeartbeatResult = .{
+        .code = @enumFromInt(try d.i16v()),
+        .message = try d.compactString(),
+        .member_id = try d.compactString(),
+        .member_epoch = try d.i32v(),
+        .heartbeat_interval_ms = try d.i32v(),
+        .assignment = null,
+    };
+    if (try d.i8v() != -1) {
+        const nt = try groupArrayLen(d);
+        const assignment = try alloc.alloc(TopicAssignment, nt);
+        for (assignment) |*t| {
+            if (d.data.len - d.pos < 16) return error.Truncated;
+            const id = d.data[d.pos..][0..16].*;
+            try d.skip(16);
+            const np = try groupArrayLen(d);
+            const parts = try alloc.alloc(i32, np);
+            for (parts) |*p| p.* = try d.i32v();
+            t.* = .{ .topic_id = id, .partitions = parts };
+            try d.tagBuffer();
+        }
+        try d.tagBuffer();
+        result.assignment = assignment;
+    }
+    try d.tagBuffer();
+    return result;
+}
+
+pub const GroupTopic = struct { name: []const u8, partitions: []const i32 };
+pub const OffsetFetch = struct {
+    group: []const u8,
+    member_id: ?[]const u8 = null,
+    member_epoch: i32 = -1,
+    topics: ?[]const GroupTopic = null,
+};
+
+pub fn offsetFetchRequest(e: *Encoder, req: OffsetFetch) ProtoError!void {
+    try e.compactArrayLen(1);
+    try e.compactString(req.group);
+    try e.compactString(req.member_id);
+    try e.i32v(req.member_epoch);
+    if (req.topics) |topics| {
+        try e.compactArrayLen(topics.len);
+        for (topics) |t| {
+            try e.compactString(t.name);
+            try e.compactArrayLen(t.partitions.len);
+            for (t.partitions) |p| try e.i32v(p);
+            try e.tagBuffer();
+        }
+    } else try e.uvarint(0);
+    try e.tagBuffer();
+    try e.boolean(false);
+    try e.tagBuffer();
+}
+
+pub const CommitPartition = struct { partition: i32, offset: i64 };
+pub const CommitTopic = struct { name: []const u8, partitions: []const CommitPartition };
+pub const OffsetCommit = struct {
+    group: []const u8,
+    member_id: []const u8 = "",
+    member_epoch: i32 = -1,
+    topics: []const CommitTopic,
+};
+
+pub fn offsetCommitRequest(e: *Encoder, req: OffsetCommit) ProtoError!void {
+    try e.compactString(req.group);
+    try e.i32v(req.member_epoch);
+    try e.compactString(req.member_id);
+    try e.compactString(null);
+    try e.compactArrayLen(req.topics.len);
+    for (req.topics) |t| {
+        try e.compactString(t.name);
+        try e.compactArrayLen(t.partitions.len);
+        for (t.partitions) |p| {
+            try e.i32v(p.partition);
+            try e.i64v(p.offset);
+            try e.i32v(-1);
+            try e.compactString(null);
+            try e.tagBuffer();
+        }
+        try e.tagBuffer();
+    }
+    try e.tagBuffer();
+}
+
+pub const TopicAssignment = struct { topic_id: [16]u8, partitions: []const i32 };
+pub const Heartbeat = struct {
+    group: []const u8,
+    member_id: []const u8,
+    member_epoch: i32,
+    rebalance_timeout_ms: i32 = -1,
+    topics: ?[]const []const u8 = null,
+    assignment: ?[]const TopicAssignment = null,
+};
+
+pub fn heartbeatRequest(e: *Encoder, req: Heartbeat) ProtoError!void {
+    try e.compactString(req.group);
+    try e.compactString(req.member_id);
+    try e.i32v(req.member_epoch);
+    try e.compactString(null);
+    try e.compactString(null);
+    try e.i32v(req.rebalance_timeout_ms);
+    if (req.topics) |topics| {
+        try e.compactArrayLen(topics.len);
+        for (topics) |t| try e.compactString(t);
+    } else try e.uvarint(0);
+    try e.compactString(null); // subscribed_topic_regex (v1)
+    try e.compactString(null);
+    if (req.assignment) |assignment| {
+        try e.compactArrayLen(assignment.len);
+        for (assignment) |t| {
+            try e.raw(&t.topic_id);
+            try e.compactArrayLen(t.partitions.len);
+            for (t.partitions) |p| try e.i32v(p);
+            try e.tagBuffer();
+        }
+    } else try e.uvarint(0);
+    try e.tagBuffer();
+}
 
 // ---------------------------------------------------------------------------
 // Request framing

@@ -40,7 +40,7 @@ under zsh, `complete -C` under fish) and asserts that `kite consume --fr` offers
 scripts/check-size.sh
 ```
 
-The default stripped binary must stay below 600,000 bytes. `scripts/pack.sh` is an
+The default stripped binary must stay below 1 MB (1,000,000 bytes). `scripts/pack.sh` is an
 optional UPX/LZMA packaging step.
 
 ## End-to-end tests

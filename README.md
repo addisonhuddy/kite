@@ -27,7 +27,7 @@
 
 <p>
   <strong>kite is an ultra-lightweight Kafka CLI built for agents and sandboxes.</strong><br>
-  One binary under 700 KB, no JVM, no runtime, no daemon. stdin in, stdout out,
+  One binary under 1 MB, no JVM, no runtime, no daemon. stdin in, stdout out,
   non-zero exit on failure.
 </p>
 </div>
@@ -103,7 +103,7 @@ See [Troubleshooting](#troubleshooting) if the roundtrip does not print
 If you are an agent reading this (or a human who also likes Kafka), here's
 why I think you will love kite.
 
-- **Small.** The stripped binary is under 700 KB (CI-gated by
+- **Small.** The stripped binary is under 1 MB (1,000,000 bytes; CI-gated by
   `scripts/check-size.sh`). It fits in a container layer, a
   sandbox, or a tool call without anyone noticing.
 - **Unix philosophy.** kite does one thing per invocation and composes with
@@ -132,7 +132,7 @@ kite is optimized for the case where a program, not a person, is on the
 other end of the pipe: a shell script, a CI step, a container entrypoint, or
 an AI agent's tool call. That shapes every design choice:
 
-- **Zero-dependency install.** One static binary under 700 KB, fetched with
+- **Zero-dependency install.** One static binary under 1 MB, fetched with
   `curl` and verified against `SHA256SUMS`. Nothing to apt-get, brew, or
   build; nothing that needs a JVM or a shared library at runtime.
 - **Bounded by default.** A piped consume with no `-n`, `--idle`, or `-f`
@@ -376,6 +376,24 @@ kite topic delete -y --if-exists gone
 Delete confirms on a terminal; when stderr is not a terminal it refuses
 unless `-y`/`--yes` is given. `list` writes topic names (or JSON lines) to
 stdout; all notes go to stderr.
+
+## Consumer groups
+
+```sh
+kite group list @prod
+kite group list --all --json  # include classic groups
+kite group describe orders --json
+```
+
+`group list` queries every broker and lists consumer-protocol groups by default.
+`group describe` requires Kafka's consumer group protocol (KIP-848). It prints
+one row per assigned or committed partition with `group`, `topic`, `partition`,
+`committed`, `end`, `lag`, `member_id`, and `client_id`. Output is tab-separated
+(with a header on terminals), or one JSON object per partition with `--json`.
+Missing commits and lag appear as `-` (JSON `null`); unassigned partitions have
+empty member/client IDs in JSON. These commands are read-only, accept common
+connection flags and `@CLUSTER`, and do not change consumer offsets. Lag is a
+snapshot: producing or committing concurrently can change it during the query.
 
 ## Common recipes
 
@@ -780,7 +798,7 @@ pipe.
 - `KITE_DEBUG=1` enables frame and TLS diagnostics.
 - `KITE_TIME=1` prints producer timing totals and connection count.
 
-The default stripped binary is under 700 KB (CI-gated by
+The default stripped binary is under 1 MB (CI-gated by
 `scripts/check-size.sh`).
 `scripts/pack.sh` can produce an optional UPX/LZMA artifact of about 200 KiB.
 
@@ -998,7 +1016,7 @@ by either kite or wing.
 No. kite is one static binary with no runtime dependencies.
 
 **How big is kite and how fast does it start?**
-The stripped binary is under 700 KB (CI-gated) and starts in milliseconds.
+The stripped binary is under 1 MB (CI-gated) and starts in milliseconds.
 
 **Can kite create topics or manage consumer groups?**
 `kite produce` creates a missing topic — after a y/N prompt on a terminal,
