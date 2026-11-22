@@ -302,6 +302,12 @@ const GroupSession = struct {
         defer arena.deinit();
         _ = s.c.heartbeat(arena.allocator(), .{ .group = s.opts.group.?, .member_id = &s.member, .member_epoch = -1 }) catch {};
     }
+
+    fn finalCommitFailed(s: *GroupSession, err: anyerror) error{FinalCommitFailed} {
+        s.c.setErr("{s}; next run may replay records", .{@errorName(err)});
+        std.debug.print("kite: warning: final commit failed; next run may replay records\n", .{});
+        return error.FinalCommitFailed;
+    }
 };
 
 fn pendingCommit(cursor: Cursor) ?i64 {
@@ -372,6 +378,23 @@ test "commit floor skips network requests until due" {
     session.c = &c;
     session.last_commit = std.Io.Timestamp.now(c.io, .awake);
     try session.commit(std.testing.allocator, false);
+}
+
+test "failed final commits preserve pending progress and report replay" {
+    var c: client.Client = undefined;
+    var session: GroupSession = undefined;
+    session.c = &c;
+    session.epoch = 3;
+    session.owned = .empty;
+    defer session.owned.deinit(std.testing.allocator);
+    try session.owned.append(std.testing.allocator, .{ .pidx = 0, .leader = 1, .offset = 4, .emitted = 4, .committed = 2 });
+    for ([_]anyerror{ error.FencedMemberEpoch, error.UnknownMemberId, error.GroupDeadlineExceeded }) |err| {
+        try std.testing.expectEqual(error.FinalCommitFailed, session.finalCommitFailed(err));
+        try std.testing.expectEqual(@as(i32, 3), session.epoch);
+        try std.testing.expectEqual(@as(?i64, 4), pendingCommit(session.owned.items[0]));
+        try std.testing.expect(std.mem.indexOf(u8, c.errDetail(), @errorName(err)) != null);
+        try std.testing.expect(std.mem.indexOf(u8, c.errDetail(), "next run may replay records") != null);
+    }
 }
 
 fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
@@ -451,11 +474,11 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
     if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
     session.beginAttempt();
     session.commit(arena.allocator(), true) catch |err| {
-        if (!session.recoverEpoch(err)) return err;
-        if (session.epoch > 0) {
-            try session.beat(&arena);
-            try session.commit(arena.allocator(), true);
-        }
+        if (err != error.StaleMemberEpoch) return session.finalCommitFailed(err);
+        session.heartbeat_due = true;
+        session.beat(&arena) catch |beat_err| return session.finalCommitFailed(beat_err);
+        if (session.epoch <= 0) return session.finalCommitFailed(error.FencedMemberEpoch);
+        session.commit(arena.allocator(), true) catch |commit_err| return session.finalCommitFailed(commit_err);
     };
     return count;
 }

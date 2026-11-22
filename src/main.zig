@@ -730,6 +730,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
             fatal("cannot write stdout: {s}", .{@errorName(write_err)});
         },
         error.FetchFailed => fatalErr(&cli, "consume failed"),
+        error.FinalCommitFailed => fatalErr(&cli, "final commit failed"),
         else => fatalErr(&cli, "consume failed"),
     };
     stdout.flush() catch |err| switch (err) {
