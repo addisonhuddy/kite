@@ -710,6 +710,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     installSignalHandlers();
     const consumed = consumer.run(&cli, .{
         .topic = topic_name,
+        .group = consume.group,
         .start = consume.start,
         .offset = consume.offset,
         .partition = consume.partition,

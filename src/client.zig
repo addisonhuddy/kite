@@ -72,6 +72,7 @@ pub const Client = struct {
     coordinator_node: i32 = -1,
     /// partition index -> leader node_id for the target topic
     partitions: std.ArrayListUnmanaged(Partition),
+    topic_id: [16]u8 = @splat(0),
     /// api_key -> negotiated range, from the last ApiVersions response
     api_ranges: std.AutoHashMapUnmanaged(i16, ApiRange),
     ca: ?std.crypto.Certificate.Bundle,
@@ -501,7 +502,9 @@ pub const Client = struct {
                 else => if (terr.retriable()) error.MetadataUnavailable else error.MetadataFailed,
             };
         }
-        try d.skip(16); // topic_id uuid
+        if (d.data.len - d.pos < 16) return error.Truncated;
+        const topic_id = d.data[d.pos..][0..16].*;
+        try d.skip(16);
         _ = try d.boolean(); // is_internal
         const nparts = try d.compactArrayLen();
         if (nparts <= 0) {
@@ -526,6 +529,7 @@ pub const Client = struct {
         try d.tagBuffer();
         try d.tagBuffer();
         std.mem.swap(std.ArrayListUnmanaged(Partition), &c.partitions, &partitions);
+        c.topic_id = topic_id;
         c.vlog("metadata: topic '{s}' has {d} partition(s)", .{ topic, c.partitions.items.len });
     }
 
@@ -568,6 +572,8 @@ pub const Client = struct {
     pub fn groupResult(c: *Client, code: protocol.ErrorCode) !void {
         if (code == .none) return;
         c.setErr("consumer group: {s}", .{code.name()});
+        if (code == .fenced_member_epoch) return error.FencedMemberEpoch;
+        if (code == .unknown_member_id) return error.UnknownMemberId;
         return error.GroupFailed;
     }
 

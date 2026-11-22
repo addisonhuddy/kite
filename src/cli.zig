@@ -31,6 +31,7 @@ pub const ProduceArgs = struct {
 
 pub const ConsumeArgs = struct {
     topic: []const u8,
+    group: ?[]const u8 = null,
     common: Common = .{},
     start: consumer.Options.Start = .latest,
     offset: i64 = 0,
@@ -148,6 +149,20 @@ test "group parser actions flags and cluster selector" {
         &.{ "--format", "csv" },        &.{ "@a", "@b" },     &.{"--bootstrap="},
     }) |args| try std.testing.expect(parseGroup(a, args) == .err);
     try std.testing.expectEqual(Command.group, splitCommand(a, &.{ "group", "list" }).ok.command);
+}
+
+test "consume group flags and conflicts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const []const u8{ &.{ "-g", "g", "t" }, &.{ "--group=g", "t" }, &.{ "--group", "g", "-B", "t" } }) |args| {
+        try std.testing.expectEqualStrings("g", parseConsume(a, args).ok.group.?);
+    }
+    for ([_][]const []const u8{
+        &.{ "-g", "g", "--offset=0", "t" },    &.{ "--offset", "0", "--group=g", "t" },
+        &.{ "-g", "g", "--partition=0", "t" }, &.{ "--partition", "0", "-g", "g", "t" },
+        &.{ "--group=", "t" },                 &.{"-g"},
+    }) |args| try std.testing.expect(parseConsume(a, args) == .err);
 }
 
 pub const TopicAction = enum { list, create, delete, update };
@@ -361,6 +376,8 @@ pub const consume_help =
     "  @NAME                 Use cluster NAME from kite.yaml for this\n" ++
     "                        run only (also $KITE_TARGET).\n" ++
     "  -B, --from-beginning  Start at the earliest available offset.\n" ++
+    "  -g, --group GROUP     Join a consumer group and commit flushed records.\n" ++
+    "                        Cannot be combined with --offset or --partition.\n" ++
     "  --offset N            Start at offset N in each selected partition.\n" ++
     "                        Cannot be combined with --from-beginning.\n" ++
     "  --partition P         Read partition P only (default: all partitions).\n" ++
@@ -385,6 +402,11 @@ pub const consume_help =
     "By default, start at the latest offset. When stdout is a terminal the read\n" ++
     "follows new records until Ctrl-C; when stdout is a pipe or file and none of\n" ++
     "--max, --idle, or --follow is given, the read stops after 5s idle.\n" ++
+    "With --group, resume committed offsets; -B applies only without a commit.\n" ++
+    "Group idle time starts with the first assignment heartbeat, including an\n" ++
+    "empty assignment; a member with zero partitions exits after that window.\n" ++
+    "Commits mean records reached stdout, not that a downstream reader processed\n" ++
+    "them. Failed output is not committed; records may be replayed after a crash.\n" ++
     "\n" ++
     "Examples:\n" ++
     "  kite consume events\n" ++
@@ -602,10 +624,10 @@ pub fn parseHeaderArg(s: []const u8) !protocol.Header {
 }
 
 const produce_only = [_][]const u8{ "-H", "--csv", "--key" };
-const consume_only = [_][]const u8{ "-B", "--from-beginning", "--offset", "--partition", "-n", "--max", "-t", "--idle", "-f", "--follow" };
+const consume_only = [_][]const u8{ "-g", "--group", "-B", "--from-beginning", "--offset", "--partition", "-n", "--max", "-t", "--idle", "-f", "--follow" };
 
 const produce_options = [_][]const u8{ "--bootstrap", "--config", "--format", "--json", "--csv", "--key", "--quiet", "--verbose", "--help" };
-const consume_options = [_][]const u8{ "--bootstrap", "--config", "--from-beginning", "--offset", "--partition", "--max", "--idle", "--follow", "--format", "--json", "--quiet", "--verbose", "--help" };
+const consume_options = [_][]const u8{ "--bootstrap", "--config", "--group", "--from-beginning", "--offset", "--partition", "--max", "--idle", "--follow", "--format", "--json", "--quiet", "--verbose", "--help" };
 const cluster_options = [_][]const u8{ "--config", "--json", "--format", "--quiet", "--verbose", "--help" };
 const update_options = [_][]const u8{"--help"};
 const topic_options = [_][]const u8{ "--bootstrap", "--config", "--format", "--json", "--all", "--partitions", "--replication-factor", "--set", "--unset", "--yes", "--if-exists", "--if-not-exists", "--quiet", "--verbose", "--help" };
@@ -885,7 +907,12 @@ pub fn parseConsume(alloc: std.mem.Allocator, args: []const []const u8) Result(C
                 .ok => continue,
             }
         }
-        if (std.mem.eql(u8, arg, "-B") or std.mem.eql(u8, arg, "--from-beginning")) {
+        var group_value: ?[]const u8 = null;
+        if (optionValue(args, &i, &group_value, arg, "-g", "--group")) {
+            const value = group_value orelse return .{ .err = "--group requires a value" };
+            if (value.len == 0) return .{ .err = "--group must not be empty" };
+            parsed.group = value;
+        } else if (std.mem.eql(u8, arg, "-B") or std.mem.eql(u8, arg, "--from-beginning")) {
             if (parsed.start == .offset)
                 return errorResult(ConsumeArgs, alloc, "--offset cannot be combined with --from-beginning", .{});
             parsed.start = .earliest;
@@ -990,6 +1017,8 @@ pub fn parseConsume(alloc: std.mem.Allocator, args: []const []const u8) Result(C
 
     const topic_name = topic orelse return errorResult(ConsumeArgs, alloc, "missing TOPIC", .{});
     if (topic_name.len == 0) return errorResult(ConsumeArgs, alloc, "TOPIC must not be empty", .{});
+    if (parsed.group != null and parsed.start == .offset) return .{ .err = "--group cannot be combined with --offset" };
+    if (parsed.group != null and parsed.partition != null) return .{ .err = "--group cannot be combined with --partition" };
     if (parsed.follow and parsed.idle_ms != null)
         return errorResult(ConsumeArgs, alloc, "--follow cannot be combined with --idle", .{});
     if (parsed.common.format == .csv)

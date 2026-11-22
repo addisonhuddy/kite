@@ -33,6 +33,7 @@ complete -c kite -n '__fish_seen_subcommand_from produce p' -l csv -d 'Read RFC 
 complete -c kite -n '__fish_seen_subcommand_from produce p' -l key -d 'Use CSV column as record key' -x
 
 # consume only.
+complete -c kite -n '__fish_seen_subcommand_from consume c' -s g -l group -d 'Join consumer group' -x
 complete -c kite -n '__fish_seen_subcommand_from consume c' -s B -l from-beginning -d 'Start at earliest offset'
 complete -c kite -n '__fish_seen_subcommand_from consume c' -l offset -d 'Start at offset N' -x
 complete -c kite -n '__fish_seen_subcommand_from consume c' -l partition -d 'Read one partition' -x

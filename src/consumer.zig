@@ -12,6 +12,8 @@ const Decoder = protocol.Decoder;
 pub const Options = struct {
     pub const Start = enum { earliest, latest, offset };
     topic: []const u8,
+    group: ?[]const u8 = null,
+    fetch_wait_ms: ?u64 = null,
     start: Start = .latest,
     offset: i64 = 0,
     partition: ?i32 = null,
@@ -42,6 +44,8 @@ pub const Cursor = struct {
     pidx: i32,
     leader: i32,
     offset: i64,
+    emitted: i64 = -1,
+    committed: i64 = -1,
 };
 
 const ListPart = struct {
@@ -55,6 +59,7 @@ const FetchPart = struct {
 };
 
 pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
+    if (opts.group != null) return runGroup(c, opts, out);
     var cursors = try c.alloc.alloc(Cursor, c.partitions.items.len);
     defer c.alloc.free(cursors);
     var cursor_count: usize = 0;
@@ -136,6 +141,249 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             retry = .{};
         }
     }
+    return count;
+}
+
+const GroupSession = struct {
+    c: *client.Client,
+    opts: Options,
+    member: [32]u8,
+    epoch: i32 = 0,
+    interval: u64 = 1000,
+    owned: std.ArrayList(Cursor) = .empty,
+    assignment_seen: bool = false,
+    heartbeat_due: bool = true,
+    last_heartbeat: std.Io.Timestamp,
+    last_record: std.Io.Timestamp,
+
+    fn rejoin(s: *GroupSession) void {
+        s.owned.clearRetainingCapacity();
+        s.epoch = 0;
+        s.heartbeat_due = true;
+        s.assignment_seen = false;
+        s.c.vlog("group '{s}': fenced; rejoining", .{s.opts.group.?});
+    }
+
+    fn commit(s: *GroupSession, alloc: std.mem.Allocator) !void {
+        var parts: std.ArrayList(protocol.CommitPartition) = .empty;
+        for (s.owned.items) |cursor| {
+            if (pendingCommit(cursor)) |offset| try parts.append(alloc, .{ .partition = cursor.pidx, .offset = offset });
+        }
+        if (parts.items.len == 0) return;
+        try s.c.commitGroupOffsets(alloc, .{
+            .group = s.opts.group.?,
+            .member_id = &s.member,
+            .member_epoch = s.epoch,
+            .topics = &.{.{ .name = s.opts.topic, .partitions = parts.items }},
+        });
+        for (s.owned.items) |*cursor| if (pendingCommit(cursor.*)) |offset| {
+            cursor.committed = offset;
+        };
+        s.c.vlog("committed {d} offsets for group {s}", .{ parts.items.len, s.opts.group.? });
+    }
+
+    fn beat(s: *GroupSession, arena: *std.heap.ArenaAllocator) !void {
+        const alloc = arena.allocator();
+        const parts = try alloc.alloc(i32, s.owned.items.len);
+        for (s.owned.items, parts) |cursor, *p| p.* = cursor.pidx;
+        const joining = s.epoch == 0;
+        const result = try s.c.heartbeat(alloc, .{
+            .group = s.opts.group.?,
+            .member_id = &s.member,
+            .member_epoch = s.epoch,
+            .rebalance_timeout_ms = if (joining) 30000 else -1,
+            .topics = if (joining) &.{s.opts.topic} else null,
+            .assignment = if (parts.len == 0) &.{} else &.{.{ .topic_id = s.c.topic_id, .partitions = parts }},
+        });
+        if (result.code == .fenced_member_epoch or result.code == .unknown_member_id) {
+            s.rejoin();
+            return;
+        }
+        try s.c.groupResult(result.code);
+        s.epoch = result.member_epoch;
+        s.interval = @intCast(@max(1, result.heartbeat_interval_ms));
+        s.last_heartbeat = std.Io.Timestamp.now(s.c.io, .awake);
+        s.heartbeat_due = false;
+        if (joining) s.c.vlog("joined group '{s}', member {s}, epoch {d}", .{ s.opts.group.?, s.member, s.epoch });
+        if (result.assignment) |assignment| {
+            if (!s.assignment_seen) s.last_record = std.Io.Timestamp.now(s.c.io, .awake);
+            s.assignment_seen = true;
+            var assigned: []const i32 = &.{};
+            for (assignment) |t| {
+                if (!std.mem.eql(u8, &t.topic_id, &s.c.topic_id)) return error.UnknownTopicAssignment;
+                assigned = t.partitions;
+            }
+            if (!assignmentChanged(s.owned.items, assigned)) return;
+            try s.commit(alloc);
+            var next: std.ArrayList(Cursor) = .empty;
+            errdefer next.deinit(s.c.alloc);
+            var added: std.ArrayList(i32) = .empty;
+            for (assigned) |p| {
+                var retained: ?Cursor = null;
+                for (s.owned.items) |cursor| if (cursor.pidx == p) {
+                    retained = cursor;
+                };
+                try next.append(s.c.alloc, retained orelse .{ .pidx = p, .leader = s.c.partitionLeader(p) orelse -1, .offset = -1 });
+                if (retained == null) try added.append(alloc, p);
+            }
+            if (added.items.len > 0) {
+                try s.c.refreshMetadata(s.opts.topic);
+                const fetched = try s.c.fetchGroupOffsets(alloc, .{
+                    .group = s.opts.group.?,
+                    .member_id = &s.member,
+                    .member_epoch = s.epoch,
+                    .topics = &.{.{ .name = s.opts.topic, .partitions = added.items }},
+                });
+                for (next.items) |*cursor| {
+                    cursor.leader = s.c.partitionLeader(cursor.pidx) orelse -1;
+                    for (added.items) |p| {
+                        if (p != cursor.pidx) continue;
+                        for (fetched.offsets) |offset| {
+                            if (offset.partition == p) {
+                                cursor.offset = offset.offset;
+                                cursor.committed = offset.offset;
+                            }
+                        }
+                    }
+                }
+                try listOffsets(s.c, arena, s.opts.topic, next.items, s.opts.start);
+            }
+            s.owned.deinit(s.c.alloc);
+            s.owned = next;
+            s.heartbeat_due = true;
+            s.c.vlog("group '{s}': assignment {d} partition(s), epoch {d}", .{ s.opts.group.?, s.owned.items.len, s.epoch });
+        }
+    }
+
+    fn leave(s: *GroupSession) void {
+        if (s.epoch <= 0) return;
+        var arena = std.heap.ArenaAllocator.init(s.c.alloc);
+        defer arena.deinit();
+        _ = s.c.heartbeat(arena.allocator(), .{ .group = s.opts.group.?, .member_id = &s.member, .member_epoch = -1 }) catch {};
+    }
+};
+
+fn pendingCommit(cursor: Cursor) ?i64 {
+    return if (cursor.emitted >= 0 and cursor.emitted != cursor.committed) cursor.emitted else null;
+}
+
+fn assignmentChanged(owned: []const Cursor, assigned: []const i32) bool {
+    if (owned.len != assigned.len) return true;
+    for (owned) |cursor| {
+        var found = false;
+        for (assigned) |p| if (p == cursor.pidx) {
+            found = true;
+        };
+        if (!found) return true;
+    }
+    return false;
+}
+
+test "group assignment changes and commit watermarks" {
+    const owned = [_]Cursor{
+        .{ .pidx = 0, .leader = 1, .offset = 4, .emitted = 4, .committed = 4 },
+        .{ .pidx = 2, .leader = 1, .offset = 9, .emitted = 8, .committed = 5 },
+    };
+    try std.testing.expect(!assignmentChanged(&owned, &.{ 2, 0 }));
+    try std.testing.expect(assignmentChanged(&owned, &.{ 0, 1 }));
+    try std.testing.expect(assignmentChanged(&owned, &.{0}));
+    try std.testing.expect(assignmentChanged(&owned, &.{}));
+    try std.testing.expect(!assignmentChanged(&.{}, &.{}));
+    try std.testing.expect(pendingCommit(owned[0]) == null);
+    try std.testing.expectEqual(@as(?i64, 8), pendingCommit(owned[1]));
+    try std.testing.expect(pendingCommit(.{ .pidx = 0, .leader = 1, .offset = 100 }) == null);
+}
+
+test "fenced group discards cursors without committing" {
+    var c: client.Client = undefined;
+    const cfg = @import("config.zig").Config{ .bootstrap_servers = &.{} };
+    c.cfg = &cfg;
+    var session: GroupSession = undefined;
+    session.c = &c;
+    session.opts = .{ .topic = "t", .group = "g" };
+    session.owned = .empty;
+    defer session.owned.deinit(std.testing.allocator);
+    try session.owned.append(std.testing.allocator, .{ .pidx = 0, .leader = 1, .offset = 3, .emitted = 3 });
+    session.epoch = 5;
+    session.assignment_seen = true;
+    session.heartbeat_due = false;
+    session.rejoin();
+    try std.testing.expectEqual(@as(usize, 0), session.owned.items.len);
+    try std.testing.expectEqual(@as(i32, 0), session.epoch);
+    try std.testing.expect(session.heartbeat_due);
+    try std.testing.expect(!session.assignment_seen);
+}
+
+fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
+    var random: [16]u8 = undefined;
+    c.io.randomSecure(&random) catch c.io.random(&random);
+    const now = std.Io.Timestamp.now(c.io, .awake);
+    var session: GroupSession = .{ .c = c, .opts = opts, .member = std.fmt.bytesToHex(random, .lower), .last_heartbeat = now, .last_record = now };
+    defer session.owned.deinit(c.alloc);
+    defer session.leave();
+    var arena = std.heap.ArenaAllocator.init(c.alloc);
+    defer arena.deinit();
+    var scratch: std.Io.Writer.Allocating = .init(c.alloc);
+    defer scratch.deinit();
+    var count: u64 = 0;
+    var leader_index: usize = 0;
+    var retry: client.Retry = .{};
+    while (true) {
+        if (opts.stop) |flag| if (flag.load(.acquire)) break;
+        if (opts.max_records) |max| if (count >= max) break;
+        if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
+        _ = arena.reset(.retain_capacity);
+        const elapsed = session.last_heartbeat.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds();
+        if (session.heartbeat_due or elapsed >= session.interval / 2) {
+            session.beat(&arena) catch |err| switch (err) {
+                error.FencedMemberEpoch, error.UnknownMemberId => session.rejoin(),
+                else => return err,
+            };
+            if (session.heartbeat_due) continue;
+        }
+        if (opts.idle_ms) |idle| {
+            if (session.assignment_seen and retry.started == null and session.last_record.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds() >= idle) break;
+        }
+        if (session.owned.items.len == 0) {
+            c.sleep(@min(50, @max(1, session.interval / 4)));
+            continue;
+        }
+        const leader = session.owned.items[leader_index % session.owned.items.len].leader;
+        leader_index +%= 1;
+        var parts: std.ArrayList(FetchPart) = .empty;
+        for (session.owned.items) |*cursor| if (cursor.leader == leader) {
+            try parts.append(arena.allocator(), .{ .pidx = cursor.pidx, .cursor = cursor });
+        };
+        var fetch_opts = opts;
+        fetch_opts.fetch_wait_ms = @min(c.cfg.fetch_max_wait_ms, @max(1, session.interval / 2));
+        var progress = false;
+        var failed = false;
+        fetchLeader(c, arena.allocator(), fetch_opts, parts.items, out, &scratch, &count, &progress) catch |err| switch (err) {
+            error.RetryFetch => {
+                c.dropNode(leader);
+                failed = true;
+            },
+            else => return err,
+        };
+        try out.flush();
+        if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
+        session.commit(arena.allocator()) catch |err| switch (err) {
+            error.FencedMemberEpoch, error.UnknownMemberId => {
+                session.rejoin();
+                continue;
+            },
+            else => return err,
+        };
+        if (progress) session.last_record = std.Io.Timestamp.now(c.io, .awake);
+        if (opts.stats) |s| s.maybeRender();
+        if (failed) {
+            if (!retry.pause(c)) return error.FetchFailed;
+            refreshLeaders(c, opts.topic, session.owned.items);
+        } else retry = .{};
+    }
+    try out.flush();
+    if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
+    try session.commit(arena.allocator());
     return count;
 }
 
@@ -314,7 +562,7 @@ fn fetchLeader(
     const resp = c.sendRequestAlloc(alloc, conn, protocol.api_key.fetch, protocol.version.fetch, Ctx{
         .topic = opts.topic,
         .parts = parts,
-        .max_wait_ms = c.cfg.fetch_max_wait_ms,
+        .max_wait_ms = opts.fetch_wait_ms orelse c.cfg.fetch_max_wait_ms,
         .max_bytes = c.cfg.fetch_max_bytes,
     }, body) catch return error.RetryFetch;
 
@@ -397,9 +645,12 @@ fn fetchLeader(
             }
             if (range.last) |last| {
                 if (part.cursor.offset <= last + 1) part.cursor.offset = last + 1;
+                if (opts.group != null) part.cursor.emitted = last + 1;
             }
             if (next_from_batches) |next| {
-                if (part.cursor.offset < next) part.cursor.offset = next;
+                if (opts.group == null or opts.max_records == null or count.* < opts.max_records.?) {
+                    if (part.cursor.offset < next) part.cursor.offset = next;
+                }
             }
             if (range.first != null) {
                 progress.* = true;

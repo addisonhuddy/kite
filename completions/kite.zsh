@@ -41,6 +41,7 @@ _kite() {
     case "$words[2]" in
         consume | c)
             _arguments -s $shared \
+                '(-g --group)'{-g,--group}'[join consumer group]:group:' \
                 '(-B --from-beginning)'{-B,--from-beginning}'[start at earliest offset]' \
                 '--offset[start at offset N]:offset:' \
                 '--partition[read one partition]:partition:' \

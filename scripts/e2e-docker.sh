@@ -289,5 +289,11 @@ zig-out/bin/kite topic delete -y "$TT" >/dev/null 2>&1 || true
 rm -f "$TERR"
 echo "PASS topic"
 
+echo "== consumer groups =="
+GROUP_LOG=${KITE_GROUP_LOG_DIR:-$HOME/kite-group-e2e-$(date +%s)}
+mkdir -p "$GROUP_LOG"
+echo "group logs: $GROUP_LOG"
+python3 scripts/check-groups.py "$PWD/zig-out/bin/kite" "$GROUP_LOG"
+
 status=0
 echo "ok: e2e against $IMAGE"

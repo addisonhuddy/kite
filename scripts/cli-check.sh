@@ -64,6 +64,9 @@ run_case group-describe-help 0 nonempty empty group describe --help
 run_case group-missing-name 1 empty "missing GROUP" group describe
 run_case group-unknown-action 1 empty "want list or describe" group reset
 run_case group-describe-all 1 empty "kite: --all is only valid for group list" group describe g --all
+run_case consume-group-offset 1 empty "kite: --group cannot be combined with --offset" consume -g g --offset 0 t
+run_case consume-group-partition 1 empty "kite: --group cannot be combined with --partition" consume --partition 0 --group=g t
+run_case consume-group-empty 1 empty "kite: --group must not be empty" consume --group= t
 run_case update-help 0 nonempty empty update --help
 run_case update-bad-tag 1 empty "kite: 'main' is not a release tag (want e.g. v0.3.0)" update main
 run_case update-extra 1 empty "kite: unexpected argument 'v2'" update v1 v2

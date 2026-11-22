@@ -57,7 +57,7 @@ _kite() {
             COMPREPLY=($(compgen -f -- "$cur"))
             return
             ;;
-        -b | --bootstrap | -H | --key | --offset | --partition | -n | --max | -t | --idle | --set | --unset | -p | --partitions | -r | --replication-factor | -s)
+        -g | --group | -b | --bootstrap | -H | --key | --offset | --partition | -n | --max | -t | --idle | --set | --unset | -p | --partitions | -r | --replication-factor | -s)
             return
             ;;
     esac
@@ -66,7 +66,7 @@ _kite() {
     case "$cmd" in
         consume | c)
             opts="-b --bootstrap --config --format --json \
-                -B --from-beginning --offset --partition -n --max -t --idle \
+                -g --group -B --from-beginning --offset --partition -n --max -t --idle \
                 -f --follow -q --quiet -v --verbose -h --help"
             ;;
         cluster)
