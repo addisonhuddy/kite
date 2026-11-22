@@ -55,7 +55,7 @@ pub const Conn = struct {
 /// Connect TCP to host:port. host may be DNS or IP literal.
 fn tcpConnect(io: std.Io, host: []const u8, port: u16, timeout_ms: ?u64) !std.Io.net.Stream {
     const hn = std.Io.net.HostName.init(host) catch return error.HostNotFound;
-    const s = hn.connect(io, port, .{ .mode = .stream, .timeout = if (timeout_ms) |ms| .{ .duration = .{ .raw = .fromMilliseconds(@intCast(ms)), .clock = .awake } } else .none }) catch |err| return switch (err) {
+    const s = if (timeout_ms) |ms| try connectBounded(io, hn, port, ms) else hn.connect(io, port, .{ .mode = .stream }) catch |err| return switch (err) {
         error.ConnectionRefused => error.ConnectionRefused,
         error.Timeout, error.HostUnreachable, error.NetworkUnreachable => error.ConnectTimedOut,
         error.UnknownHostName, error.NameServerFailure, error.NoAddressReturned => error.HostNotFound,
@@ -70,6 +70,67 @@ fn tcpConnect(io: std.Io, host: []const u8, port: u16, timeout_ms: ?u64) !std.Io
     // NB: no SO_SNDBUF — explicit values clamp to wmem_max (~208KB here),
     // smaller than tcp autotuning's ceiling.
     return s;
+}
+
+fn connectBounded(io: std.Io, host: std.Io.net.HostName, port: u16, timeout_ms: u64) !std.Io.net.Stream {
+    const deadline = std.Io.Timestamp.now(io, .awake).addDuration(.fromMilliseconds(@intCast(timeout_ms)));
+    var buffer: [32]std.Io.net.HostName.LookupResult = undefined;
+    var addresses: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&buffer);
+    host.lookup(io, &addresses, .{ .port = port }) catch return error.HostNotFound;
+    var last_error: error{ HostNotFound, ConnectTimedOut, ConnectFailed, ConnectionRefused } = error.HostNotFound;
+    while (addresses.getOne(io)) |result| switch (result) {
+        .canonical_name => {},
+        .address => |address| {
+            const remaining = std.Io.Timestamp.now(io, .awake).durationTo(deadline).toMilliseconds();
+            if (remaining <= 0) return error.ConnectTimedOut;
+            return connectAddress(io, address, @intCast(remaining)) catch |err| {
+                last_error = err;
+                continue;
+            };
+        },
+    } else |_| {}
+    return last_error;
+}
+
+fn connectAddress(io: std.Io, address: std.Io.net.IpAddress, timeout_ms: u64) !std.Io.net.Stream {
+    const p = std.posix;
+    const raw_fd = p.system.socket(std.Io.Threaded.posixAddressFamily(&address), p.SOCK.STREAM, p.IPPROTO.TCP);
+    if (p.errno(raw_fd) != .SUCCESS) return error.ConnectFailed;
+    const fd: p.fd_t = @intCast(raw_fd);
+    const stream: std.Io.net.Stream = .{ .socket = .{ .handle = fd, .address = address } };
+    errdefer stream.close(io);
+    const flags: u32 = @bitCast(p.O{ .NONBLOCK = true });
+    if (p.errno(p.system.fcntl(fd, p.F.SETFL, flags)) != .SUCCESS) return error.ConnectFailed;
+    if (p.errno(p.system.fcntl(fd, p.F.SETFD, @as(u32, p.FD_CLOEXEC))) != .SUCCESS) return error.ConnectFailed;
+    var storage: std.Io.Threaded.PosixAddress = undefined;
+    const len = std.Io.Threaded.addressToPosix(&address, &storage);
+    const code = p.errno(p.system.connect(fd, &storage.any, len));
+    switch (code) {
+        .SUCCESS => {},
+        .CONNREFUSED => return error.ConnectionRefused,
+        .INPROGRESS, .AGAIN => {
+            var pollfds = [_]p.pollfd{.{ .fd = fd, .events = p.POLL.OUT, .revents = 0 }};
+            if ((p.poll(&pollfds, @intCast(timeout_ms)) catch return error.ConnectFailed) == 0) return error.ConnectTimedOut;
+            var socket_error: u32 = 0;
+            var size: p.socklen_t = @sizeOf(u32);
+            if (p.errno(p.system.getsockopt(fd, p.SOL.SOCKET, p.SO.ERROR, std.mem.asBytes(&socket_error), &size)) != .SUCCESS) return error.ConnectFailed;
+            if (socket_error == @intFromEnum(p.E.CONNREFUSED)) return error.ConnectionRefused;
+            if (socket_error != 0) return error.ConnectFailed;
+        },
+        else => return error.ConnectFailed,
+    }
+    if (p.errno(p.system.fcntl(fd, p.F.SETFL, @as(u32, 0))) != .SUCCESS) return error.ConnectFailed;
+    return stream;
+}
+
+test "bounded group connections succeed and report refused sockets" {
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(std.testing.io, .{});
+    const bound = server.socket.address;
+    const stream = try connectAddress(std.testing.io, bound, 100);
+    stream.close(std.testing.io);
+    server.deinit(std.testing.io);
+    try std.testing.expectError(error.ConnectionRefused, connectAddress(std.testing.io, bound, 100));
 }
 
 /// Establish a connection: TCP, then TLS if `ca` is set (SNI + verification on).
