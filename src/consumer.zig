@@ -287,7 +287,7 @@ const GroupSession = struct {
     }
 
     fn rejoin(s: *GroupSession) void {
-        s.startRecovery();
+        if (s.recovery_deadline == null) s.recovery_deadline = std.Io.Timestamp.now(s.c.io, .awake).addDuration(.fromMilliseconds(group_session_assumed_ms));
         s.owned.clearRetainingCapacity();
         s.commit_recovery_deadline = null;
         s.epoch = 0;
@@ -528,6 +528,30 @@ test "stale epochs request one heartbeat and retry" {
     try std.testing.expect(session.heartbeat_due);
     try std.testing.expect(!session.recoverEpoch(error.StaleMemberEpoch));
     try std.testing.expect(!session.recoverEpoch(error.GroupFailed));
+}
+
+test "fences after long stalls start a current bounded rejoin budget" {
+    var c: client.Client = undefined;
+    const cfg: config.Config = .{ .bootstrap_servers = &.{} };
+    c.cfg = &cfg;
+    c.io = std.testing.io;
+    const now = std.Io.Timestamp.now(c.io, .awake);
+    const old = now.addDuration(.fromMilliseconds(-2 * group_session_assumed_ms));
+    for ([_]anyerror{ error.FencedMemberEpoch, error.UnknownMemberId }) |err| {
+        var session: GroupSession = .{ .c = &c, .opts = .{ .topic = "t", .group = "g" }, .member = @splat('m'), .epoch = 3, .last_heartbeat = old, .last_record = old, .assignment_seen = true };
+        try std.testing.expect(session.recoverEpoch(err));
+        try session.checkRecovery();
+        const deadline = session.recovery_deadline.?;
+        try std.testing.expect(deadline.nanoseconds >= now.addDuration(.fromMilliseconds(group_session_assumed_ms)).nanoseconds);
+        try std.testing.expectEqual(@as(i32, 0), session.epoch);
+        try std.testing.expect(session.heartbeat_due);
+        try std.testing.expect(!session.assignment_seen);
+        session.rejoin();
+        try std.testing.expectEqual(deadline, session.recovery_deadline.?);
+        session.recovery_deadline = .zero;
+        session.rejoin();
+        try std.testing.expectError(error.FetchFailed, session.checkRecovery());
+    }
 }
 
 test "commit floor skips network requests until due" {
