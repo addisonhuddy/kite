@@ -69,7 +69,9 @@ class Handler(socketserver.StreamRequestHandler):
                 api, _, corr = struct.unpack_from(">hhi", req)
                 if api == 10 and (broker.mode == "no-join" or (broker.mode == "follow-join" and time.monotonic() - broker.started < 50)):
                     return
-                if api == 1 and broker.mode == "leader":
+                if api == 3 and broker.mode == "healthy" and broker.fetch_old_fault:
+                    return
+                if api == 1 and broker.mode in ("leader", "healthy"):
                     broker.fetch_nodes.append(self.server.node)
                     if self.server.node == 1:
                         broker.fetch_old_fault = True
@@ -92,11 +94,13 @@ class Handler(socketserver.StreamRequestHandler):
                 elif api == 3:
                     address = pack("i", 1) + text(b"127.0.0.1") + pack("i", broker.server_address[1]) + b"\x00\x00"
                     leader = 2 if broker.mode == "leader" and broker.fetch_old_fault else 1
-                    if leader == 2:
+                    if leader == 2 or broker.mode == "healthy":
                         address += pack("i", 2) + text(b"127.0.0.1") + pack("i", broker.secondary.server_address[1]) + b"\x00\x00"
                     partition = pack("hiii", 0, 0, leader, 1) + b"\x01\x01\x01\x00"
-                    topic = b"\x00\x00" + text(b"example") + b"\x00" * 17 + b"\x02" + partition + b"\x00" * 5
-                    response = b"\x00" * 4 + bytes([3 if leader == 2 else 2]) + address + b"\x00" + pack("i", 1) + b"\x02" + topic + b"\x00"
+                    if broker.mode == "healthy":
+                        partition += pack("hiii", 0, 1, 2, 1) + b"\x01\x01\x01\x00"
+                    topic = b"\x00\x00" + text(b"example") + b"\x00" * 17 + bytes([3 if broker.mode == "healthy" else 2]) + partition + b"\x00" * 5
+                    response = b"\x00" * 4 + bytes([3 if leader == 2 or broker.mode == "healthy" else 2]) + address + b"\x00" + pack("i", 1) + b"\x02" + topic + b"\x00"
                 elif api == 10:
                     response = b"\x00" * 4 + b"\x02" + text(b"g") + pack("i", 1) + text(b"127.0.0.1") + pack("i", broker.server_address[1]) + b"\x00" * 5
                 elif api == 68:
@@ -117,23 +121,27 @@ class Handler(socketserver.StreamRequestHandler):
                         self.wfile.write(pack("I", len(payload)) + payload)
                         continue
                     assignment = b"\x01\x02" + b"\x00" * 16 + b"\x02" + pack("i", 0) + b"\x00\x00\x00"
+                    if broker.mode == "healthy":
+                        assignment = b"\x01\x02" + b"\x00" * 16 + b"\x03" + pack("ii", 0, 1) + b"\x00\x00\x00"
                     response = b"\x00" * 7 + text(member) + pack("ii", broker.generation, 1000) + assignment
                 elif api == 9:
                     response = b"\x00" * 4 + b"\x02" + text(b"g") + b"\x02" + text(b"example") + b"\x02" + pack("iqi", 0, -1, -1) + b"\x00" * 9
                 elif api == 2:
                     code = 6 if broker.mode == "adoption" and adopting else 0
-                    response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ihqqi", 0, code, 0, 0, 0) + b"\x00\x00\x00"
+                    response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ihqqi", self.server.node - 1 if broker.mode == "healthy" else 0, code, 0, 0, 0) + b"\x00\x00\x00"
                 elif api == 1:
                     records = batch(1 if broker.delivered and broker.mode == "follow-fetch" else 0)
+                    if broker.mode == "healthy":
+                        records = batch(broker.fetch_nodes.count(2) - 1)
                     if broker.delivered and broker.mode in ("commit-bound", "follow-commit"):
                         records = batch(1) if broker.mode == "follow-commit" and elapsed >= 50 else b""
                     broker.delivered = broker.delivered or time.monotonic()
-                    part = pack("ihqqq", 0, 0, 1, -1, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
+                    part = pack("ihqqq", 1 if broker.mode == "healthy" else 0, 0, 1, -1, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
                     response = b"\x00" * 10 + b"\x02" + text(b"example") + b"\x02" + part + b"\x00\x00"
                 elif api == 8:
                     broker.commits.append(time.monotonic())
                     code = 14 if broker.mode in ("idle-unconfirmed", "bounded", "commit-bound") or (broker.mode == "follow-commit" and elapsed < 50) or (broker.mode == "idle-confirmed" and elapsed < 1.7) else 0
-                    response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ih", 0, code) + b"\x00\x00\x00"
+                    response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ih", 1 if broker.mode == "healthy" else 0, code) + b"\x00\x00\x00"
                 else:
                     raise AssertionError(api)
                 payload = pack("i", corr) + tags + response
@@ -145,11 +153,13 @@ class Handler(socketserver.StreamRequestHandler):
 def check(mode):
     with contextlib.ExitStack() as stack:
         broker = stack.enter_context(Broker(mode))
-        if mode == "leader":
+        if mode in ("leader", "healthy"):
             broker.secondary = stack.enter_context(Broker(mode, broker))
             threading.Thread(target=broker.secondary.serve_forever, daemon=True).start()
         threading.Thread(target=broker.serve_forever, daemon=True).start()
-        if mode.startswith("follow"):
+        if mode == "healthy":
+            flags = ["--idle", "20s", "-n", "2"]
+        elif mode.startswith("follow"):
             flags = ["--follow", "-n", "1" if mode == "follow-join" else "2"]
         elif mode.startswith("idle"):
             flags = ["--idle", "1500ms"]
@@ -197,6 +207,9 @@ def check(mode):
             assert any(t - broker.delivered >= 1.7 for t in broker.commits), broker.commits
         elif mode == "leader":
             assert broker.fetch_nodes == [1, 2], broker.fetch_nodes
+        elif mode == "healthy":
+            assert broker.fetch_old_fault and broker.fetch_nodes.count(2) == 2, broker.fetch_nodes
+            assert len(rows) == 2 and all(row["partition"] == 1 for row in rows), rows
         elif mode in ("adoption", "metadata", "offsets"):
             assert len(broker.beats) >= 8, (mode, broker.beats)
             assert max(b - a for a, b in zip(broker.beats, broker.beats[1:])) < 2, (mode, broker.beats)
@@ -205,4 +218,4 @@ def check(mode):
 
 
 with concurrent.futures.ThreadPoolExecutor() as pool:
-    list(pool.map(check, sys.argv[2:] or ("leader", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-coordinator", "no-join", "follow-join")))
+    list(pool.map(check, sys.argv[2:] or ("leader", "healthy", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-coordinator", "no-join", "follow-join")))

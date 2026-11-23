@@ -48,6 +48,7 @@ pub const Cursor = struct {
     offset: i64,
     emitted: i64 = -1,
     committed: i64 = -1,
+    leader_stale: bool = false,
 };
 
 const ListPart = struct {
@@ -160,7 +161,6 @@ const GroupSession = struct {
     owned: std.ArrayList(Cursor) = .empty,
     pending: ?std.ArrayList(Cursor) = null,
     pending_offsets_fetched: bool = false,
-    leaders_stale: bool = false,
     assignment_seen: bool = false,
     joined_once: bool = false,
     heartbeat_due: bool = true,
@@ -764,7 +764,9 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             c.sleep(@min(50, @max(1, session.interval / 4)));
             continue;
         }
-        if (session.leaders_stale) {
+        const selected = leader_index % session.owned.items.len;
+        leader_index +%= 1;
+        if (session.owned.items[selected].leader_stale) {
             c.refreshMetadata(opts.topic) catch |err| {
                 if (!session.recoverEpoch(err)) {
                     exit_error = err;
@@ -773,13 +775,14 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
                 _ = retry.pause(c);
                 continue;
             };
-            for (session.owned.items) |*cursor| cursor.leader = c.partitionLeader(cursor.pidx) orelse -1;
-            session.leaders_stale = false;
+            for (session.owned.items) |*cursor| {
+                cursor.leader = c.partitionLeader(cursor.pidx) orelse -1;
+                cursor.leader_stale = false;
+            }
         }
-        const leader = session.owned.items[leader_index % session.owned.items.len].leader;
-        leader_index +%= 1;
+        const leader = session.owned.items[selected].leader;
         var parts: std.ArrayList(FetchPart) = .empty;
-        for (session.owned.items) |*cursor| if (cursor.leader == leader) {
+        for (session.owned.items) |*cursor| if (cursor.leader == leader and !cursor.leader_stale) {
             try parts.append(arena.allocator(), .{ .pidx = cursor.pidx, .cursor = cursor });
         };
         var fetch_opts = opts;
@@ -811,7 +814,7 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         fetchLeader(c, arena.allocator(), fetch_opts, parts.items, out, &scratch, &count, &progress) catch |err| switch (err) {
             error.RetryFetch => {
                 c.dropNode(leader);
-                session.leaders_stale = true;
+                for (parts.items) |part| part.cursor.leader_stale = true;
                 session.startFetchRecovery();
                 failed = true;
             },
