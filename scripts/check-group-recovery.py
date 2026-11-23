@@ -69,6 +69,8 @@ class Handler(socketserver.StreamRequestHandler):
                 api, _, corr = struct.unpack_from(">hhi", req)
                 if api == 10 and (broker.mode == "no-join" or (broker.mode == "follow-join" and time.monotonic() - broker.started < 50)):
                     return
+                if api == 68 and broker.mode == "no-join-heartbeat":
+                    return
                 if api == 3 and broker.mode == "healthy" and broker.fetch_old_fault:
                     return
                 if api == 1 and broker.mode in ("leader", "healthy"):
@@ -163,7 +165,7 @@ def check(mode):
             flags = ["--follow", "-n", "1" if mode == "follow-join" else "2"]
         elif mode.startswith("idle"):
             flags = ["--idle", "1500ms"]
-        elif mode in ("bounded", "commit-bound", "no-join"):
+        elif mode in ("bounded", "commit-bound", "no-join", "no-join-heartbeat"):
             flags = ["--idle", "2m"]
         else:
             flags = ["--idle", "20s", "-n", "1"]
@@ -176,11 +178,11 @@ def check(mode):
         if broker.secondary:
             broker.secondary.shutdown()
         rows = [json.loads(line) for line in result.stdout.splitlines()]
-        if mode == "no-join":
+        if mode in ("no-join", "no-join-heartbeat"):
             assert result.returncode == 1 and not rows and not broker.beats, result.stderr
             assert "before joining group" in result.stderr, result.stderr
             assert 35 <= time.monotonic() - broker.started < 50
-            print("PASS group recovery no-join", flush=True)
+            print(f"PASS group recovery {mode}", flush=True)
             return
         assert rows and all(row["value"] == "kept" for row in rows), (mode, result.stderr, rows)
         assert broker.commits, (mode, result.stderr)
@@ -218,4 +220,4 @@ def check(mode):
 
 
 with concurrent.futures.ThreadPoolExecutor() as pool:
-    list(pool.map(check, sys.argv[2:] or ("leader", "healthy", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-coordinator", "no-join", "follow-join")))
+    list(pool.map(check, sys.argv[2:] or ("leader", "healthy", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-coordinator", "no-join", "no-join-heartbeat", "follow-join")))
