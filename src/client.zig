@@ -710,6 +710,12 @@ pub const Client = struct {
         return groups.toOwnedSlice(alloc);
     }
 
+    pub fn listCoordinatorGroups(c: *Client, alloc: std.mem.Allocator, group: []const u8) ![]protocol.ListedGroup {
+        try c.requireVersion(protocol.api_key.list_groups, protocol.version.list_groups, "ListGroups");
+        const node = try c.findCoordinator(group);
+        return c.listGroupsOnNode(alloc, node, true);
+    }
+
     fn listGroupsOnNode(c: *Client, alloc: std.mem.Allocator, node: i32, all: bool) ![]protocol.ListedGroup {
         const conn = try c.connFor(node, connKey(node, 0xFFFF_FFFE));
         var retry: Retry = .{};
@@ -1727,6 +1733,59 @@ pub const Client = struct {
         try d.tagBuffer();
     }
 };
+
+test "classic fallback lists only the cached coordinator for results empty and errors" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var env: std.process.Environ.Map = .init(alloc);
+    defer env.deinit();
+    const cfg: config.Config = .{ .bootstrap_servers = &.{} };
+    var c = Client.init(alloc, io, &env, &cfg);
+    defer c.deinit();
+    c.coordinator_group = try alloc.dupe(u8, "g");
+    c.coordinator_node = 2;
+    try c.api_ranges.put(alloc, protocol.api_key.list_groups, .{ .min = 0, .max = 5 });
+    try c.brokers.put(alloc, 3, .{ .host = try alloc.dupe(u8, "unreachable.invalid"), .port = 1 });
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+    const conn = try transport.connect(io, alloc, &env, "127.0.0.1", server.socket.address.getPort(), null, null);
+    try c.conns.put(alloc, Client.connKey(2, 0xFFFF_FFFE), conn);
+    const peer = try server.accept(io);
+    defer peer.close(io);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    for (0..3) |case| {
+        var response = Encoder.init(alloc);
+        defer response.deinit();
+        try response.i32v(protocol.lastCorrelationId() + 1);
+        try response.tagBuffer();
+        try response.i32v(0);
+        try response.i16v(if (case == 2) 30 else 0);
+        try response.compactArrayLen(if (case == 0) 1 else 0);
+        if (case == 0) {
+            for ([_][]const u8{ "g", "consumer", "Empty", "classic" }) |field| try response.compactString(field);
+            try response.tagBuffer();
+        }
+        try response.tagBuffer();
+        var buffer: [128]u8 = undefined;
+        var writer = peer.writer(io, &buffer);
+        var length: [4]u8 = undefined;
+        std.mem.writeInt(u32, &length, @intCast(response.written().len), .big);
+        try writer.interface.writeAll(&length);
+        try writer.interface.writeAll(response.written());
+        try writer.interface.flush();
+        if (case == 2) {
+            try std.testing.expectError(error.GroupFailed, c.listCoordinatorGroups(arena.allocator(), "g"));
+        } else {
+            const groups = try c.listCoordinatorGroups(arena.allocator(), "g");
+            try std.testing.expectEqual(@as(usize, if (case == 0) 1 else 0), groups.len);
+            if (case == 0) try std.testing.expectEqualStrings("classic", groups[0].group_type);
+        }
+        try std.testing.expect(c.control == null);
+        try std.testing.expectEqual(@as(u32, 1), c.conns.count());
+    }
+}
 
 test "socket request timeouts exceed long polls and respect the recovery deadline" {
     var c: Client = undefined;

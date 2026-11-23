@@ -1010,7 +1010,7 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
     const group = opts.group.?;
     const described = c.describeGroup(alloc, group) catch |err| switch (err) {
         error.GroupNotFound => classic: {
-            const groups = c.listGroups(alloc, true) catch fatalErr(&c, "could not list classic groups");
+            const groups = c.listCoordinatorGroups(alloc, group) catch fatalErr(&c, "could not describe classic group");
             for (groups) |g| {
                 if (std.mem.eql(u8, g.group, group)) break :classic protocol.DescribedGroup{ .code = .none, .message = null, .group = group, .state = g.state, .partitions = &.{} };
             }
