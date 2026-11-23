@@ -268,6 +268,7 @@ const GroupSession = struct {
     fn rejoin(s: *GroupSession) void {
         s.clearPending();
         s.owned.clearRetainingCapacity();
+        s.commit_recovery_deadline = null;
         s.epoch = 0;
         s.heartbeat_due = true;
         s.assignment_seen = false;
@@ -277,14 +278,18 @@ const GroupSession = struct {
 
     fn commit(s: *GroupSession, alloc: std.mem.Allocator, force: bool) !void {
         const now = std.Io.Timestamp.now(s.c.io, .awake);
-        if (!force) if (s.last_commit) |last| {
-            if (last.durationTo(now).toMilliseconds() < group_commit_floor_ms) return;
-        };
         var parts: std.ArrayList(protocol.CommitPartition) = .empty;
+        defer parts.deinit(alloc);
         for (s.owned.items) |cursor| {
             if (pendingCommit(cursor)) |offset| try parts.append(alloc, .{ .partition = cursor.pidx, .offset = offset });
         }
-        if (parts.items.len == 0) return;
+        if (parts.items.len == 0) {
+            s.commit_recovery_deadline = null;
+            return;
+        }
+        if (!force) if (s.last_commit) |last| {
+            if (last.durationTo(now).toMilliseconds() < group_commit_floor_ms) return;
+        };
         s.c.commitGroupOffsets(alloc, .{
             .group = s.opts.group.?,
             .member_id = &s.member,
@@ -495,7 +500,9 @@ test "fenced group discards cursors without committing" {
     session.epoch = 5;
     session.assignment_seen = true;
     session.heartbeat_due = false;
+    session.commit_recovery_deadline = .zero;
     session.rejoin();
+    try std.testing.expect(session.commit_recovery_deadline == null);
     try std.testing.expectEqual(@as(usize, 0), session.owned.items.len);
     try std.testing.expectEqual(@as(i32, 0), session.epoch);
     try std.testing.expect(session.heartbeat_due);
@@ -518,7 +525,24 @@ test "commit floor skips network requests until due" {
     var session: GroupSession = undefined;
     session.c = &c;
     session.last_commit = std.Io.Timestamp.now(c.io, .awake);
+    session.owned = .empty;
+    defer session.owned.deinit(std.testing.allocator);
+    try session.owned.append(std.testing.allocator, .{ .pidx = 0, .leader = 1, .offset = 2, .emitted = 2, .committed = 1 });
     try session.commit(std.testing.allocator, false);
+}
+
+test "no pending offsets clear commit recovery even within the commit floor" {
+    var c: client.Client = undefined;
+    c.io = std.testing.io;
+    const now = std.Io.Timestamp.now(c.io, .awake);
+    var session: GroupSession = .{ .c = &c, .opts = .{ .topic = "t" }, .member = @splat('m'), .last_heartbeat = now, .last_record = now, .last_commit = now, .commit_recovery_deadline = .zero };
+    try session.commit(std.testing.allocator, false);
+    try std.testing.expect(session.commit_recovery_deadline == null);
+    try session.owned.append(std.testing.allocator, .{ .pidx = 0, .leader = 1, .offset = 2, .emitted = 2, .committed = 2 });
+    defer session.owned.deinit(std.testing.allocator);
+    session.commit_recovery_deadline = .zero;
+    try session.commit(std.testing.allocator, true);
+    try std.testing.expect(session.commit_recovery_deadline == null);
 }
 
 test "recovery deadlines retain the member epoch and flushed progress" {
