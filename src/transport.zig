@@ -125,7 +125,8 @@ pub const Conn = struct {
     }
 
     fn ioError(c: *Conn) TransportError {
-        if (c.net_reader.err == error.IoTimedOut or c.net_writer.err == error.IoTimedOut) return error.IoTimedOut;
+        if (c.net_reader.err) |err| if (err == error.IoTimedOut) return err;
+        if (c.net_writer.err) |err| if (err == error.IoTimedOut) return err;
         return error.IoFailed;
     }
 };
