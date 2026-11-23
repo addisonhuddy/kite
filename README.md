@@ -417,8 +417,9 @@ the records emitted within the limit. On idle, SIGINT, or reaching `-n`, kite
 commits flushed progress and leaves the group; on broken pipe it leaves without
 committing the failed round. SIGINT still exits 130.
 
-Group idle time starts at the first assignment heartbeat (even an empty
-assignment), not while joining. A member assigned zero partitions exits after
+Group idle time excludes joining and the initial position-resolution pass. Each
+ready partition gets an initial fetch before an idle exit; unresolved partitions
+remain under their outage deadlines. A member assigned zero partitions exits after
 that idle window unless `--follow` is used. `-v` logs joins, assignments, and
 commits. Heartbeats run between fetches; no background process is started.
 The stdout reader must drain within the broker's group session timeout (45s
@@ -432,8 +433,10 @@ Without `--follow`, recovery stops at the idle timeout
 (if set), or after a session-sized recovery budget. Group membership, each
 partition's leader outage, and pending commits have independent budgets. Only a
 fully initialized heartbeat clears membership recovery; only fetching the affected
-partition clears its outage. Newly assigned partitions resolve their starting
-positions independently, so unresolved partitions do not stop healthy ones.
+partition clears its outage. Newly assigned partitions resolve starting positions
+before fetching: one OffsetFetch batch, then ListOffsets batches by leader.
+Unresolved partitions retry in a bounded pass that reserves time for healthy
+partitions to fetch; they do not hold up ready partitions.
 Revocations take effect after the commit attempt, without waiting for additions.
 Revocation drops that partition's outage, and a
 successful commit or discarded pending offsets clears commit recovery.

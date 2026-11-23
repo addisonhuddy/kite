@@ -66,6 +66,64 @@ class Broker(socketserver.ThreadingTCPServer):
         self.fetches = []
         self.commit_recovered = None
         self.fetch_connections = []
+        self.position_fetches = []
+        self.position_lists = []
+        self.produced = False
+
+
+def positions_response(broker, node, api, req):
+    pos = 11 + struct.unpack_from(">h", req, 8)[0]
+    if api == 3:
+        addresses = b"".join(pack("i", n) + text(b"127.0.0.1") + pack("i", server.server_address[1]) + b"\x00\x00" for n, server in ((1, broker), (2, broker.secondary)))
+        partitions = b"".join(pack("hiii", 0, p, 1 if p == 0 else 2, 1) + b"\x01\x01\x01\x00" for p in range(3))
+        topic = b"\x00\x00" + text(b"example") + b"\x00" * 17 + b"\x04" + partitions + b"\x00" * 5
+        return b"\x00" * 4 + b"\x03" + addresses + b"\x00" + pack("i", 1) + b"\x02" + topic + b"\x00"
+    if api == 68:
+        _, pos = string(req, pos)
+        member, pos = string(req, pos)
+        broker.beats.append(time.monotonic())
+        assignment = b"\x01\x02" + b"\x00" * 16 + b"\x04" + pack("iii", 0, 1, 2) + b"\x00\x00\x00"
+        return b"\x00" * 7 + text(member) + pack("ii", 1, 1000) + assignment
+    if api == 9:
+        _, pos = string(req, pos + 1)
+        _, pos = string(req, pos)
+        _, pos = string(req, pos + 5)
+        count = req[pos] - 1
+        parts = struct.unpack_from(">" + "i" * count, req, pos + 1)
+        broker.position_fetches.append(parts)
+        offsets = b"".join(pack("iqi", p, -1, -1) + b"\x00" * 4 for p in parts)
+        return b"\x00" * 4 + b"\x02" + text(b"g") + b"\x02" + text(b"example") + bytes([count + 1]) + offsets + b"\x00" * 5
+    if api == 2:
+        _, pos = string(req, pos + 6)
+        count = req[pos] - 1
+        parts = [struct.unpack_from(">i", req, pos + 1 + 17 * i)[0] for i in range(count)]
+        broker.position_lists.append((node, parts, time.monotonic()))
+        if broker.mode == "position-timeout" and node == 1:
+            time.sleep(1)
+            return None
+        offset = 1 if broker.mode == "position-latest" and broker.produced else 0
+        offsets = b"".join(pack("ihqqi", p, 0, 0, offset, 0) + b"\x00" for p in parts)
+        return b"\x00" * 4 + b"\x02" + text(b"example") + bytes([count + 1]) + offsets + b"\x00\x00"
+    if api == 1:
+        _, pos = string(req, pos + 26)
+        count = req[pos] - 1
+        pos += 1
+        if node == 1:
+            broker.produced = True
+            wait, = struct.unpack_from(">i", req, 15 + struct.unpack_from(">h", req, 8)[0])
+            time.sleep(wait / 1000)
+        parts = b""
+        for _ in range(count):
+            partition, _, offset = struct.unpack_from(">iiq", req, pos)
+            pos += 33
+            limit = (4 if broker.mode == "position-timeout" else 1) if partition == 1 else 0
+            records = batch(offset) if offset < limit else b""
+            parts += pack("ihqqq", partition, 0, limit, -1, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
+        return b"\x00" * 10 + b"\x02" + text(b"example") + bytes([count + 1]) + parts + b"\x00\x00"
+    if api == 8:
+        broker.commits.append(time.monotonic())
+        parts = b"".join(pack("ih", p, 0) + b"\x00" for p in range(3))
+        return b"\x00" * 4 + b"\x02" + text(b"example") + b"\x04" + parts + b"\x00\x00"
 
 
 def assignment_response(broker, api, req):
@@ -105,9 +163,13 @@ def assignment_response(broker, api, req):
         return b"\x00" * 4 + b"\x02" + text(b"g") + b"\x02" + text(b"example") + b"\x05" + offsets + b"\x00" * 5
     if api == 2:
         _, pos = string(req, pos + 6)
-        partition, = struct.unpack_from(">i", req, pos + 1)
-        unresolved = partition == 1 and time.monotonic() - broker.assignment_changed < 8
-        return b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ihqqi", partition, 6 if unresolved else 0, 0, 0, 0) + b"\x00\x00\x00"
+        count = req[pos] - 1
+        parts = b""
+        for i in range(count):
+            partition, = struct.unpack_from(">i", req, pos + 1 + 17 * i)
+            unresolved = partition == 1 and time.monotonic() - broker.assignment_changed < 8
+            parts += pack("ihqqi", partition, 6 if unresolved else 0, 0, 0, 0) + b"\x00"
+        return b"\x00" * 4 + b"\x02" + text(b"example") + bytes([count + 1]) + parts + b"\x00\x00"
     if api == 1:
         _, pos = string(req, pos + 26)
         count = req[pos] - 1
@@ -145,6 +207,13 @@ class Handler(socketserver.StreamRequestHandler):
                     broker.fetch_connections.append(self.connection)
                     if broker.mode == "transport-connection" and len(broker.fetches) == 2:
                         return
+                if broker.mode.startswith("position-") and api in (1, 2, 3, 8, 9, 68):
+                    response = positions_response(broker, self.server.node, api, req)
+                    if response is None:
+                        return
+                    payload = pack("i", corr) + b"\x00" + response
+                    self.wfile.write(pack("I", len(payload)) + payload)
+                    continue
                 if broker.mode == "assignment" and api in (1, 2, 3, 8, 9, 68):
                     response = assignment_response(broker, api, req)
                     payload = pack("i", corr) + b"\x00" + response
@@ -220,7 +289,7 @@ class Handler(socketserver.StreamRequestHandler):
                     response = b"\x00" * 7 + text(member) + pack("ii", broker.generation, 1000) + assignment
                 elif api == 9:
                     response = b"\x00" * 4 + b"\x02" + text(b"g") + b"\x02" + text(b"example") + b"\x02" + pack("iqi", 0, -1, -1) + b"\x00" * 9
-                    if connection_test:
+                    if paired:
                         offsets = b"".join(pack("iqi", p, -1, -1) + b"\x00" * 4 for p in (0, 1))
                         response = b"\x00" * 4 + b"\x02" + text(b"g") + b"\x02" + text(b"example") + b"\x03" + offsets + b"\x00" * 5
                 elif api == 2:
@@ -285,7 +354,7 @@ class Handler(socketserver.StreamRequestHandler):
 def check(mode):
     with contextlib.ExitStack() as stack:
         broker = stack.enter_context(Broker(mode.removesuffix("-legacy")))
-        if mode in ("leader", "healthy", "partition-bound", "follow-partition", "reset-fair"):
+        if mode in ("leader", "healthy", "partition-bound", "follow-partition", "reset-fair") or mode.startswith("position-"):
             broker.secondary = stack.enter_context(Broker(mode, broker))
             threading.Thread(target=broker.secondary.serve_forever, daemon=True).start()
         threading.Thread(target=broker.serve_forever, daemon=True).start()
@@ -295,6 +364,8 @@ def check(mode):
             flags = ["--idle", "2m", "-n", "1"]
         elif mode == "assignment":
             flags = ["-v", "--idle", "20s", "-n", "4"]
+        elif mode.startswith("position-"):
+            flags = ["--idle", "300ms", "-n", "4" if mode == "position-timeout" else "1"]
         elif "-connection" in mode:
             flags = ["--idle", "20s", "-n", "3"]
         elif mode == "healthy":
@@ -308,7 +379,7 @@ def check(mode):
         else:
             flags = ["--idle", "20s", "-n", "1"]
         result = subprocess.run(
-            [sys.argv[1], "consume", *([] if mode == "throttle-idle" or mode.endswith("-legacy") else ["-g", "g"]), "-B", *flags, "--json", "example"],
+            [sys.argv[1], "consume", *([] if mode == "throttle-idle" or mode.endswith("-legacy") else ["-g", "g"]), *([] if mode == "position-latest" else ["-B"]), *flags, "--json", "example"],
             env={**os.environ, "BOOTSTRAP_SERVERS": f"127.0.0.1:{broker.server_address[1]}"},
             capture_output=True, text=True, timeout=65,
         )
@@ -341,6 +412,16 @@ def check(mode):
             print(f"PASS group recovery {mode}", flush=True)
             return
         assert broker.commits, (mode, result.stderr)
+        if mode.startswith("position-"):
+            assert result.returncode == 0, (mode, result.stderr)
+            assert broker.position_fetches == [(0, 1, 2)], broker.position_fetches
+            assert any(parts == [1, 2] for _, parts, _ in broker.position_lists), broker.position_lists
+            assert all(at < broker.fetches[0] for _, _, at in broker.position_lists[:2]), broker.position_lists
+            assert [r["offset"] for r in rows] == list(range(4 if mode == "position-timeout" else 1)), rows
+            assert all(r["partition"] == 1 for r in rows), rows
+            assert time.monotonic() - broker.started < 4, (mode, result.stderr)
+            print(f"PASS group recovery {mode}", flush=True)
+            return
         if mode == "assignment":
             assert result.returncode == 0 and len(rows) == 4, (result.stderr, rows)
             assert sorted((r["partition"], r["offset"]) for r in rows) == [(0, 0), (0, 1), (1, 0), (3, 0)], rows
@@ -408,4 +489,4 @@ def check(mode):
 
 
 with concurrent.futures.ThreadPoolExecutor() as pool:
-    list(pool.map(check, sys.argv[2:] or ("partition-connection", "partition-connection-legacy", "request-connection", "transport-connection", "assignment", "leader", "healthy", "partition-bound", "reset", "reset-fail", "reset-fair", "throttle-idle", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-partition", "follow-coordinator", "no-join", "no-join-heartbeat", "follow-join")))
+    list(pool.map(check, sys.argv[2:] or ("position-backlog", "position-latest", "position-timeout", "partition-connection", "partition-connection-legacy", "request-connection", "transport-connection", "assignment", "leader", "healthy", "partition-bound", "reset", "reset-fail", "reset-fair", "throttle-idle", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-partition", "follow-coordinator", "no-join", "no-join-heartbeat", "follow-join")))
