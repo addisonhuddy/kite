@@ -135,7 +135,6 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
                     break :broker_loop;
                 },
                 error.RetryFetch => {
-                    c.dropNode(cursor.leader);
                     failed_leader = cursor.leader;
                 },
                 else => {
@@ -945,7 +944,6 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             break;
         };
         const failed = session.applyFetchOutcomes(parts.items, outcomes);
-        if (failed) c.dropNode(leader);
         try out.flush();
         if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
         if (progress) session.last_record = std.Io.Timestamp.now(c.io, .awake);
@@ -1292,13 +1290,19 @@ fn fetchLeader(
         }
     }.f;
     const leader = parts[0].cursor.leader;
-    const conn = c.connFor(leader, client.Client.connKey(leader, 0)) catch return outcomes;
+    const conn = c.connFor(leader, client.Client.connKey(leader, 0)) catch {
+        c.dropNode(leader);
+        return outcomes;
+    };
     const resp = c.sendRequestAlloc(alloc, conn, protocol.api_key.fetch, protocol.version.fetch, Ctx{
         .topic = opts.topic,
         .parts = parts,
         .max_wait_ms = opts.fetch_wait_ms orelse c.cfg.fetch_max_wait_ms,
         .max_bytes = c.cfg.fetch_max_bytes,
-    }, body) catch return outcomes;
+    }, body) catch {
+        c.dropNode(leader);
+        return outcomes;
+    };
 
     return decodeFetch(c, alloc, opts, parts, resp.body, outcomes, out, scratch, count, progress);
 }
@@ -1321,7 +1325,10 @@ fn decodeFetch(
     const top_code: protocol.ErrorCode = @enumFromInt(try d.i16v());
     _ = try d.i32v();
     if (top_code != .none) {
-        if (top_code.retriable()) return outcomes;
+        if (top_code.retriable()) {
+            c.dropNode(leader);
+            return outcomes;
+        }
         c.setErr("fetch from broker {d}: {s}", .{ leader, top_code.name() });
         return error.FetchFailed;
     }

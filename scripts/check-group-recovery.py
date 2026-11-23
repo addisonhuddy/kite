@@ -65,6 +65,7 @@ class Broker(socketserver.ThreadingTCPServer):
         self.partition_deliveries = []
         self.fetches = []
         self.commit_recovered = None
+        self.fetch_connections = []
 
 
 def assignment_response(broker, api, req):
@@ -141,6 +142,9 @@ class Handler(socketserver.StreamRequestHandler):
                 api, _, corr = struct.unpack_from(">hhi", req)
                 if api == 1:
                     broker.fetches.append(time.monotonic())
+                    broker.fetch_connections.append(self.connection)
+                    if broker.mode == "transport-connection" and len(broker.fetches) == 2:
+                        return
                 if broker.mode == "assignment" and api in (1, 2, 3, 8, 9, 68):
                     response = assignment_response(broker, api, req)
                     payload = pack("i", corr) + b"\x00" + response
@@ -155,6 +159,8 @@ class Handler(socketserver.StreamRequestHandler):
                 if api == 68 and broker.mode == "no-join-heartbeat":
                     return
                 split = broker.mode in ("healthy", "partition-bound", "follow-partition", "reset-fair")
+                connection_test = broker.mode.endswith("-connection")
+                paired = split or connection_test
                 if api == 3 and split and broker.fetch_old_fault and not (broker.mode == "follow-partition" and time.monotonic() - broker.started >= 50):
                     return
                 if api == 1 and (broker.mode == "leader" or split):
@@ -183,9 +189,9 @@ class Handler(socketserver.StreamRequestHandler):
                     if leader == 2 or split:
                         address += pack("i", 2) + text(b"127.0.0.1") + pack("i", broker.secondary.server_address[1]) + b"\x00\x00"
                     partition = pack("hiii", 0, 0, leader, 1) + b"\x01\x01\x01\x00"
-                    if split:
-                        partition += pack("hiii", 0, 1, 2, 1) + b"\x01\x01\x01\x00"
-                    topic = b"\x00\x00" + text(b"example") + b"\x00" * 17 + bytes([3 if split else 2]) + partition + b"\x00" * 5
+                    if paired:
+                        partition += pack("hiii", 0, 1, 2 if split else 1, 1) + b"\x01\x01\x01\x00"
+                    topic = b"\x00\x00" + text(b"example") + b"\x00" * 17 + bytes([3 if paired else 2]) + partition + b"\x00" * 5
                     response = b"\x00" * 4 + bytes([3 if leader == 2 or split else 2]) + address + b"\x00" + pack("i", 1) + b"\x02" + topic + b"\x00"
                 elif api == 10:
                     response = b"\x00" * 4 + b"\x02" + text(b"g") + pack("i", 1) + text(b"127.0.0.1") + pack("i", broker.server_address[1]) + b"\x00" * 5
@@ -207,16 +213,25 @@ class Handler(socketserver.StreamRequestHandler):
                         self.wfile.write(pack("I", len(payload)) + payload)
                         continue
                     assignment = b"\x01\x02" + b"\x00" * 16 + b"\x02" + pack("i", 0) + b"\x00\x00\x00"
-                    if split:
+                    if paired:
                         assignment = b"\x01\x02" + b"\x00" * 16 + b"\x03" + pack("ii", 0, 1) + b"\x00\x00\x00"
                     response = b"\x00" * 7 + text(member) + pack("ii", broker.generation, 1000) + assignment
                 elif api == 9:
                     response = b"\x00" * 4 + b"\x02" + text(b"g") + b"\x02" + text(b"example") + b"\x02" + pack("iqi", 0, -1, -1) + b"\x00" * 9
+                    if connection_test:
+                        offsets = b"".join(pack("iqi", p, -1, -1) + b"\x00" * 4 for p in (0, 1))
+                        response = b"\x00" * 4 + b"\x02" + text(b"g") + b"\x02" + text(b"example") + b"\x03" + offsets + b"\x00" * 5
                 elif api == 2:
                     code = 6 if broker.mode == "adoption" and adopting else 0
                     if broker.mode == "reset-fail" and broker.reset_started:
                         code = 6
                     response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ihqqi", self.server.node - 1 if split else 0, code, 0, 0, 0) + b"\x00\x00\x00"
+                    if connection_test:
+                        pos = 11 + struct.unpack_from(">h", req, 8)[0]
+                        _, pos = string(req, pos + 6)
+                        count = req[pos] - 1
+                        parts = b"".join(pack("ihqqi", struct.unpack_from(">i", req, pos + 1 + 17 * i)[0], 0, 0, 0, 0) + b"\x00" for i in range(count))
+                        response = b"\x00" * 4 + b"\x02" + text(b"example") + bytes([count + 1]) + parts + b"\x00\x00"
                 elif api == 1:
                     fetch_code = 0
                     if broker.mode == "reset-fair" and self.server.node == 1:
@@ -242,6 +257,15 @@ class Handler(socketserver.StreamRequestHandler):
                     broker.delivered = broker.delivered or time.monotonic()
                     part = pack("ihqqq", self.server.node - 1 if split else 0, fetch_code, 1, -1, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
                     response = b"\x00" * 10 + b"\x02" + text(b"example") + b"\x02" + part + b"\x00\x00"
+                    if connection_test:
+                        parts = b""
+                        for p in (0, 1):
+                            code = 6 if p == 0 and len(broker.fetches) == 2 else 0
+                            records = b"" if code else batch(1 if p == 0 and len(broker.fetches) > 2 else 0)
+                            parts += pack("ihqqq", p, code, 2 if p == 0 else 1, -1, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
+                        response = b"\x00" * 10 + b"\x02" + text(b"example") + b"\x03" + parts + b"\x00\x00"
+                        if broker.mode == "request-connection" and len(broker.fetches) == 2:
+                            response = pack("ihi", 0, 6, 0) + b"\x01\x00"
                 elif api == 8:
                     broker.commits.append(time.monotonic())
                     code = 14 if broker.mode in ("idle-unconfirmed", "bounded", "commit-bound") or (broker.mode == "follow-commit" and elapsed < 50) or (broker.mode == "idle-confirmed" and elapsed < 1.7) else 0
@@ -258,7 +282,7 @@ class Handler(socketserver.StreamRequestHandler):
 
 def check(mode):
     with contextlib.ExitStack() as stack:
-        broker = stack.enter_context(Broker(mode))
+        broker = stack.enter_context(Broker(mode.removesuffix("-legacy")))
         if mode in ("leader", "healthy", "partition-bound", "follow-partition", "reset-fair"):
             broker.secondary = stack.enter_context(Broker(mode, broker))
             threading.Thread(target=broker.secondary.serve_forever, daemon=True).start()
@@ -269,6 +293,8 @@ def check(mode):
             flags = ["--idle", "2m", "-n", "1"]
         elif mode == "assignment":
             flags = ["-v", "--idle", "20s", "-n", "4"]
+        elif "-connection" in mode:
+            flags = ["--idle", "20s", "-n", "3"]
         elif mode == "healthy":
             flags = ["--idle", "20s", "-n", "2"]
         elif mode.startswith("follow"):
@@ -280,7 +306,7 @@ def check(mode):
         else:
             flags = ["--idle", "20s", "-n", "1"]
         result = subprocess.run(
-            [sys.argv[1], "consume", *([] if mode == "throttle-idle" else ["-g", "g"]), "-B", *flags, "--json", "example"],
+            [sys.argv[1], "consume", *([] if mode == "throttle-idle" or mode.endswith("-legacy") else ["-g", "g"]), "-B", *flags, "--json", "example"],
             env={**os.environ, "BOOTSTRAP_SERVERS": f"127.0.0.1:{broker.server_address[1]}"},
             capture_output=True, text=True, timeout=65,
         )
@@ -306,6 +332,12 @@ def check(mode):
             print(f"PASS group recovery {mode}", flush=True)
             return
         assert rows and all(row["value"] == "kept" for row in rows), (mode, result.stderr, rows)
+        if "-connection" in mode:
+            assert result.returncode == 0 and len(rows) == 3, (result.stderr, rows)
+            assert sorted((r["partition"], r["offset"]) for r in rows) == [(0, 0), (0, 1), (1, 0)], rows
+            assert len(set(broker.fetch_connections)) == (1 if mode.startswith("partition") else 2), broker.fetch_connections
+            print(f"PASS group recovery {mode}", flush=True)
+            return
         assert broker.commits, (mode, result.stderr)
         if mode == "assignment":
             assert result.returncode == 0 and len(rows) == 4, (result.stderr, rows)
@@ -374,4 +406,4 @@ def check(mode):
 
 
 with concurrent.futures.ThreadPoolExecutor() as pool:
-    list(pool.map(check, sys.argv[2:] or ("assignment", "leader", "healthy", "partition-bound", "reset", "reset-fail", "reset-fair", "throttle-idle", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-partition", "follow-coordinator", "no-join", "no-join-heartbeat", "follow-join")))
+    list(pool.map(check, sys.argv[2:] or ("partition-connection", "partition-connection-legacy", "request-connection", "transport-connection", "assignment", "leader", "healthy", "partition-bound", "reset", "reset-fail", "reset-fair", "throttle-idle", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-partition", "follow-coordinator", "no-join", "no-join-heartbeat", "follow-join")))
