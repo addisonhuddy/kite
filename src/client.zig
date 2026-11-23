@@ -335,8 +335,11 @@ pub const Client = struct {
         ctx: anytype,
         comptime body_fn: fn (*Encoder, @TypeOf(ctx)) protocol.ProtoError!void,
     ) !Resp {
-        const remaining = try c.groupRemainingMs();
-        transport.setTimeout(conn, remaining);
+        const server_wait: u64 = switch (key) {
+            protocol.api_key.create_topics, protocol.api_key.delete_topics, protocol.api_key.create_partitions => 30000,
+            else => if (comptime @typeInfo(@TypeOf(ctx)) == .@"struct" and @hasField(@TypeOf(ctx), "max_wait_ms")) ctx.max_wait_ms else 0,
+        };
+        transport.setTimeout(conn, try c.requestTimeoutMs(server_wait));
         var e = Encoder.init(alloc);
         defer e.deinit();
         // ApiVersions and SaslHandshake are the non-/semi-flexible oddballs:
@@ -347,6 +350,14 @@ pub const Client = struct {
         try protocol.encodeRequest(&e, key, ver, flexible, "kite", ctx, body_fn);
         try transport.send(conn, e.written());
         return try transport.recv(conn, alloc, protocol.lastCorrelationId(), resp_tags);
+    }
+
+    fn requestTimeoutMs(c: *Client, server_wait_ms: u64) !u64 {
+        const timeout = @max(15000, server_wait_ms +| 1000);
+        if (c.group_deadline == null) return timeout;
+        const remaining = try c.groupRemainingMs();
+        if (remaining <= server_wait_ms) return error.GroupDeadlineExceeded;
+        return @min(remaining, timeout);
     }
 
     // -- ApiVersions ---------------------------------------------------------
@@ -1557,7 +1568,10 @@ pub const Client = struct {
 
     pub fn connFor(c: *Client, node: i32, key: u64) !*Conn {
         if (node < 0) return error.MetadataFailed;
-        if (c.conns.get(key)) |conn| return conn;
+        if (c.conns.get(key)) |conn| {
+            if (!conn.closed) return conn;
+            c.dropConn(key);
+        }
         const addr = c.brokers.get(node) orelse {
             c.setErr("no address for broker node {d}", .{node});
             return error.MetadataFailed;
@@ -1609,6 +1623,7 @@ pub const Client = struct {
         pidx: []const i32,
         batches: []const []const u8,
     ) !i32 {
+        transport.setTimeout(conn, 16000);
         c.produce_requests += 1;
         var parts: std.ArrayListUnmanaged([]const u8) = .empty;
         defer parts.deinit(c.alloc);
@@ -1712,6 +1727,20 @@ pub const Client = struct {
         try d.tagBuffer();
     }
 };
+
+test "socket request timeouts exceed long polls and respect the recovery deadline" {
+    var c: Client = undefined;
+    c.io = std.testing.io;
+    c.group_deadline = null;
+    try std.testing.expectEqual(@as(u64, 15000), try c.requestTimeoutMs(0));
+    try std.testing.expectEqual(@as(u64, 31000), try c.requestTimeoutMs(30000));
+    c.group_deadline = std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(10000));
+    const timeout = try c.requestTimeoutMs(5000);
+    try std.testing.expect(timeout > 5000 and timeout <= 10000);
+    try std.testing.expectError(error.GroupDeadlineExceeded, c.requestTimeoutMs(10000));
+    c.group_deadline = std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(-1));
+    try std.testing.expectError(error.GroupDeadlineExceeded, c.requestTimeoutMs(0));
+}
 
 test "group retry deadline is shared across nested retries" {
     var c: Client = undefined;

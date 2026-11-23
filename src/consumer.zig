@@ -470,7 +470,15 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             c.sleep(until_beat);
             continue;
         }
-        fetch_opts.fetch_wait_ms = @min(c.cfg.fetch_max_wait_ms, @max(1, until_beat -| heartbeat_slack_ms));
+        const remaining = c.groupRemainingMs() catch {
+            session.heartbeat_due = true;
+            continue;
+        };
+        if (remaining <= 1000) {
+            session.heartbeat_due = true;
+            continue;
+        }
+        fetch_opts.fetch_wait_ms = @min(c.cfg.fetch_max_wait_ms, @min(until_beat - heartbeat_slack_ms, remaining - 1000));
         var progress = false;
         var failed = false;
         fetchLeader(c, arena.allocator(), fetch_opts, parts.items, out, &scratch, &count, &progress) catch |err| switch (err) {
