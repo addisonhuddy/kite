@@ -1,5 +1,6 @@
 const std = @import("std");
 const client = @import("client.zig");
+const config = @import("config.zig");
 const protocol = @import("protocol.zig");
 const stats = @import("stats.zig");
 const term = @import("term.zig");
@@ -292,74 +293,83 @@ const GroupSession = struct {
                 .assignment = if (parts.len == 0) &.{} else &.{.{ .topic_id = s.c.topic_id, .partitions = parts }},
             },
         });
+        try s.applyHeartbeat(arena, result);
+    }
+
+    fn applyHeartbeat(s: *GroupSession, arena: *std.heap.ArenaAllocator, result: protocol.HeartbeatResult) !void {
+        const joining = s.epoch == 0;
         if (result.code == .fenced_member_epoch or result.code == .unknown_member_id) {
             s.rejoin();
             return;
         }
         try s.c.groupResult(result.code);
-        defer s.heartbeatSucceeded();
         s.epoch = result.member_epoch;
         s.interval = @intCast(@max(1, result.heartbeat_interval_ms));
         s.last_heartbeat = std.Io.Timestamp.now(s.c.io, .awake);
         s.heartbeat_due = false;
         if (joining) s.c.vlog("joined group '{s}', member {s}, epoch {d}", .{ s.opts.group.?, s.member, s.epoch });
-        if (result.assignment) |assignment| {
-            if (!s.assignment_seen) s.last_record = std.Io.Timestamp.now(s.c.io, .awake);
-            s.assignment_seen = true;
-            var assigned: []const i32 = &.{};
-            var refreshed = false;
-            for (assignment) |t| {
-                if (!std.mem.eql(u8, &t.topic_id, &s.c.topic_id)) {
-                    if (!refreshed) try s.c.refreshMetadata(s.opts.topic);
-                    refreshed = true;
-                    if (!std.mem.eql(u8, &t.topic_id, &s.c.topic_id)) return error.UnknownTopicAssignment;
-                }
-                assigned = t.partitions;
+        if (result.assignment) |assignment| try s.initializeAssignment(arena, assignment);
+        s.heartbeatSucceeded();
+    }
+
+    fn initializeAssignment(s: *GroupSession, arena: *std.heap.ArenaAllocator, assignment: []const protocol.TopicAssignment) !void {
+        _ = try s.c.groupRemainingMs();
+        const alloc = arena.allocator();
+        if (!s.assignment_seen) s.last_record = std.Io.Timestamp.now(s.c.io, .awake);
+        s.assignment_seen = true;
+        var assigned: []const i32 = &.{};
+        var refreshed = false;
+        for (assignment) |t| {
+            if (!std.mem.eql(u8, &t.topic_id, &s.c.topic_id)) {
+                if (!refreshed) try s.c.refreshMetadata(s.opts.topic);
+                refreshed = true;
+                if (!std.mem.eql(u8, &t.topic_id, &s.c.topic_id)) return error.UnknownTopicAssignment;
             }
-            if (!assignmentChanged(s.owned.items, assigned)) return;
-            s.commit(alloc, true) catch |err| {
-                // Leaving after a failed revoke commit lets the next owner replay progress.
-                s.c.vlog("group '{s}': revoke commit failed ({s}); progress may replay", .{ s.opts.group.?, @errorName(err) });
-                return err;
+            assigned = t.partitions;
+        }
+        if (!assignmentChanged(s.owned.items, assigned)) return;
+        s.commit(alloc, true) catch |err| {
+            // Leaving after a failed revoke commit lets the next owner replay progress.
+            s.c.vlog("group '{s}': revoke commit failed ({s}); progress may replay", .{ s.opts.group.?, @errorName(err) });
+            return err;
+        };
+        var next: std.ArrayList(Cursor) = .empty;
+        errdefer next.deinit(s.c.alloc);
+        var added: std.ArrayList(i32) = .empty;
+        for (assigned) |p| {
+            var retained: ?Cursor = null;
+            for (s.owned.items) |cursor| if (cursor.pidx == p) {
+                retained = cursor;
             };
-            var next: std.ArrayList(Cursor) = .empty;
-            errdefer next.deinit(s.c.alloc);
-            var added: std.ArrayList(i32) = .empty;
-            for (assigned) |p| {
-                var retained: ?Cursor = null;
-                for (s.owned.items) |cursor| if (cursor.pidx == p) {
-                    retained = cursor;
-                };
-                try next.append(s.c.alloc, retained orelse .{ .pidx = p, .leader = s.c.partitionLeader(p) orelse -1, .offset = -1 });
-                if (retained == null) try added.append(alloc, p);
-            }
-            if (added.items.len > 0) {
-                try s.c.refreshMetadata(s.opts.topic);
-                const fetched = try s.c.fetchGroupOffsets(alloc, .{
-                    .group = s.opts.group.?,
-                    .member_id = &s.member,
-                    .member_epoch = s.epoch,
-                    .topics = &.{.{ .name = s.opts.topic, .partitions = added.items }},
-                });
-                for (next.items) |*cursor| {
-                    cursor.leader = s.c.partitionLeader(cursor.pidx) orelse -1;
-                    for (added.items) |p| {
-                        if (p != cursor.pidx) continue;
-                        for (fetched.offsets) |offset| {
-                            if (offset.partition == p) {
-                                cursor.offset = offset.offset;
-                                cursor.committed = offset.offset;
-                            }
+            try next.append(s.c.alloc, retained orelse .{ .pidx = p, .leader = s.c.partitionLeader(p) orelse -1, .offset = -1 });
+            if (retained == null) try added.append(alloc, p);
+        }
+        if (added.items.len > 0) {
+            try s.c.refreshMetadata(s.opts.topic);
+            const fetched = try s.c.fetchGroupOffsets(alloc, .{
+                .group = s.opts.group.?,
+                .member_id = &s.member,
+                .member_epoch = s.epoch,
+                .topics = &.{.{ .name = s.opts.topic, .partitions = added.items }},
+            });
+            for (next.items) |*cursor| {
+                cursor.leader = s.c.partitionLeader(cursor.pidx) orelse -1;
+                for (added.items) |p| {
+                    if (p != cursor.pidx) continue;
+                    for (fetched.offsets) |offset| {
+                        if (offset.partition == p) {
+                            cursor.offset = offset.offset;
+                            cursor.committed = offset.offset;
                         }
                     }
                 }
-                try listOffsets(s.c, arena, s.opts.topic, next.items, s.opts.start);
             }
-            s.owned.deinit(s.c.alloc);
-            s.owned = next;
-            s.heartbeat_due = true;
-            s.c.vlog("group '{s}': assignment {d} partition(s), epoch {d}", .{ s.opts.group.?, s.owned.items.len, s.epoch });
+            try listOffsets(s.c, arena, s.opts.topic, next.items, s.opts.start);
         }
+        s.owned.deinit(s.c.alloc);
+        s.owned = next;
+        s.heartbeat_due = true;
+        s.c.vlog("group '{s}': assignment {d} partition(s), epoch {d}", .{ s.opts.group.?, s.owned.items.len, s.epoch });
     }
 
     fn leave(s: *GroupSession) void {
@@ -519,10 +529,16 @@ test "persistent group fetch recovery survives successful heartbeats and honors 
 }
 
 test "a successful empty assignment clears recovery from an earlier fetch failure" {
-    var c: client.Client = undefined;
-    c.io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(alloc);
+    defer env.deinit();
+    const cfg: config.Config = .{ .bootstrap_servers = &.{} };
+    var c = client.Client.init(alloc, std.testing.io, &env, &cfg);
+    defer c.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
     const now = std.Io.Timestamp.now(c.io, .awake);
-    var session: GroupSession = .{ .c = &c, .opts = .{ .topic = "t" }, .member = @splat('m'), .last_heartbeat = now, .last_record = now, .assignment_seen = true };
+    var session: GroupSession = .{ .c = &c, .opts = .{ .topic = "t", .group = "g" }, .member = @splat('m'), .last_heartbeat = now, .last_record = now, .assignment_seen = true };
     try session.owned.append(std.testing.allocator, .{ .pidx = 0, .leader = 1, .offset = 0 });
     defer session.owned.deinit(std.testing.allocator);
     session.beginRound();
@@ -530,19 +546,45 @@ test "a successful empty assignment clears recovery from an earlier fetch failur
     session.startRecovery();
     try std.testing.expect(session.recovery_deadline != null);
     try std.testing.expect(session.fetch_recovery_deadline != null);
-    session.owned.clearRetainingCapacity();
-    session.heartbeatSucceeded();
+    var result: protocol.HeartbeatResult = .{ .code = .none, .message = null, .member_id = "m", .member_epoch = 1, .heartbeat_interval_ms = 5000, .assignment = &.{} };
+    try session.applyHeartbeat(&arena, result);
     try std.testing.expect(session.recoveryDeadline() == null);
 
     const expired = now.addDuration(.fromMilliseconds(-group_session_assumed_ms));
     session.last_record = expired;
     session.recovery_deadline = expired;
     session.fetch_recovery_deadline = expired;
-    session.heartbeatSucceeded();
+    result.assignment = null;
+    try session.applyHeartbeat(&arena, result);
     session.beginRound();
     try session.checkRecovery();
     try std.testing.expect(try c.groupRemainingMs() > 44000);
     try std.testing.expectEqual(@as(usize, 0), session.owned.items.len);
+}
+
+test "assignment initialization timeouts preserve the existing recovery budget" {
+    var c: client.Client = undefined;
+    c.io = std.testing.io;
+    const now = std.Io.Timestamp.now(c.io, .awake);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var session: GroupSession = .{ .c = &c, .opts = .{ .topic = "t", .group = "g" }, .member = @splat('m'), .epoch = 3, .last_heartbeat = now, .last_record = now, .assignment_seen = true };
+    const deadline = now.addDuration(.fromMilliseconds(-1));
+    session.recovery_deadline = deadline;
+    session.fetch_recovery_deadline = deadline;
+    var assignment = [_]protocol.TopicAssignment{.{ .topic_id = @splat(0), .partitions = &.{0} }};
+    const result: protocol.HeartbeatResult = .{ .code = .none, .message = null, .member_id = "m", .member_epoch = 4, .heartbeat_interval_ms = 5000, .assignment = &assignment };
+    for (0..3) |_| {
+        session.beginRound();
+        try std.testing.expectError(error.GroupDeadlineExceeded, session.applyHeartbeat(&arena, result));
+        try std.testing.expect(session.recoverEpoch(error.GroupDeadlineExceeded));
+        try std.testing.expectEqual(deadline, session.recovery_deadline.?);
+        try std.testing.expectEqual(deadline, session.fetch_recovery_deadline.?);
+        try std.testing.expectEqual(@as(usize, 0), session.owned.items.len);
+        try std.testing.expect(session.heartbeat_due);
+        try std.testing.expectEqual(@as(i32, 4), session.epoch);
+        try std.testing.expectError(error.FetchFailed, session.checkRecovery());
+    }
 }
 
 test "failed final commits preserve pending progress and report replay" {
