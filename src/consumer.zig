@@ -213,7 +213,7 @@ const GroupSession = struct {
                 s.startFetchRecovery(part.cursor);
                 failed = true;
             },
-            .success => part.cursor.fetchSucceeded(),
+            .success, .offset_reset => part.cursor.fetchSucceeded(),
             .throttled => {},
         };
         return failed;
@@ -891,6 +891,10 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             break;
         };
         const failed = session.applyFetchOutcomes(parts.items, outcomes);
+        for (outcomes) |outcome| if (outcome == .offset_reset) {
+            leader_index = selected;
+            break;
+        };
         if (failed) c.dropNode(leader);
         try out.flush();
         if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
@@ -1064,7 +1068,7 @@ fn listOffsetsLeader(
     if (resolved != parts.len) return error.RetryFetch;
 }
 
-const FetchOutcome = enum { success, retry, throttled };
+const FetchOutcome = enum { success, retry, throttled, offset_reset };
 
 test "mixed fetch replies update only each partition's recovery" {
     const alloc = std.testing.allocator;
@@ -1310,7 +1314,7 @@ fn decodeFetch(
                     if (err != error.RetryFetch) return err;
                     continue;
                 };
-                if (opts.group == null) outcomes[part_idx] = .success;
+                outcomes[part_idx] = .offset_reset;
                 continue;
             }
             if (code != .none) {

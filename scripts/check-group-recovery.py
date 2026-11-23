@@ -57,6 +57,8 @@ class Broker(socketserver.ThreadingTCPServer):
         self.fetch_old_fault = False
         self.fetch_nodes = []
         self.started = time.monotonic()
+        self.reset_started = None
+        self.reset_fetches = []
 
 
 class Handler(socketserver.StreamRequestHandler):
@@ -131,8 +133,17 @@ class Handler(socketserver.StreamRequestHandler):
                     response = b"\x00" * 4 + b"\x02" + text(b"g") + b"\x02" + text(b"example") + b"\x02" + pack("iqi", 0, -1, -1) + b"\x00" * 9
                 elif api == 2:
                     code = 6 if broker.mode == "adoption" and adopting else 0
+                    if broker.mode == "reset-fail" and broker.reset_started:
+                        code = 6
                     response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ihqqi", self.server.node - 1 if split else 0, code, 0, 0, 0) + b"\x00\x00\x00"
                 elif api == 1:
+                    fetch_code = 0
+                    if broker.mode in ("reset", "reset-fail"):
+                        broker.reset_started = broker.reset_started or time.monotonic()
+                        broker.reset_fetches.append(time.monotonic())
+                        if time.monotonic() - broker.reset_started < 50:
+                            fetch_code = 1
+                            time.sleep(0.05)
                     records = batch(1 if broker.delivered and broker.mode == "follow-fetch" else 0)
                     if split:
                         records = batch(broker.fetch_nodes.count(2) - 1)
@@ -141,7 +152,7 @@ class Handler(socketserver.StreamRequestHandler):
                     if broker.delivered and broker.mode in ("commit-bound", "follow-commit"):
                         records = batch(1) if broker.mode == "follow-commit" and elapsed >= 50 else b""
                     broker.delivered = broker.delivered or time.monotonic()
-                    part = pack("ihqqq", self.server.node - 1 if split else 0, 0, 1, -1, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
+                    part = pack("ihqqq", self.server.node - 1 if split else 0, fetch_code, 1, -1, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
                     response = b"\x00" * 10 + b"\x02" + text(b"example") + b"\x02" + part + b"\x00\x00"
                 elif api == 8:
                     broker.commits.append(time.monotonic())
@@ -162,7 +173,9 @@ def check(mode):
             broker.secondary = stack.enter_context(Broker(mode, broker))
             threading.Thread(target=broker.secondary.serve_forever, daemon=True).start()
         threading.Thread(target=broker.serve_forever, daemon=True).start()
-        if mode == "healthy":
+        if mode in ("reset", "reset-fail"):
+            flags = ["--idle", "2m", "-n", "1"]
+        elif mode == "healthy":
             flags = ["--idle", "20s", "-n", "2"]
         elif mode.startswith("follow"):
             flags = ["--follow", "-n", "1" if mode == "follow-join" else "2"]
@@ -181,6 +194,12 @@ def check(mode):
         if broker.secondary:
             broker.secondary.shutdown()
         rows = [json.loads(line) for line in result.stdout.splitlines()]
+        if mode == "reset-fail":
+            assert result.returncode == 1 and not rows, result.stderr
+            assert "next run may replay records" in result.stderr, result.stderr
+            assert 44 <= time.monotonic() - broker.reset_started < 52
+            print("PASS group recovery reset-fail", flush=True)
+            return
         if mode in ("no-join", "no-join-heartbeat"):
             assert result.returncode == 1 and not rows and not broker.beats, result.stderr
             assert "before joining group" in result.stderr, result.stderr
@@ -224,6 +243,10 @@ def check(mode):
         elif mode == "healthy":
             assert broker.fetch_old_fault and broker.fetch_nodes.count(2) == 2, broker.fetch_nodes
             assert len(rows) == 2 and all(row["partition"] == 1 for row in rows), rows
+        elif mode == "reset":
+            assert time.monotonic() - broker.reset_started >= 50
+            assert len(broker.reset_fetches) > 500, len(broker.reset_fetches)
+            assert "recovery ongoing" not in result.stderr, result.stderr
         elif mode in ("adoption", "metadata", "offsets"):
             assert len(broker.beats) >= 8, (mode, broker.beats)
             assert max(b - a for a, b in zip(broker.beats, broker.beats[1:])) < 2, (mode, broker.beats)
@@ -232,4 +255,4 @@ def check(mode):
 
 
 with concurrent.futures.ThreadPoolExecutor() as pool:
-    list(pool.map(check, sys.argv[2:] or ("leader", "healthy", "partition-bound", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-partition", "follow-coordinator", "no-join", "no-join-heartbeat", "follow-join")))
+    list(pool.map(check, sys.argv[2:] or ("leader", "healthy", "partition-bound", "reset", "reset-fail", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-partition", "follow-coordinator", "no-join", "no-join-heartbeat", "follow-join")))
