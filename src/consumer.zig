@@ -164,6 +164,7 @@ const GroupSession = struct {
     stale_retries: u8 = 0,
     attempt_started: std.Io.Timestamp = .zero,
     recovery_deadline: ?std.Io.Timestamp = null,
+    fetch_recovery_deadline: ?std.Io.Timestamp = null,
 
     fn beginAttempt(s: *GroupSession) void {
         s.attempt_started = std.Io.Timestamp.now(s.c.io, .awake);
@@ -172,9 +173,9 @@ const GroupSession = struct {
 
     fn beginRound(s: *GroupSession) void {
         s.beginAttempt();
-        if (s.recovery_deadline) |deadline| s.capDeadline(deadline);
+        if (s.recoveryDeadline()) |deadline| s.capDeadline(deadline);
         if (s.assignment_seen) if (s.opts.idle_ms) |idle| {
-            const io_slack: u64 = if (s.recovery_deadline == null) 1000 else 0;
+            const io_slack: u64 = if (s.recoveryDeadline() == null) 1000 else 0;
             s.capDeadline(s.last_record.addDuration(.fromMilliseconds(@intCast(idle +| io_slack))));
         };
     }
@@ -187,13 +188,33 @@ const GroupSession = struct {
         if (s.recovery_deadline == null) s.recovery_deadline = s.attempt_started.addDuration(.fromMilliseconds(group_session_assumed_ms));
     }
 
+    fn startFetchRecovery(s: *GroupSession) void {
+        if (s.fetch_recovery_deadline == null) s.fetch_recovery_deadline = s.attempt_started.addDuration(.fromMilliseconds(group_session_assumed_ms));
+    }
+
+    fn recoveryDeadline(s: *GroupSession) ?std.Io.Timestamp {
+        const fetch = s.fetch_recovery_deadline orelse return s.recovery_deadline;
+        const group = s.recovery_deadline orelse return fetch;
+        return if (fetch.nanoseconds < group.nanoseconds) fetch else group;
+    }
+
+    fn heartbeatSucceeded(s: *GroupSession) void {
+        s.recovery_deadline = null;
+        if (s.owned.items.len == 0) s.fetch_recovery_deadline = null;
+    }
+
+    fn fetchSucceeded(s: *GroupSession) void {
+        s.recovery_deadline = null;
+        s.fetch_recovery_deadline = null;
+    }
+
     fn idleExpired(s: *GroupSession, now: std.Io.Timestamp) bool {
         const idle = s.opts.idle_ms orelse return false;
         return s.assignment_seen and s.last_record.durationTo(now).toMilliseconds() >= idle;
     }
 
     fn checkRecovery(s: *GroupSession) !void {
-        const deadline = s.recovery_deadline orelse return;
+        const deadline = s.recoveryDeadline() orelse return;
         const now = std.Io.Timestamp.now(s.c.io, .awake);
         if (now.nanoseconds >= deadline.nanoseconds or s.idleExpired(now)) return s.recoveryFailed();
     }
@@ -276,6 +297,7 @@ const GroupSession = struct {
             return;
         }
         try s.c.groupResult(result.code);
+        defer s.heartbeatSucceeded();
         s.epoch = result.member_epoch;
         s.interval = @intCast(@max(1, result.heartbeat_interval_ms));
         s.last_heartbeat = std.Io.Timestamp.now(s.c.io, .awake);
@@ -342,7 +364,7 @@ const GroupSession = struct {
 
     fn leave(s: *GroupSession) void {
         if (s.epoch <= 0) return;
-        if (s.recovery_deadline != null) {
+        if (s.recoveryDeadline() != null) {
             s.beginRound();
             if (s.c.groupRemainingMs()) |_| {} else |_| return;
         } else s.beginAttempt();
@@ -436,6 +458,7 @@ test "recovery deadlines retain the member epoch and flushed progress" {
     session.epoch = 3;
     session.heartbeat_due = false;
     session.recovery_deadline = null;
+    session.fetch_recovery_deadline = null;
     session.owned = .empty;
     defer session.owned.deinit(std.testing.allocator);
     try session.owned.append(std.testing.allocator, .{ .pidx = 0, .leader = 1, .offset = 4, .emitted = 4, .committed = 2 });
@@ -448,24 +471,27 @@ test "recovery deadlines retain the member epoch and flushed progress" {
     try std.testing.expectEqual(@as(?i64, 4), pendingCommit(session.owned.items[0]));
 }
 
-test "persistent group recovery retains one deadline across rounds and honors idle" {
+test "persistent group fetch recovery survives successful heartbeats and honors idle" {
     var c: client.Client = undefined;
     c.io = std.testing.io;
     const now = std.Io.Timestamp.now(c.io, .awake);
     var session: GroupSession = .{ .c = &c, .opts = .{ .topic = "t" }, .member = @splat('m'), .last_heartbeat = now, .last_record = now, .assignment_seen = true };
+    try session.owned.append(std.testing.allocator, .{ .pidx = 0, .leader = 1, .offset = 0 });
+    defer session.owned.deinit(std.testing.allocator);
     session.beginRound();
-    session.startRecovery();
-    const deadline = session.recovery_deadline.?;
+    session.startFetchRecovery();
+    const deadline = session.fetch_recovery_deadline.?;
     try std.testing.expectEqual(session.attempt_started.addDuration(.fromMilliseconds(group_session_assumed_ms)), deadline);
     for (0..3) |_| {
         session.last_heartbeat = std.Io.Timestamp.now(c.io, .awake);
+        session.heartbeatSucceeded();
         session.beginRound();
-        session.startRecovery();
-        try std.testing.expectEqual(deadline, session.recovery_deadline.?);
+        session.startFetchRecovery();
+        try std.testing.expectEqual(deadline, session.fetch_recovery_deadline.?);
         try std.testing.expectEqual(deadline, c.group_deadline.?);
         try session.checkRecovery();
     }
-    session.recovery_deadline = now.addDuration(.fromMilliseconds(-1));
+    session.fetch_recovery_deadline = now.addDuration(.fromMilliseconds(-1));
     session.beginRound();
     try std.testing.expectError(error.FetchFailed, session.checkRecovery());
     try std.testing.expectEqualStrings("consumer group: recovery timed out", c.errDetail());
@@ -473,12 +499,12 @@ test "persistent group recovery retains one deadline across rounds and honors id
     session.leave();
     try std.testing.expectError(error.GroupDeadlineExceeded, c.groupRemainingMs());
 
-    session.recovery_deadline = null;
+    session.fetch_recovery_deadline = null;
     session.opts.idle_ms = 100;
     session.last_record = now.addDuration(.fromMilliseconds(-200));
     session.beginRound();
     try std.testing.expect(try c.groupRemainingMs() > 0);
-    session.startRecovery();
+    session.startFetchRecovery();
     try std.testing.expectError(error.FetchFailed, session.checkRecovery());
     session.leave();
     try std.testing.expectError(error.GroupDeadlineExceeded, c.groupRemainingMs());
@@ -487,8 +513,36 @@ test "persistent group recovery retains one deadline across rounds and honors id
     session.beginRound();
     try session.checkRecovery();
     try std.testing.expect(try c.groupRemainingMs() > 44000);
-    session.recovery_deadline = null;
+    session.fetchSucceeded();
+    try std.testing.expect(session.recoveryDeadline() == null);
     try session.checkRecovery();
+}
+
+test "a successful empty assignment clears recovery from an earlier fetch failure" {
+    var c: client.Client = undefined;
+    c.io = std.testing.io;
+    const now = std.Io.Timestamp.now(c.io, .awake);
+    var session: GroupSession = .{ .c = &c, .opts = .{ .topic = "t" }, .member = @splat('m'), .last_heartbeat = now, .last_record = now, .assignment_seen = true };
+    try session.owned.append(std.testing.allocator, .{ .pidx = 0, .leader = 1, .offset = 0 });
+    defer session.owned.deinit(std.testing.allocator);
+    session.beginRound();
+    session.startFetchRecovery();
+    session.startRecovery();
+    try std.testing.expect(session.recovery_deadline != null);
+    try std.testing.expect(session.fetch_recovery_deadline != null);
+    session.owned.clearRetainingCapacity();
+    session.heartbeatSucceeded();
+    try std.testing.expect(session.recoveryDeadline() == null);
+
+    const expired = now.addDuration(.fromMilliseconds(-group_session_assumed_ms));
+    session.last_record = expired;
+    session.recovery_deadline = expired;
+    session.fetch_recovery_deadline = expired;
+    session.heartbeatSucceeded();
+    session.beginRound();
+    try session.checkRecovery();
+    try std.testing.expect(try c.groupRemainingMs() > 44000);
+    try std.testing.expectEqual(@as(usize, 0), session.owned.items.len);
 }
 
 test "failed final commits preserve pending progress and report replay" {
@@ -578,7 +632,7 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         fetchLeader(c, arena.allocator(), fetch_opts, parts.items, out, &scratch, &count, &progress) catch |err| switch (err) {
             error.RetryFetch => {
                 c.dropNode(leader);
-                session.startRecovery();
+                session.startFetchRecovery();
                 failed = true;
             },
             else => return err,
@@ -586,6 +640,7 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         try out.flush();
         if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
         if (progress) session.last_record = std.Io.Timestamp.now(c.io, .awake);
+        if (!failed) session.fetchSucceeded();
         session.beginRound();
         session.commit(arena.allocator(), false) catch |err| {
             if (!session.recoverEpoch(err)) return err;
@@ -596,10 +651,7 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         if (failed) {
             if (!retry.pause(c)) return session.recoveryFailed();
             refreshLeaders(c, opts.topic, session.owned.items);
-        } else {
-            retry = .{};
-            session.recovery_deadline = null;
-        }
+        } else retry = .{};
     }
     try out.flush();
     if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
