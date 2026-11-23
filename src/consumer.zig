@@ -170,6 +170,7 @@ const GroupSession = struct {
     attempt_started: std.Io.Timestamp = .zero,
     recovery_deadline: ?std.Io.Timestamp = null,
     fetch_recovery_deadline: ?std.Io.Timestamp = null,
+    commit_recovery_deadline: ?std.Io.Timestamp = null,
     last_recovery_warning: ?std.Io.Timestamp = null,
 
     fn beginAttempt(s: *GroupSession) void {
@@ -200,9 +201,13 @@ const GroupSession = struct {
     }
 
     fn recoveryDeadline(s: *GroupSession) ?std.Io.Timestamp {
-        const fetch = s.fetch_recovery_deadline orelse return s.recovery_deadline;
-        const group = s.recovery_deadline orelse return fetch;
-        return if (fetch.nanoseconds < group.nanoseconds) fetch else group;
+        var deadline = s.commit_recovery_deadline;
+        for ([_]?std.Io.Timestamp{ s.recovery_deadline, s.fetch_recovery_deadline }) |candidate| {
+            if (candidate) |next| if (deadline == null or next.nanoseconds < deadline.?.nanoseconds) {
+                deadline = next;
+            };
+        }
+        return deadline;
     }
 
     fn heartbeatSucceeded(s: *GroupSession) void {
@@ -279,12 +284,16 @@ const GroupSession = struct {
             if (pendingCommit(cursor)) |offset| try parts.append(alloc, .{ .partition = cursor.pidx, .offset = offset });
         }
         if (parts.items.len == 0) return;
-        try s.c.commitGroupOffsets(alloc, .{
+        s.c.commitGroupOffsets(alloc, .{
             .group = s.opts.group.?,
             .member_id = &s.member,
             .member_epoch = s.epoch,
             .topics = &.{.{ .name = s.opts.topic, .partitions = parts.items }},
-        });
+        }) catch |err| {
+            if (s.commit_recovery_deadline == null) s.commit_recovery_deadline = s.attempt_started.addDuration(.fromMilliseconds(group_session_assumed_ms));
+            return err;
+        };
+        s.commit_recovery_deadline = null;
         s.last_commit = std.Io.Timestamp.now(s.c.io, .awake);
         for (s.owned.items) |*cursor| if (pendingCommit(cursor.*)) |offset| {
             cursor.committed = offset;
@@ -727,7 +736,12 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         if (opts.stop) |flag| if (flag.load(.acquire)) break;
         if (opts.max_records) |max| if (count >= max) break;
         if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
-        session.checkRecovery() catch break;
+        session.checkRecovery() catch {
+            if (session.commit_recovery_deadline) |deadline| {
+                if (std.Io.Timestamp.now(c.io, .awake).nanoseconds >= deadline.nanoseconds) exit_error = error.CommitRecoveryExpired;
+            }
+            break;
+        };
         if (session.idleExpired(std.Io.Timestamp.now(c.io, .awake))) break;
         _ = arena.reset(.retain_capacity);
         session.beginRound();
@@ -835,7 +849,10 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         if (session.epoch <= 0) return session.finalCommitFailed(error.FencedMemberEpoch);
         session.commit(arena.allocator(), true) catch |commit_err| return session.finalCommitFailed(commit_err);
     };
-    if (exit_error) |err| return err;
+    if (exit_error) |err| {
+        if (err == error.CommitRecoveryExpired) return session.finalCommitFailed(err);
+        return err;
+    }
     return count;
 }
 

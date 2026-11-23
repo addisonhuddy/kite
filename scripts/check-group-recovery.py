@@ -122,12 +122,14 @@ class Handler(socketserver.StreamRequestHandler):
                     response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ihqqi", 0, code, 0, 0, 0) + b"\x00\x00\x00"
                 elif api == 1:
                     records = batch(1 if broker.delivered and broker.mode == "follow-fetch" else 0)
+                    if broker.delivered and broker.mode in ("commit-bound", "follow-commit"):
+                        records = batch(1) if broker.mode == "follow-commit" and elapsed >= 50 else b""
                     broker.delivered = broker.delivered or time.monotonic()
                     part = pack("ihqqq", 0, 0, 1, -1, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
                     response = b"\x00" * 10 + b"\x02" + text(b"example") + b"\x02" + part + b"\x00\x00"
                 elif api == 8:
                     broker.commits.append(time.monotonic())
-                    code = 14 if broker.mode in ("idle-unconfirmed", "bounded") or (broker.mode == "idle-confirmed" and elapsed < 1.7) else 0
+                    code = 14 if broker.mode in ("idle-unconfirmed", "bounded", "commit-bound") or (broker.mode == "follow-commit" and elapsed < 50) or (broker.mode == "idle-confirmed" and elapsed < 1.7) else 0
                     response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ih", 0, code) + b"\x00\x00\x00"
                 else:
                     raise AssertionError(api)
@@ -148,7 +150,7 @@ def check(mode):
             flags = ["--follow", "-n", "2"]
         elif mode.startswith("idle"):
             flags = ["--idle", "1500ms"]
-        elif mode == "bounded":
+        elif mode in ("bounded", "commit-bound"):
             flags = ["--idle", "2m"]
         else:
             flags = ["--idle", "20s", "-n", "1"]
@@ -163,11 +165,13 @@ def check(mode):
         rows = [json.loads(line) for line in result.stdout.splitlines()]
         assert rows and all(row["value"] == "kept" for row in rows), (mode, result.stderr, rows)
         assert broker.commits, (mode, result.stderr)
-        if mode in ("idle-unconfirmed", "bounded"):
+        if mode in ("idle-unconfirmed", "bounded", "commit-bound"):
             assert result.returncode == 1, (mode, result.stderr)
             assert "final commit failed" in result.stderr and "next run may replay records" in result.stderr, result.stderr
-            if mode == "bounded":
+            if mode in ("bounded", "commit-bound"):
                 assert 44 <= time.monotonic() - broker.delivered < 52
+            if mode == "commit-bound":
+                assert len(broker.commits) > 10 and len(broker.beats) > 30
         else:
             assert result.returncode == 0, (mode, result.stderr)
         if mode.startswith("follow"):
@@ -189,4 +193,4 @@ def check(mode):
 
 
 with concurrent.futures.ThreadPoolExecutor() as pool:
-    list(pool.map(check, sys.argv[2:] or ("leader", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "follow-fetch", "follow-coordinator")))
+    list(pool.map(check, sys.argv[2:] or ("leader", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-coordinator")))
