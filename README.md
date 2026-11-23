@@ -427,12 +427,15 @@ Network lookups and retries yield to the next heartbeat; unfinished assignments
 resume after it. With `--follow`, coordinator and broker outages are retried with
 backoff indefinitely, with a periodic stderr warning. kite rejoins if the broker
 expired its membership. Without `--follow`, recovery stops at the idle timeout
-(if set), or after the session-sized recovery budget. Recovery stops also attempt
-one bounded final commit of flushed progress: a confirmed commit exits 0;
-an unconfirmed commit exits 1 with a warning that the next run may replay records.
-Commit outages have their own recovery bound, which successful fetches and
-heartbeats do not reset. Exhausting it without `--follow` exits 1 with the replay
-warning, even if the final best-effort commit succeeds.
+(if set), or after a session-sized recovery budget. Group membership, each
+partition's leader outage, and pending commits have independent budgets. Only a
+fully initialized heartbeat clears membership recovery; only fetching the affected
+partition clears its outage. Revocation drops that partition's outage, and a
+successful commit or discarded pending offsets clears commit recovery.
+Recovery stops attempt one bounded final commit of flushed progress. An idle
+stop exits 0 if the commit is confirmed, otherwise 1 with a replay warning.
+Exhausting any recovery budget without `--follow` exits 1 with the replay warning,
+even if the final best-effort commit succeeds.
 If bounded recovery ends before kite has ever joined the group, it exits 1 with
 a join failure rather than reporting a successful empty read.
 

@@ -71,11 +71,12 @@ class Handler(socketserver.StreamRequestHandler):
                     return
                 if api == 68 and broker.mode == "no-join-heartbeat":
                     return
-                if api == 3 and broker.mode == "healthy" and broker.fetch_old_fault:
+                split = broker.mode in ("healthy", "partition-bound", "follow-partition")
+                if api == 3 and split and broker.fetch_old_fault and not (broker.mode == "follow-partition" and time.monotonic() - broker.started >= 50):
                     return
-                if api == 1 and broker.mode in ("leader", "healthy"):
+                if api == 1 and (broker.mode == "leader" or split):
                     broker.fetch_nodes.append(self.server.node)
-                    if self.server.node == 1:
+                    if self.server.node == 1 and not (broker.mode == "follow-partition" and time.monotonic() - broker.started >= 50):
                         broker.fetch_old_fault = True
                         time.sleep(1.1)
                         return
@@ -96,13 +97,13 @@ class Handler(socketserver.StreamRequestHandler):
                 elif api == 3:
                     address = pack("i", 1) + text(b"127.0.0.1") + pack("i", broker.server_address[1]) + b"\x00\x00"
                     leader = 2 if broker.mode == "leader" and broker.fetch_old_fault else 1
-                    if leader == 2 or broker.mode == "healthy":
+                    if leader == 2 or split:
                         address += pack("i", 2) + text(b"127.0.0.1") + pack("i", broker.secondary.server_address[1]) + b"\x00\x00"
                     partition = pack("hiii", 0, 0, leader, 1) + b"\x01\x01\x01\x00"
-                    if broker.mode == "healthy":
+                    if split:
                         partition += pack("hiii", 0, 1, 2, 1) + b"\x01\x01\x01\x00"
-                    topic = b"\x00\x00" + text(b"example") + b"\x00" * 17 + bytes([3 if broker.mode == "healthy" else 2]) + partition + b"\x00" * 5
-                    response = b"\x00" * 4 + bytes([3 if leader == 2 or broker.mode == "healthy" else 2]) + address + b"\x00" + pack("i", 1) + b"\x02" + topic + b"\x00"
+                    topic = b"\x00\x00" + text(b"example") + b"\x00" * 17 + bytes([3 if split else 2]) + partition + b"\x00" * 5
+                    response = b"\x00" * 4 + bytes([3 if leader == 2 or split else 2]) + address + b"\x00" + pack("i", 1) + b"\x02" + topic + b"\x00"
                 elif api == 10:
                     response = b"\x00" * 4 + b"\x02" + text(b"g") + pack("i", 1) + text(b"127.0.0.1") + pack("i", broker.server_address[1]) + b"\x00" * 5
                 elif api == 68:
@@ -123,27 +124,29 @@ class Handler(socketserver.StreamRequestHandler):
                         self.wfile.write(pack("I", len(payload)) + payload)
                         continue
                     assignment = b"\x01\x02" + b"\x00" * 16 + b"\x02" + pack("i", 0) + b"\x00\x00\x00"
-                    if broker.mode == "healthy":
+                    if split:
                         assignment = b"\x01\x02" + b"\x00" * 16 + b"\x03" + pack("ii", 0, 1) + b"\x00\x00\x00"
                     response = b"\x00" * 7 + text(member) + pack("ii", broker.generation, 1000) + assignment
                 elif api == 9:
                     response = b"\x00" * 4 + b"\x02" + text(b"g") + b"\x02" + text(b"example") + b"\x02" + pack("iqi", 0, -1, -1) + b"\x00" * 9
                 elif api == 2:
                     code = 6 if broker.mode == "adoption" and adopting else 0
-                    response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ihqqi", self.server.node - 1 if broker.mode == "healthy" else 0, code, 0, 0, 0) + b"\x00\x00\x00"
+                    response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ihqqi", self.server.node - 1 if split else 0, code, 0, 0, 0) + b"\x00\x00\x00"
                 elif api == 1:
                     records = batch(1 if broker.delivered and broker.mode == "follow-fetch" else 0)
-                    if broker.mode == "healthy":
+                    if split:
                         records = batch(broker.fetch_nodes.count(2) - 1)
+                        if broker.mode != "healthy" and broker.delivered and not (broker.mode == "follow-partition" and self.server.node == 1):
+                            records = b""
                     if broker.delivered and broker.mode in ("commit-bound", "follow-commit"):
                         records = batch(1) if broker.mode == "follow-commit" and elapsed >= 50 else b""
                     broker.delivered = broker.delivered or time.monotonic()
-                    part = pack("ihqqq", 1 if broker.mode == "healthy" else 0, 0, 1, -1, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
+                    part = pack("ihqqq", self.server.node - 1 if split else 0, 0, 1, -1, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
                     response = b"\x00" * 10 + b"\x02" + text(b"example") + b"\x02" + part + b"\x00\x00"
                 elif api == 8:
                     broker.commits.append(time.monotonic())
                     code = 14 if broker.mode in ("idle-unconfirmed", "bounded", "commit-bound") or (broker.mode == "follow-commit" and elapsed < 50) or (broker.mode == "idle-confirmed" and elapsed < 1.7) else 0
-                    response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ih", 1 if broker.mode == "healthy" else 0, code) + b"\x00\x00\x00"
+                    response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ih", 1 if split else 0, code) + b"\x00\x00\x00"
                 else:
                     raise AssertionError(api)
                 payload = pack("i", corr) + tags + response
@@ -155,7 +158,7 @@ class Handler(socketserver.StreamRequestHandler):
 def check(mode):
     with contextlib.ExitStack() as stack:
         broker = stack.enter_context(Broker(mode))
-        if mode in ("leader", "healthy"):
+        if mode in ("leader", "healthy", "partition-bound", "follow-partition"):
             broker.secondary = stack.enter_context(Broker(mode, broker))
             threading.Thread(target=broker.secondary.serve_forever, daemon=True).start()
         threading.Thread(target=broker.serve_forever, daemon=True).start()
@@ -165,7 +168,7 @@ def check(mode):
             flags = ["--follow", "-n", "1" if mode == "follow-join" else "2"]
         elif mode.startswith("idle"):
             flags = ["--idle", "1500ms"]
-        elif mode in ("bounded", "commit-bound", "no-join", "no-join-heartbeat"):
+        elif mode in ("bounded", "commit-bound", "partition-bound", "no-join", "no-join-heartbeat"):
             flags = ["--idle", "2m"]
         else:
             flags = ["--idle", "20s", "-n", "1"]
@@ -186,6 +189,12 @@ def check(mode):
             return
         assert rows and all(row["value"] == "kept" for row in rows), (mode, result.stderr, rows)
         assert broker.commits, (mode, result.stderr)
+        if mode == "partition-bound":
+            assert result.returncode == 1 and "next run may replay records" in result.stderr, result.stderr
+            assert len(rows) == 1 and broker.fetch_nodes.count(2) > 10, (rows, broker.fetch_nodes)
+            assert 44 <= time.monotonic() - broker.started < 52
+            print("PASS group recovery partition-bound", flush=True)
+            return
         if mode in ("idle-unconfirmed", "bounded", "commit-bound"):
             assert result.returncode == 1, (mode, result.stderr)
             assert "final commit failed" in result.stderr and "next run may replay records" in result.stderr, result.stderr
@@ -199,10 +208,13 @@ def check(mode):
             assert len(rows) == 1 and time.monotonic() - broker.started >= 50, rows
             assert result.stderr.count("recovery ongoing") >= 2, result.stderr
         elif mode.startswith("follow"):
-            assert len(rows) == 2 and time.monotonic() - broker.delivered >= 50, (mode, rows)
+            origin = broker.started if mode == "follow-partition" else broker.delivered
+            assert len(rows) == 2 and time.monotonic() - origin >= 50, (mode, rows)
             assert result.stderr.count("recovery ongoing") >= 2, result.stderr
             if mode == "follow-coordinator":
                 assert broker.fenced and broker.epochs.count(0) >= 2, broker.epochs
+            elif mode == "follow-partition":
+                assert [row["partition"] for row in rows] == [1, 0], rows
             else:
                 assert [row["offset"] for row in rows] == [0, 1], rows
         elif mode == "idle-confirmed":
@@ -220,4 +232,4 @@ def check(mode):
 
 
 with concurrent.futures.ThreadPoolExecutor() as pool:
-    list(pool.map(check, sys.argv[2:] or ("leader", "healthy", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-coordinator", "no-join", "no-join-heartbeat", "follow-join")))
+    list(pool.map(check, sys.argv[2:] or ("leader", "healthy", "partition-bound", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-partition", "follow-coordinator", "no-join", "no-join-heartbeat", "follow-join")))
