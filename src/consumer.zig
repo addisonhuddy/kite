@@ -123,7 +123,7 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
                 if (candidate.leader == cursor.leader)
                     try parts.append(round_alloc, .{ .pidx = candidate.pidx, .cursor = candidate });
 
-            fetchLeader(c, round_alloc, opts, parts.items, out, &scratch, &count, &progress) catch |err| switch (err) {
+            fetchLeaderLegacy(c, round_alloc, opts, parts.items, out, &scratch, &count, &progress) catch |err| switch (err) {
                 error.RetryFetch => {
                     c.dropNode(cursor.leader);
                     failed_leader = cursor.leader;
@@ -203,6 +203,19 @@ const GroupSession = struct {
 
     fn startFetchRecovery(s: *GroupSession, cursor: *Cursor) void {
         if (cursor.fetch_recovery_deadline == null) cursor.fetch_recovery_deadline = s.attempt_started.addDuration(.fromMilliseconds(group_session_assumed_ms));
+    }
+
+    fn applyFetchOutcomes(s: *GroupSession, parts: []const FetchPart, outcomes: []const FetchOutcome) bool {
+        var failed = false;
+        for (parts, outcomes) |part, outcome| switch (outcome) {
+            .retry => {
+                part.cursor.leader_stale = true;
+                s.startFetchRecovery(part.cursor);
+                failed = true;
+            },
+            .success => part.cursor.fetchSucceeded(),
+        };
+        return failed;
     }
 
     fn recoveryDeadline(s: *GroupSession) ?std.Io.Timestamp {
@@ -872,25 +885,15 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             fetch_opts.fetch_wait_ms = @min(fetch_opts.fetch_wait_ms.?, idle_remaining / 2);
         }
         var progress = false;
-        var failed = false;
-        fetchLeader(c, arena.allocator(), fetch_opts, parts.items, out, &scratch, &count, &progress) catch |err| switch (err) {
-            error.RetryFetch => {
-                c.dropNode(leader);
-                for (parts.items) |part| {
-                    part.cursor.leader_stale = true;
-                    session.startFetchRecovery(part.cursor);
-                }
-                failed = true;
-            },
-            else => {
-                exit_error = err;
-                break;
-            },
+        const outcomes = fetchLeader(c, arena.allocator(), fetch_opts, parts.items, out, &scratch, &count, &progress) catch |err| {
+            exit_error = err;
+            break;
         };
+        const failed = session.applyFetchOutcomes(parts.items, outcomes);
+        if (failed) c.dropNode(leader);
         try out.flush();
         if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
         if (progress) session.last_record = std.Io.Timestamp.now(c.io, .awake);
-        if (!failed) for (parts.items) |part| part.cursor.fetchSucceeded();
         session.beginRound();
         session.commit(arena.allocator(), false) catch |err| {
             if (!session.recoverEpoch(err)) {
@@ -1060,7 +1063,76 @@ fn listOffsetsLeader(
     if (resolved != parts.len) return error.RetryFetch;
 }
 
-fn fetchLeader(
+const FetchOutcome = enum { success, retry };
+
+test "mixed fetch replies update only each partition's recovery" {
+    const alloc = std.testing.allocator;
+    var c: client.Client = undefined;
+    c.io = std.testing.io;
+    const cfg: config.Config = .{ .bootstrap_servers = &.{} };
+    c.cfg = &cfg;
+    const now = std.Io.Timestamp.now(c.io, .awake);
+    const expired = now.addDuration(.fromMilliseconds(-1));
+    var session: GroupSession = .{ .c = &c, .opts = .{ .topic = "t", .group = "g" }, .member = @splat('m'), .last_heartbeat = now, .last_record = now, .attempt_started = now, .recovery_deadline = expired, .commit_recovery_deadline = expired };
+    defer session.owned.deinit(alloc);
+    for (0..3) |i| try session.owned.append(alloc, .{ .pidx = @intCast(i), .leader = 1, .offset = 0 });
+    const parts = [_]FetchPart{
+        .{ .pidx = 0, .cursor = &session.owned.items[0] },
+        .{ .pidx = 1, .cursor = &session.owned.items[1] },
+    };
+    var e = Encoder.init(alloc);
+    defer e.deinit();
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    var scratch: std.Io.Writer.Allocating = .init(alloc);
+    defer scratch.deinit();
+    var count: u64 = 0;
+    var progress = false;
+    for ([_][2]i16{ .{ 6, 0 }, .{ 0, 6 }, .{ 0, 0 }, .{ 6, 6 } }) |codes| {
+        e.reset();
+        try e.i32v(0);
+        try e.i16v(0);
+        try e.i32v(0);
+        try e.compactArrayLen(1);
+        try e.compactString("t");
+        try e.compactArrayLen(2);
+        for (codes, 0..) |code, i| {
+            try e.i32v(@intCast(i));
+            try e.i16v(code);
+            try e.i64v(0);
+            try e.i64v(-1);
+            try e.i64v(-1);
+            try e.compactArrayLen(0);
+            try e.i32v(-1);
+            try e.compactBytes(null);
+            try e.tagBuffer();
+        }
+        try e.tagBuffer();
+        try e.tagBuffer();
+        var outcomes = [_]FetchOutcome{ .retry, .retry };
+        _ = try decodeFetch(&c, alloc, session.opts, &parts, e.written(), &outcomes, &out.writer, &scratch, &count, &progress);
+        session.owned.items[0].fetch_recovery_deadline = expired;
+        session.owned.items[1].fetch_recovery_deadline = null;
+        session.owned.items[2].fetch_recovery_deadline = expired;
+        try std.testing.expectEqual(codes[0] != 0 or codes[1] != 0, session.applyFetchOutcomes(&parts, &outcomes));
+        for (codes, outcomes, 0..) |code, outcome, i| {
+            try std.testing.expectEqual(if (code == 0) FetchOutcome.success else FetchOutcome.retry, outcome);
+            const deadline = session.owned.items[i].fetch_recovery_deadline;
+            if (code == 0) try std.testing.expect(deadline == null) else try std.testing.expectEqual(if (i == 0) expired else now.addDuration(.fromMilliseconds(group_session_assumed_ms)), deadline.?);
+        }
+        try std.testing.expectEqual(expired, session.owned.items[2].fetch_recovery_deadline.?);
+        try std.testing.expectEqual(expired, session.recovery_deadline.?);
+        try std.testing.expectEqual(expired, session.commit_recovery_deadline.?);
+    }
+    var outcomes = [_]FetchOutcome{ .retry, .retry };
+    _ = try decodeFetch(&c, alloc, session.opts, &parts, &@as([12]u8, @splat(0)), &outcomes, &out.writer, &scratch, &count, &progress);
+    try std.testing.expectEqualSlices(FetchOutcome, &.{ .retry, .retry }, &outcomes);
+    try std.testing.expectError(error.Truncated, decodeFetch(&c, alloc, session.opts, &parts, &.{}, &outcomes, &out.writer, &scratch, &count, &progress));
+    try std.testing.expectEqual(@as(u64, 0), count);
+    try std.testing.expect(!progress);
+}
+
+fn fetchLeaderLegacy(
     c: *client.Client,
     alloc: std.mem.Allocator,
     opts: Options,
@@ -1070,6 +1142,22 @@ fn fetchLeader(
     count: *u64,
     progress: *bool,
 ) !void {
+    const outcomes = try fetchLeader(c, alloc, opts, parts, out, scratch, count, progress);
+    for (outcomes) |outcome| if (outcome == .retry) return error.RetryFetch;
+}
+
+fn fetchLeader(
+    c: *client.Client,
+    alloc: std.mem.Allocator,
+    opts: Options,
+    parts: []const FetchPart,
+    out: *std.Io.Writer,
+    scratch: *std.Io.Writer.Allocating,
+    count: *u64,
+    progress: *bool,
+) ![]const FetchOutcome {
+    const outcomes = try alloc.alloc(FetchOutcome, parts.len);
+    @memset(outcomes, .retry);
     const Ctx = struct {
         topic: []const u8,
         parts: []const FetchPart,
@@ -1104,25 +1192,40 @@ fn fetchLeader(
         }
     }.f;
     const leader = parts[0].cursor.leader;
-    const conn = c.connFor(leader, client.Client.connKey(leader, 0)) catch return error.RetryFetch;
+    const conn = c.connFor(leader, client.Client.connKey(leader, 0)) catch return outcomes;
     const resp = c.sendRequestAlloc(alloc, conn, protocol.api_key.fetch, protocol.version.fetch, Ctx{
         .topic = opts.topic,
         .parts = parts,
         .max_wait_ms = opts.fetch_wait_ms orelse c.cfg.fetch_max_wait_ms,
         .max_bytes = c.cfg.fetch_max_bytes,
-    }, body) catch return error.RetryFetch;
+    }, body) catch return outcomes;
 
-    var d = Decoder.init(resp.body);
+    return decodeFetch(c, alloc, opts, parts, resp.body, outcomes, out, scratch, count, progress);
+}
+
+fn decodeFetch(
+    c: *client.Client,
+    alloc: std.mem.Allocator,
+    opts: Options,
+    parts: []const FetchPart,
+    response: []const u8,
+    outcomes: []FetchOutcome,
+    out: *std.Io.Writer,
+    scratch: *std.Io.Writer.Allocating,
+    count: *u64,
+    progress: *bool,
+) ![]const FetchOutcome {
+    const leader = parts[0].cursor.leader;
+    var d = Decoder.init(response);
     _ = try d.i32v();
     const top_code: protocol.ErrorCode = @enumFromInt(try d.i16v());
     _ = try d.i32v();
     if (top_code != .none) {
-        if (top_code.retriable()) return error.RetryFetch;
+        if (top_code.retriable()) return outcomes;
         c.setErr("fetch from broker {d}: {s}", .{ leader, top_code.name() });
         return error.FetchFailed;
     }
     const topics = try d.compactArrayLen();
-    var needs_retry = false;
     var ti: i64 = 0;
     while (ti < topics) : (ti += 1) {
         _ = try d.compactString();
@@ -1145,7 +1248,10 @@ fn fetchLeader(
             _ = try d.i32v();
             const records = try d.compactBytes();
             try d.tagBuffer();
-            const part = findPart(parts, pidx) orelse continue;
+            const part_idx = for (parts, 0..) |part, idx| {
+                if (part.pidx == pidx) break idx;
+            } else continue;
+            const part = parts[part_idx];
             if (code == .offset_out_of_range) {
                 if (opts.start == .offset) {
                     try reportOffsetRange(c, alloc, opts, part.cursor);
@@ -1153,13 +1259,13 @@ fn fetchLeader(
                 }
                 resetOffset(c, alloc, opts, part.cursor) catch |err| {
                     if (err != error.RetryFetch) return err;
-                    needs_retry = true;
+                    continue;
                 };
+                if (opts.group == null) outcomes[part_idx] = .success;
                 continue;
             }
             if (code != .none) {
                 if (code.retriable()) {
-                    needs_retry = true;
                     continue;
                 }
                 c.setErr("fetch partition {d}: {s}", .{ pidx, code.name() });
@@ -1201,6 +1307,7 @@ fn fetchLeader(
                 }
             }
             if (opts.group != null and !limited) part.cursor.emitted = part.cursor.offset;
+            outcomes[part_idx] = .success;
             if (range.first != null) {
                 progress.* = true;
                 c.vlog("fetch partition {d}: offsets {d}..{d}, high watermark {d}, records bytes {d}", .{
@@ -1215,7 +1322,7 @@ fn fetchLeader(
         try d.tagBuffer();
     }
     try d.tagBuffer();
-    if (needs_retry) return error.RetryFetch;
+    return outcomes;
 }
 
 const Range = struct {
@@ -1340,11 +1447,6 @@ fn onRecord(ctx: *RecordSink, offset: i64, timestamp_ms: i64, rec: protocol.Reco
     }
     ctx.range.first = ctx.range.first orelse offset;
     ctx.range.last = offset;
-}
-
-fn findPart(parts: []const FetchPart, pidx: i32) ?FetchPart {
-    for (parts) |part| if (part.pidx == pidx) return part;
-    return null;
 }
 
 fn resetOffset(c: *client.Client, alloc: std.mem.Allocator, opts: Options, cursor: *Cursor) !void {
