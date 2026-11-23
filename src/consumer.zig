@@ -160,6 +160,7 @@ const GroupSession = struct {
     owned: std.ArrayList(Cursor) = .empty,
     pending: ?std.ArrayList(Cursor) = null,
     pending_offsets_fetched: bool = false,
+    leaders_stale: bool = false,
     assignment_seen: bool = false,
     heartbeat_due: bool = true,
     last_heartbeat: std.Io.Timestamp,
@@ -747,6 +748,18 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             c.sleep(@min(50, @max(1, session.interval / 4)));
             continue;
         }
+        if (session.leaders_stale) {
+            c.refreshMetadata(opts.topic) catch |err| {
+                if (!session.recoverEpoch(err)) {
+                    exit_error = err;
+                    break;
+                }
+                _ = retry.pause(c);
+                continue;
+            };
+            for (session.owned.items) |*cursor| cursor.leader = c.partitionLeader(cursor.pidx) orelse -1;
+            session.leaders_stale = false;
+        }
         const leader = session.owned.items[leader_index % session.owned.items.len].leader;
         leader_index +%= 1;
         var parts: std.ArrayList(FetchPart) = .empty;
@@ -782,6 +795,7 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         fetchLeader(c, arena.allocator(), fetch_opts, parts.items, out, &scratch, &count, &progress) catch |err| switch (err) {
             error.RetryFetch => {
                 c.dropNode(leader);
+                session.leaders_stale = true;
                 session.startFetchRecovery();
                 failed = true;
             },
@@ -809,7 +823,6 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
                 session.heartbeat_due = true;
                 continue;
             }
-            refreshLeaders(c, opts.topic, session.owned.items);
         } else retry = .{};
     }
     try out.flush();

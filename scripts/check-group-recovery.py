@@ -2,6 +2,7 @@
 
 import json
 import concurrent.futures
+import contextlib
 import os
 import socketserver
 import struct
@@ -40,7 +41,7 @@ class Broker(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, mode):
+    def __init__(self, mode, parent=None):
         super().__init__(("127.0.0.1", 0), Handler)
         self.joined = None
         self.beats = []
@@ -50,16 +51,27 @@ class Broker(socketserver.ThreadingTCPServer):
         self.delivered = None
         self.fenced = False
         self.generation = 1
+        self.parent = parent
+        self.node = 2 if parent else 1
+        self.secondary = None
+        self.fetch_old_fault = False
+        self.fetch_nodes = []
 
 
 class Handler(socketserver.StreamRequestHandler):
     def handle(self):
-        broker = self.server
+        broker = self.server.parent or self.server
         try:
             while header := self.rfile.read(4):
                 size, = struct.unpack(">I", header)
                 req = self.rfile.read(size)
                 api, _, corr = struct.unpack_from(">hhi", req)
+                if api == 1 and broker.mode == "leader":
+                    broker.fetch_nodes.append(self.server.node)
+                    if self.server.node == 1:
+                        broker.fetch_old_fault = True
+                        time.sleep(1.1)
+                        return
                 elapsed = time.monotonic() - broker.delivered if broker.delivered else 0
                 if broker.mode == "follow-coordinator" and broker.delivered and elapsed < 50 and api in (8, 9, 10, 68):
                     return
@@ -76,9 +88,12 @@ class Handler(socketserver.StreamRequestHandler):
                     response = b"\x00\x00" + bytes([len(versions) + 1]) + b"".join(pack("hhh", k, v, v) + b"\x00" for k, v in versions) + b"\x00" * 5
                 elif api == 3:
                     address = pack("i", 1) + text(b"127.0.0.1") + pack("i", broker.server_address[1]) + b"\x00\x00"
-                    partition = pack("hiii", 0, 0, 1, 1) + b"\x01\x01\x01\x00"
+                    leader = 2 if broker.mode == "leader" and broker.fetch_old_fault else 1
+                    if leader == 2:
+                        address += pack("i", 2) + text(b"127.0.0.1") + pack("i", broker.secondary.server_address[1]) + b"\x00\x00"
+                    partition = pack("hiii", 0, 0, leader, 1) + b"\x01\x01\x01\x00"
                     topic = b"\x00\x00" + text(b"example") + b"\x00" * 17 + b"\x02" + partition + b"\x00" * 5
-                    response = b"\x00" * 4 + b"\x02" + address + b"\x00" + pack("i", 1) + b"\x02" + topic + b"\x00"
+                    response = b"\x00" * 4 + bytes([3 if leader == 2 else 2]) + address + b"\x00" + pack("i", 1) + b"\x02" + topic + b"\x00"
                 elif api == 10:
                     response = b"\x00" * 4 + b"\x02" + text(b"g") + pack("i", 1) + text(b"127.0.0.1") + pack("i", broker.server_address[1]) + b"\x00" * 5
                 elif api == 68:
@@ -123,7 +138,11 @@ class Handler(socketserver.StreamRequestHandler):
 
 
 def check(mode):
-    with Broker(mode) as broker:
+    with contextlib.ExitStack() as stack:
+        broker = stack.enter_context(Broker(mode))
+        if mode == "leader":
+            broker.secondary = stack.enter_context(Broker(mode, broker))
+            threading.Thread(target=broker.secondary.serve_forever, daemon=True).start()
         threading.Thread(target=broker.serve_forever, daemon=True).start()
         if mode.startswith("follow"):
             flags = ["--follow", "-n", "2"]
@@ -139,6 +158,8 @@ def check(mode):
             capture_output=True, text=True, timeout=65,
         )
         broker.shutdown()
+        if broker.secondary:
+            broker.secondary.shutdown()
         rows = [json.loads(line) for line in result.stdout.splitlines()]
         assert rows and all(row["value"] == "kept" for row in rows), (mode, result.stderr, rows)
         assert broker.commits, (mode, result.stderr)
@@ -158,6 +179,8 @@ def check(mode):
                 assert [row["offset"] for row in rows] == [0, 1], rows
         elif mode == "idle-confirmed":
             assert any(t - broker.delivered >= 1.7 for t in broker.commits), broker.commits
+        elif mode == "leader":
+            assert broker.fetch_nodes == [1, 2], broker.fetch_nodes
         elif mode in ("adoption", "metadata", "offsets"):
             assert len(broker.beats) >= 8, (mode, broker.beats)
             assert max(b - a for a, b in zip(broker.beats, broker.beats[1:])) < 2, (mode, broker.beats)
@@ -166,4 +189,4 @@ def check(mode):
 
 
 with concurrent.futures.ThreadPoolExecutor() as pool:
-    list(pool.map(check, ("adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "follow-fetch", "follow-coordinator")))
+    list(pool.map(check, sys.argv[2:] or ("leader", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "follow-fetch", "follow-coordinator")))
