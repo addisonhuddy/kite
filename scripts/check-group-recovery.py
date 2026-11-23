@@ -63,6 +63,8 @@ class Broker(socketserver.ThreadingTCPServer):
         self.revoked_commit = False
         self.revoked_released = False
         self.partition_deliveries = []
+        self.fetches = []
+        self.commit_recovered = None
 
 
 def assignment_response(broker, api, req):
@@ -137,6 +139,8 @@ class Handler(socketserver.StreamRequestHandler):
                 size, = struct.unpack(">I", header)
                 req = self.rfile.read(size)
                 api, _, corr = struct.unpack_from(">hhi", req)
+                if api == 1:
+                    broker.fetches.append(time.monotonic())
                 if broker.mode == "assignment" and api in (1, 2, 3, 8, 9, 68):
                     response = assignment_response(broker, api, req)
                     payload = pack("i", corr) + b"\x00" + response
@@ -229,13 +233,20 @@ class Handler(socketserver.StreamRequestHandler):
                         if broker.mode not in ("healthy", "reset-fair") and broker.delivered and not (broker.mode == "follow-partition" and self.server.node == 1):
                             records = b""
                     if broker.delivered and broker.mode in ("commit-bound", "follow-commit"):
-                        records = batch(1) if broker.mode == "follow-commit" and elapsed >= 50 else b""
+                        records = b""
+                    if broker.mode == "follow-commit":
+                        pos = 11 + struct.unpack_from(">h", req, 8)[0]
+                        _, pos = string(req, pos + 26)
+                        offset, = struct.unpack_from(">q", req, pos + 9)
+                        records = batch(offset)
                     broker.delivered = broker.delivered or time.monotonic()
                     part = pack("ihqqq", self.server.node - 1 if split else 0, fetch_code, 1, -1, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
                     response = b"\x00" * 10 + b"\x02" + text(b"example") + b"\x02" + part + b"\x00\x00"
                 elif api == 8:
                     broker.commits.append(time.monotonic())
                     code = 14 if broker.mode in ("idle-unconfirmed", "bounded", "commit-bound") or (broker.mode == "follow-commit" and elapsed < 50) or (broker.mode == "idle-confirmed" and elapsed < 1.7) else 0
+                    if code == 0:
+                        broker.commit_recovered = broker.commit_recovered or time.monotonic()
                     response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ih", 1 if split else 0, code) + b"\x00\x00\x00"
                 else:
                     raise AssertionError(api)
@@ -261,7 +272,7 @@ def check(mode):
         elif mode == "healthy":
             flags = ["--idle", "20s", "-n", "2"]
         elif mode.startswith("follow"):
-            flags = ["--follow", "-n", "1" if mode == "follow-join" else "2"]
+            flags = ["--follow", "-n", "1" if mode == "follow-join" else "3" if mode == "follow-commit" else "2"]
         elif mode.startswith("idle"):
             flags = ["--idle", "1500ms"]
         elif mode in ("bounded", "commit-bound", "partition-bound", "no-join", "no-join-heartbeat"):
@@ -328,12 +339,17 @@ def check(mode):
             assert result.stderr.count("recovery ongoing") >= 2, result.stderr
         elif mode.startswith("follow"):
             origin = broker.started if mode == "follow-partition" else broker.delivered
-            assert len(rows) == 2 and time.monotonic() - origin >= 50, (mode, rows)
+            assert len(rows) == (3 if mode == "follow-commit" else 2) and time.monotonic() - origin >= 50, (mode, rows)
             assert result.stderr.count("recovery ongoing") >= 2, result.stderr
             if mode == "follow-coordinator":
                 assert broker.fenced and broker.epochs.count(0) >= 2, broker.epochs
             elif mode == "follow-partition":
                 assert [row["partition"] for row in rows] == [1, 0], rows
+            elif mode == "follow-commit":
+                assert [row["offset"] for row in rows] == [0, 1, 2], rows
+                assert len(broker.fetches) == 3 and broker.fetches[1] >= broker.commit_recovered, broker.fetches
+                assert len(broker.commits) > 10 and len(broker.beats) > 30, (broker.commits, broker.beats)
+                assert max(b - a for a, b in zip(broker.beats, broker.beats[1:])) < 2, broker.beats
             else:
                 assert [row["offset"] for row in rows] == [0, 1], rows
         elif mode == "idle-confirmed":

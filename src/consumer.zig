@@ -814,6 +814,7 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
     var count: u64 = 0;
     var leader_index: usize = 0;
     var retry: client.Retry = .{};
+    var commit_retry: client.Retry = .{};
     var exit_error: ?anyerror = null;
     while (true) {
         if (opts.stop) |flag| if (flag.load(.acquire)) break;
@@ -842,6 +843,19 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             if (session.heartbeat_due) continue;
         }
         if (session.idleExpired(std.Io.Timestamp.now(c.io, .awake))) break;
+        if (opts.follow and session.commit_recovery_deadline != null) {
+            session.commit(arena.allocator(), true) catch |err| {
+                if (!session.recoverEpoch(err)) {
+                    exit_error = err;
+                    break;
+                }
+                _ = commit_retry.pause(c);
+                continue;
+            };
+            commit_retry = .{};
+            session.stale_retries = 0;
+            continue;
+        }
         if (session.owned.items.len == 0) {
             c.sleep(@min(50, @max(1, session.interval / 4)));
             continue;
@@ -917,6 +931,7 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
                 exit_error = err;
                 break;
             }
+            if (opts.follow) _ = commit_retry.pause(c);
             continue;
         };
         session.stale_retries = 0;

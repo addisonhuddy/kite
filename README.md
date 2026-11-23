@@ -426,7 +426,9 @@ by default). A slower reader can cause fencing and replay of uncommitted records
 Network lookups and retries yield to the next heartbeat; unfinished assignments
 resume after it. With `--follow`, coordinator and broker outages are retried with
 backoff indefinitely, with a periodic stderr warning. kite rejoins if the broker
-expired its membership. Without `--follow`, recovery stops at the idle timeout
+expired its membership. Failed commits pause fetching under `--follow` until the
+flushed offsets are committed, while heartbeats and commit retries continue.
+Without `--follow`, recovery stops at the idle timeout
 (if set), or after a session-sized recovery budget. Group membership, each
 partition's leader outage, and pending commits have independent budgets. Only a
 fully initialized heartbeat clears membership recovery; only fetching the affected
