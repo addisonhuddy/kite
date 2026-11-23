@@ -186,6 +186,8 @@ class Handler(socketserver.StreamRequestHandler):
                 elif api == 3:
                     address = pack("i", 1) + text(b"127.0.0.1") + pack("i", broker.server_address[1]) + b"\x00\x00"
                     leader = 2 if broker.mode == "leader" and broker.fetch_old_fault else 1
+                    if broker.mode == "metadata" and not broker.joined:
+                        leader = -1
                     if leader == 2 or split:
                         address += pack("i", 2) + text(b"127.0.0.1") + pack("i", broker.secondary.server_address[1]) + b"\x00\x00"
                     partition = pack("hiii", 0, 0, leader, 1) + b"\x01\x01\x01\x00"

@@ -424,7 +424,7 @@ const GroupSession = struct {
         if (!cursor.awaiting_position) return;
         _ = try s.c.groupRemainingMs();
         errdefer cursor.leader_stale = true;
-        if (cursor.leader_stale or !cursor.offsets_fetched) {
+        if (cursor.leader_stale or cursor.leader < 0) {
             try s.c.refreshMetadata(s.opts.topic);
             cursor.leader = s.c.partitionLeader(cursor.pidx) orelse -1;
             cursor.leader_stale = false;
