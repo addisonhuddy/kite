@@ -614,14 +614,14 @@ pub const Client = struct {
             const node = try c.findCoordinator(group);
             const conn = c.connFor(node, connKey(node, 0xFFFF_FFFE)) catch |err| {
                 c.invalidateCoordinator();
-                if (comptime @TypeOf(ctx) == protocol.Heartbeat) request.assignment = ctx.retry_assignment orelse ctx.assignment;
+                if (comptime @TypeOf(ctx) == protocol.Heartbeat) request = request.forRetry();
                 if (retry.pause(c)) continue;
                 _ = try c.groupRemainingMs();
                 return err;
             };
             return c.sendRequestAlloc(alloc, conn, key, ver, request, encode) catch |err| {
                 c.invalidateCoordinator();
-                if (comptime @TypeOf(ctx) == protocol.Heartbeat) request.assignment = ctx.retry_assignment orelse ctx.assignment;
+                if (comptime @TypeOf(ctx) == protocol.Heartbeat) request = request.forRetry();
                 if (retry.pause(c)) continue;
                 _ = try c.groupRemainingMs();
                 return err;
@@ -638,7 +638,7 @@ pub const Client = struct {
             const result = try protocol.heartbeatResponse(&d, alloc);
             if (isCoordinatorError(result.code)) {
                 c.invalidateCoordinator();
-                request.assignment = req.retry_assignment orelse req.assignment;
+                request = request.forRetry();
                 if (retry.pause(c)) continue;
             }
             return result;

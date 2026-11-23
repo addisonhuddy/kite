@@ -846,7 +846,21 @@ pub const Heartbeat = struct {
     rebalance_timeout_ms: i32 = -1,
     topics: ?[]const []const u8 = null,
     assignment: ?[]const TopicAssignment = null,
-    retry_assignment: ?[]const TopicAssignment = null,
+    retry_fields: ?struct {
+        rebalance_timeout_ms: i32,
+        topics: []const []const u8,
+        assignment: []const TopicAssignment,
+    } = null,
+
+    pub fn forRetry(req: Heartbeat) Heartbeat {
+        var full = req;
+        if (req.retry_fields) |fields| {
+            full.rebalance_timeout_ms = fields.rebalance_timeout_ms;
+            full.topics = fields.topics;
+            full.assignment = fields.assignment;
+        }
+        return full;
+    }
 };
 
 pub fn heartbeatRequest(e: *Encoder, req: Heartbeat) ProtoError!void {
@@ -1339,6 +1353,29 @@ test "election and coordinator errors are retriable" {
     try std.testing.expect(!ErrorCode.topic_authorization_failed.retriable());
     try std.testing.expect(!ErrorCode.out_of_order_sequence_number.retriable());
     try std.testing.expectEqualStrings("COORDINATOR_NOT_AVAILABLE", ErrorCode.coordinator_not_available.name());
+}
+
+test "heartbeat retries restore all fields after lost responses" {
+    for ([_][]const TopicAssignment{ &.{}, &.{.{ .topic_id = @splat(1), .partitions = &.{ 0, 2 } }} }) |owned| {
+        const incremental: Heartbeat = .{
+            .group = "g",
+            .member_id = "m",
+            .member_epoch = 3,
+            .retry_fields = .{ .rebalance_timeout_ms = 30000, .topics = &.{"t"}, .assignment = owned },
+        };
+        const retry = incremental.forRetry().forRetry();
+        try std.testing.expectEqual(@as(i32, 30000), retry.rebalance_timeout_ms);
+        try std.testing.expectEqualStrings("t", retry.topics.?[0]);
+        try std.testing.expectEqual(owned.len, retry.assignment.?.len);
+        try std.testing.expectEqual(incremental.member_epoch, retry.member_epoch);
+        var expected = Encoder.init(std.testing.allocator);
+        defer expected.deinit();
+        try heartbeatRequest(&expected, .{ .group = "g", .member_id = "m", .member_epoch = 3, .rebalance_timeout_ms = 30000, .topics = &.{"t"}, .assignment = owned });
+        var actual = Encoder.init(std.testing.allocator);
+        defer actual.deinit();
+        try heartbeatRequest(&actual, retry);
+        try std.testing.expectEqualSlices(u8, expected.written(), actual.written());
+    }
 }
 
 test "record batch smoke" {

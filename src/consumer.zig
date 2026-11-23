@@ -224,7 +224,11 @@ const GroupSession = struct {
             .rebalance_timeout_ms = if (full) group_rebalance_timeout_ms else -1,
             .topics = if (full) &.{s.opts.topic} else null,
             .assignment = if (full) (if (parts.len == 0) &.{} else &.{.{ .topic_id = s.c.topic_id, .partitions = parts }}) else null,
-            .retry_assignment = if (parts.len == 0) &.{} else &.{.{ .topic_id = s.c.topic_id, .partitions = parts }},
+            .retry_fields = .{
+                .rebalance_timeout_ms = group_rebalance_timeout_ms,
+                .topics = &.{s.opts.topic},
+                .assignment = if (parts.len == 0) &.{} else &.{.{ .topic_id = s.c.topic_id, .partitions = parts }},
+            },
         });
         if (result.code == .fenced_member_epoch or result.code == .unknown_member_id) {
             s.rejoin();
