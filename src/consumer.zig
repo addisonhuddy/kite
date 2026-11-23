@@ -214,6 +214,7 @@ const GroupSession = struct {
                 failed = true;
             },
             .success => part.cursor.fetchSucceeded(),
+            .throttled => {},
         };
         return failed;
     }
@@ -1063,7 +1064,7 @@ fn listOffsetsLeader(
     if (resolved != parts.len) return error.RetryFetch;
 }
 
-const FetchOutcome = enum { success, retry };
+const FetchOutcome = enum { success, retry, throttled };
 
 test "mixed fetch replies update only each partition's recovery" {
     const alloc = std.testing.allocator;
@@ -1130,6 +1131,50 @@ test "mixed fetch replies update only each partition's recovery" {
     try std.testing.expectError(error.Truncated, decodeFetch(&c, alloc, session.opts, &parts, &.{}, &outcomes, &out.writer, &scratch, &count, &progress));
     try std.testing.expectEqual(@as(u64, 0), count);
     try std.testing.expect(!progress);
+}
+
+test "throttled empty fetches retain outage state and yield at the heartbeat deadline" {
+    const alloc = std.testing.allocator;
+    var c: client.Client = undefined;
+    c.io = std.testing.io;
+    const cfg: config.Config = .{ .bootstrap_servers = &.{} };
+    c.cfg = &cfg;
+    const now = std.Io.Timestamp.now(c.io, .awake);
+    const expired = now.addDuration(.fromMilliseconds(-1));
+    var session: GroupSession = .{ .c = &c, .opts = .{ .topic = "t", .group = "g" }, .member = @splat('m'), .last_heartbeat = now, .last_record = now, .recovery_deadline = expired, .commit_recovery_deadline = expired };
+    defer session.owned.deinit(alloc);
+    try session.owned.append(alloc, .{ .pidx = 0, .leader = 1, .offset = 0, .fetch_recovery_deadline = expired });
+    const parts = [_]FetchPart{.{ .pidx = 0, .cursor = &session.owned.items[0] }};
+    var e = Encoder.init(alloc);
+    defer e.deinit();
+    try e.i32v(1000);
+    try e.i16v(0);
+    try e.i32v(0);
+    try e.compactArrayLen(0);
+    try e.tagBuffer();
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    var scratch: std.Io.Writer.Allocating = .init(alloc);
+    defer scratch.deinit();
+    var count: u64 = 0;
+    var progress = false;
+    var outcomes = [_]FetchOutcome{.retry};
+    c.group_deadline = now.addDuration(.fromMilliseconds(10));
+    _ = try decodeFetch(&c, alloc, session.opts, &parts, e.written(), &outcomes, &out.writer, &scratch, &count, &progress);
+    try std.testing.expect(now.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds() < 500);
+    try std.testing.expectEqual(FetchOutcome.throttled, outcomes[0]);
+    try std.testing.expect(!session.applyFetchOutcomes(&parts, &outcomes));
+    try std.testing.expectEqual(expired, session.owned.items[0].fetch_recovery_deadline.?);
+    try std.testing.expectEqual(expired, session.recovery_deadline.?);
+    try std.testing.expectEqual(expired, session.commit_recovery_deadline.?);
+    try std.testing.expect(!session.owned.items[0].leader_stale);
+    session.opts.group = null;
+    e.written()[2] = 0;
+    e.written()[3] = 5;
+    const before = std.Io.Timestamp.now(c.io, .awake);
+    _ = try decodeFetch(&c, alloc, session.opts, &parts, e.written(), &outcomes, &out.writer, &scratch, &count, &progress);
+    try std.testing.expect(before.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds() >= 5);
+    try std.testing.expectEqual(FetchOutcome.throttled, outcomes[0]);
 }
 
 fn fetchLeaderLegacy(
@@ -1217,7 +1262,7 @@ fn decodeFetch(
 ) ![]const FetchOutcome {
     const leader = parts[0].cursor.leader;
     var d = Decoder.init(response);
-    _ = try d.i32v();
+    const throttle_ms: u64 = @intCast(@max(0, try d.i32v()));
     const top_code: protocol.ErrorCode = @enumFromInt(try d.i16v());
     _ = try d.i32v();
     if (top_code != .none) {
@@ -1226,6 +1271,8 @@ fn decodeFetch(
         return error.FetchFailed;
     }
     const topics = try d.compactArrayLen();
+    var has_records = false;
+    var has_partition_error = false;
     var ti: i64 = 0;
     while (ti < topics) : (ti += 1) {
         _ = try d.compactString();
@@ -1248,6 +1295,8 @@ fn decodeFetch(
             _ = try d.i32v();
             const records = try d.compactBytes();
             try d.tagBuffer();
+            has_records = has_records or (if (records) |blob| blob.len > 0 else false);
+            has_partition_error = has_partition_error or code != .none;
             const part_idx = for (parts, 0..) |part, idx| {
                 if (part.pidx == pidx) break idx;
             } else continue;
@@ -1322,6 +1371,11 @@ fn decodeFetch(
         try d.tagBuffer();
     }
     try d.tagBuffer();
+    if (throttle_ms > 0) {
+        if (!has_records and !has_partition_error) @memset(outcomes, .throttled);
+        const delay = if (opts.group != null) @min(throttle_ms, c.groupRemainingMs() catch 0) else throttle_ms;
+        c.sleep(delay);
+    }
     return outcomes;
 }
 
