@@ -435,8 +435,9 @@ partition's leader outage, and pending commits have independent budgets. Only a
 fully initialized heartbeat clears membership recovery; only fetching the affected
 partition clears its outage. Newly assigned partitions resolve starting positions
 before fetching: one OffsetFetch batch, then ListOffsets batches by leader.
-Unresolved partitions retry in a bounded pass that reserves time for healthy
-partitions to fetch; they do not hold up ready partitions.
+Unresolved partitions retry one leader batch per round, using the remaining
+heartbeat window without splitting it between leaders. Progress survives rounds,
+and ready partitions get a fetch turn between retries.
 Revocations take effect after the commit attempt, without waiting for additions.
 Revocation drops that partition's outage, and a
 successful commit or discarded pending offsets clears commit recovery.

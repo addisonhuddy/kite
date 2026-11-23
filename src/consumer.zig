@@ -52,6 +52,7 @@ pub const Cursor = struct {
     leader_stale: bool = false,
     awaiting_position: bool = false,
     offsets_fetched: bool = false,
+    position_attempted: bool = false,
     initial_fetch_pending: bool = false,
     fetch_recovery_deadline: ?std.Io.Timestamp = null,
 
@@ -177,6 +178,8 @@ const GroupSession = struct {
     owned: std.ArrayList(Cursor) = .empty,
     assignment_seen: bool = false,
     positions_pending_initial: bool = false,
+    position_leader: ?i32 = null,
+    position_fetch_due: bool = false,
     joined_once: bool = false,
     heartbeat_due: bool = true,
     last_heartbeat: std.Io.Timestamp,
@@ -254,8 +257,18 @@ const GroupSession = struct {
 
     fn idleReady(s: *GroupSession) bool {
         if (s.positions_pending_initial) return false;
+        if (s.position_fetch_due and s.hasReadyPartition()) return false;
         for (s.owned.items) |cursor| if (!cursor.awaiting_position and cursor.initial_fetch_pending) return false;
         return true;
+    }
+
+    fn hasReadyPartition(s: *GroupSession) bool {
+        for (s.owned.items) |cursor| if (s.fetchReady(cursor) and !cursor.leader_stale) return true;
+        return false;
+    }
+
+    fn fetchReady(s: *GroupSession, cursor: Cursor) bool {
+        return !cursor.awaiting_position and (!s.positions_pending_initial or !cursor.initial_fetch_pending);
     }
 
     fn checkRecovery(s: *GroupSession) !void {
@@ -304,6 +317,8 @@ const GroupSession = struct {
         s.heartbeat_due = true;
         s.assignment_seen = false;
         s.positions_pending_initial = false;
+        s.position_leader = null;
+        s.position_fetch_due = false;
         s.stale_retries = 0;
         s.c.vlog("group '{s}': fenced; rejoining", .{s.opts.group.?});
     }
@@ -448,17 +463,24 @@ const GroupSession = struct {
             if (!cursor.offsets_fetched) try added.append(alloc, cursor.pidx);
         };
         if (!pending) return;
-        const remaining = try s.c.groupRemainingMs();
-        const round_deadline = s.c.group_deadline;
-        defer s.c.group_deadline = round_deadline;
-        const budget = @max(1, @min(remaining / 2, s.interval / 4));
-        const deadline = std.Io.Timestamp.now(s.c.io, .awake).addDuration(.fromMilliseconds(@intCast(budget)));
-        defer if (s.positions_pending_initial) {
+        _ = try s.c.groupRemainingMs();
+        defer {
+            s.position_fetch_due = true;
+            const initial = s.positions_pending_initial;
             s.positions_pending_initial = false;
-            s.last_record = std.Io.Timestamp.now(s.c.io, .awake);
-        };
-        s.c.group_deadline = deadline;
+            for (s.owned.items) |*cursor| {
+                if (!cursor.awaiting_position) continue;
+                if (cursor.offsets_fetched and cursor.offset >= 0) {
+                    cursor.awaiting_position = false;
+                    cursor.fetch_recovery_deadline = null;
+                } else if (!cursor.position_attempted) s.positions_pending_initial = true;
+            }
+            if (initial and !s.positions_pending_initial) s.last_record = std.Io.Timestamp.now(s.c.io, .awake);
+        }
         if (added.items.len > 0) {
+            for (s.owned.items) |*cursor| if (cursor.awaiting_position and !cursor.offsets_fetched) {
+                cursor.position_attempted = true;
+            };
             const fetched = try s.c.fetchGroupOffsets(arena.allocator(), .{
                 .group = s.opts.group.?,
                 .member_id = &s.member,
@@ -471,49 +493,52 @@ const GroupSession = struct {
                     cursor.offset = offset.offset;
                     cursor.committed = offset.offset;
                     cursor.offsets_fetched = true;
+                    cursor.position_attempted = false;
                 };
             }
-        }
-        var refresh = false;
-        for (s.owned.items) |cursor| if (cursor.awaiting_position and cursor.offset < 0 and (cursor.leader_stale or cursor.leader < 0)) {
-            refresh = true;
-        };
-        if (refresh) {
-            const phase = s.c.group_deadline;
-            s.capDeadline(std.Io.Timestamp.now(s.c.io, .awake).addDuration(.fromMilliseconds(@intCast(@max(1, budget / 4)))));
-            if (s.c.refreshMetadata(s.opts.topic)) |_| {
-                for (s.owned.items) |*cursor| if (cursor.awaiting_position) {
-                    cursor.leader = s.c.partitionLeader(cursor.pidx) orelse -1;
-                    cursor.leader_stale = false;
-                };
-            } else |err| {
-                if (!positionRetry(err)) return err;
-            }
-            s.c.group_deadline = phase;
         }
         var leaders: std.ArrayList(i32) = .empty;
         for (s.owned.items) |cursor| {
-            if (!cursor.awaiting_position or !cursor.offsets_fetched or cursor.offset >= 0 or cursor.leader < 0 or cursor.leader_stale) continue;
+            if (!cursor.awaiting_position or !cursor.offsets_fetched or cursor.offset >= 0) continue;
             if (std.mem.indexOfScalar(i32, leaders.items, cursor.leader) == null) try leaders.append(alloc, cursor.leader);
         }
-        for (leaders.items, 0..) |leader, i| {
-            var parts: std.ArrayList(ListPart) = .empty;
-            for (s.owned.items) |*cursor| if (cursor.awaiting_position and cursor.offsets_fetched and cursor.offset < 0 and cursor.leader == leader and !cursor.leader_stale) {
-                try parts.append(alloc, .{ .pidx = cursor.pidx, .cursor = cursor });
+        if (leaders.items.len == 0) return;
+        std.mem.sort(i32, leaders.items, {}, std.sort.asc(i32));
+        var leader = leaders.items[0];
+        if (s.position_leader) |last| for (leaders.items) |node| {
+            if (node > last) {
+                leader = node;
+                break;
+            }
+        };
+        s.position_leader = leader;
+        var selected: ?*Cursor = null;
+        var refresh = leader < 0;
+        for (s.owned.items) |*cursor| if (cursor.awaiting_position and cursor.offsets_fetched and cursor.offset < 0 and cursor.leader == leader) {
+            cursor.position_attempted = true;
+            selected = cursor;
+            refresh = refresh or cursor.leader_stale;
+        };
+        if (refresh) {
+            try s.c.refreshMetadata(s.opts.topic);
+            for (s.owned.items) |*cursor| if (cursor.awaiting_position) {
+                cursor.leader = s.c.partitionLeader(cursor.pidx) orelse -1;
+                cursor.leader_stale = false;
             };
-            s.c.group_deadline = deadline;
-            const left = s.c.groupRemainingMs() catch break;
-            s.capDeadline(std.Io.Timestamp.now(s.c.io, .awake).addDuration(.fromMilliseconds(@intCast(@max(1, left / (leaders.items.len - i))))));
-            listOffsetsLeader(s.c, alloc, s.opts.topic, parts.items, s.opts.start) catch |err| {
-                if (!positionRetry(err)) return err;
-                for (parts.items) |part| if (part.cursor.offset < 0) {
-                    part.cursor.leader_stale = true;
-                };
-            };
+            leader = selected.?.leader;
+            if (leader < 0) return error.RetryFetch;
+            s.position_leader = leader;
         }
-        for (s.owned.items) |*cursor| if (cursor.awaiting_position and cursor.offsets_fetched and cursor.offset >= 0) {
-            cursor.awaiting_position = false;
-            cursor.fetch_recovery_deadline = null;
+        var parts: std.ArrayList(ListPart) = .empty;
+        for (s.owned.items) |*cursor| if (cursor.awaiting_position and cursor.offsets_fetched and cursor.offset < 0 and cursor.leader == leader) {
+            cursor.position_attempted = true;
+            try parts.append(alloc, .{ .pidx = cursor.pidx, .cursor = cursor });
+        };
+        listOffsetsLeader(s.c, alloc, s.opts.topic, parts.items, s.opts.start) catch |err| {
+            for (parts.items) |part| if (part.cursor.offset < 0) {
+                part.cursor.leader_stale = true;
+            };
+            return err;
         };
     }
 
@@ -898,6 +923,12 @@ test "idle waits for initial positions and first ready fetches but not ongoing o
     try std.testing.expect(session.applyFetchOutcomes(&parts, &.{.retry}));
     try std.testing.expect(session.idleExpired(now));
     try std.testing.expect(session.owned.items[0].fetch_recovery_deadline != null);
+    session.position_fetch_due = true;
+    try std.testing.expect(session.idleExpired(now));
+    session.owned.items[0].leader_stale = false;
+    try std.testing.expect(!session.idleExpired(now));
+    session.position_fetch_due = false;
+    try std.testing.expect(session.idleExpired(now));
 }
 
 test "failed final commits preserve pending progress and report replay" {
@@ -978,7 +1009,7 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             c.sleep(@min(50, @max(1, session.interval / 4)));
             continue;
         }
-        session.resolvePositions(&arena) catch |err| {
+        if (!session.position_fetch_due or !session.hasReadyPartition()) session.resolvePositions(&arena) catch |err| {
             if (!GroupSession.positionRetry(err)) {
                 if (!session.recoverEpoch(err)) {
                     exit_error = err;
@@ -991,9 +1022,9 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         const selected = for (0..session.owned.items.len) |_| {
             const idx = leader_index % session.owned.items.len;
             leader_index +%= 1;
-            if (!session.owned.items[idx].awaiting_position) break idx;
+            if (session.fetchReady(session.owned.items[idx])) break idx;
         } else {
-            _ = retry.pause(c);
+            if (!session.positions_pending_initial) _ = retry.pause(c);
             continue;
         };
         if (session.owned.items[selected].leader_stale) {
@@ -1045,6 +1076,7 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             break;
         };
         const failed = session.applyFetchOutcomes(parts.items, outcomes);
+        session.position_fetch_due = false;
         try out.flush();
         if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
         if (progress) session.last_record = std.Io.Timestamp.now(c.io, .awake);
