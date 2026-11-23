@@ -40,12 +40,12 @@ pub const Retry = struct {
         const start = r.started orelse now;
         r.started = start;
         const elapsed = start.durationTo(now).toMilliseconds();
-        if (elapsed >= 30000) return false;
-        const remaining = c.groupRemainingMs() catch return false;
-        c.sleep(@min(remaining, @min(r.backoff_ms, @as(u64, @intCast(30000 - elapsed)))));
+        if (c.group_deadline == null and elapsed >= 30000) return false;
+        const remaining = if (c.group_deadline != null) c.groupRemainingMs() catch return false else @as(u64, @intCast(30000 - elapsed));
+        c.sleep(@min(remaining, r.backoff_ms));
         r.backoff_ms = @min(r.backoff_ms * 2, 3000);
         _ = c.groupRemainingMs() catch return false;
-        return start.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds() < 30000;
+        return c.group_deadline != null or start.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds() < 30000;
     }
 };
 
@@ -564,6 +564,7 @@ pub const Client = struct {
             var d = Decoder.init(resp.body);
             const coord = try protocol.coordinatorResponse(&d);
             if (isCoordinatorError(coord.code) and retry.pause(c)) continue;
+            _ = try c.groupRemainingMs();
             try c.groupResult(coord.code);
             if (coord.node < 0 or coord.host.len == 0 or coord.port < 1 or coord.port > 65535) return error.MalformedResponse;
             const name = try c.alloc.dupe(u8, group);
@@ -584,7 +585,7 @@ pub const Client = struct {
         const deadline = c.group_deadline orelse return 15000;
         const remaining = std.Io.Timestamp.now(c.io, .awake).durationTo(deadline).toMilliseconds();
         if (remaining <= 0) return error.GroupDeadlineExceeded;
-        return @intCast(@min(remaining, 15000));
+        return @intCast(remaining);
     }
 
     pub fn isCoordinatorError(code: protocol.ErrorCode) bool {
@@ -640,6 +641,7 @@ pub const Client = struct {
                 c.invalidateCoordinator();
                 request = request.forRetry();
                 if (retry.pause(c)) continue;
+                _ = try c.groupRemainingMs();
             }
             return result;
         }
@@ -658,6 +660,7 @@ pub const Client = struct {
             if (isCoordinatorError(code)) {
                 c.invalidateCoordinator();
                 if (retry.pause(c)) continue;
+                _ = try c.groupRemainingMs();
             }
             try c.groupResult(code);
             return;
@@ -739,6 +742,7 @@ pub const Client = struct {
                 if (retry.pause(c)) continue;
             }
             if (code == .unstable_offset_commit and retry.pause(c)) continue;
+            _ = try c.groupRemainingMs();
             try c.groupResult(code);
             return result;
         }
@@ -1718,6 +1722,11 @@ test "group retry deadline is shared across nested retries" {
     try std.testing.expect(!outer.pause(&c));
     try std.testing.expect(!inner.pause(&c));
     try std.testing.expectError(error.GroupDeadlineExceeded, c.groupRemainingMs());
+    c.group_deadline = std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(45000));
+    outer.started = std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(-35000));
+    outer.backoff_ms = 0;
+    try std.testing.expect(outer.pause(&c));
+    try std.testing.expect(try c.groupRemainingMs() > 44000);
     c.group_deadline = null;
     try std.testing.expectEqual(@as(u64, 15000), try c.groupRemainingMs());
     try std.testing.expectError(error.StaleMemberEpoch, c.groupResult(.stale_member_epoch));

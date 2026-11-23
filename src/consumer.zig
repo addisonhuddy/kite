@@ -145,6 +145,7 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
 }
 
 const group_rebalance_timeout_ms = 30000;
+const group_session_assumed_ms = 45000;
 const group_commit_floor_ms = 1000;
 const heartbeat_slack_ms = 100;
 
@@ -163,12 +164,13 @@ const GroupSession = struct {
     stale_retries: u8 = 0,
 
     fn beginAttempt(s: *GroupSession) void {
-        s.c.group_deadline = std.Io.Timestamp.now(s.c.io, .awake).addDuration(.fromMilliseconds(@intCast(@min(30000, s.interval *| 3))));
+        s.c.group_deadline = std.Io.Timestamp.now(s.c.io, .awake).addDuration(.fromMilliseconds(group_session_assumed_ms));
     }
 
     fn recoverEpoch(s: *GroupSession, err: anyerror) bool {
         switch (err) {
-            error.FencedMemberEpoch, error.UnknownMemberId, error.GroupDeadlineExceeded => s.rejoin(),
+            error.FencedMemberEpoch, error.UnknownMemberId => s.rejoin(),
+            error.GroupDeadlineExceeded => s.heartbeat_due = true,
             error.StaleMemberEpoch => {
                 if (s.stale_retries != 0) return false;
                 s.stale_retries += 1;
@@ -384,6 +386,25 @@ test "commit floor skips network requests until due" {
     try session.commit(std.testing.allocator, false);
 }
 
+test "recovery deadlines retain the member epoch and flushed progress" {
+    var c: client.Client = undefined;
+    c.io = std.testing.io;
+    var session: GroupSession = undefined;
+    session.c = &c;
+    session.epoch = 3;
+    session.heartbeat_due = false;
+    session.owned = .empty;
+    defer session.owned.deinit(std.testing.allocator);
+    try session.owned.append(std.testing.allocator, .{ .pidx = 0, .leader = 1, .offset = 4, .emitted = 4, .committed = 2 });
+    session.beginAttempt();
+    try std.testing.expect(try c.groupRemainingMs() > group_session_assumed_ms - 1000);
+    try std.testing.expect(session.recoverEpoch(error.GroupDeadlineExceeded));
+    try std.testing.expect(session.heartbeat_due);
+    try std.testing.expectEqual(@as(i32, 3), session.epoch);
+    try std.testing.expectEqual(@as(usize, 1), session.owned.items.len);
+    try std.testing.expectEqual(@as(?i64, 4), pendingCommit(session.owned.items[0]));
+}
+
 test "failed final commits preserve pending progress and report replay" {
     var c: client.Client = undefined;
     var session: GroupSession = undefined;
@@ -504,6 +525,7 @@ pub fn listOffsets(
         listOffsetsOnce(c, arena.allocator(), topic, cursors, start) catch |err| {
             if (err != error.RetryFetch) return err;
             if (!retry.pause(c)) {
+                _ = try c.groupRemainingMs();
                 c.setErr("list offsets: recovery timed out after 30s", .{});
                 return error.FetchFailed;
             }
