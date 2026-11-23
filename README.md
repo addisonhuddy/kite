@@ -430,7 +430,10 @@ expired its membership. Without `--follow`, recovery stops at the idle timeout
 (if set), or after a session-sized recovery budget. Group membership, each
 partition's leader outage, and pending commits have independent budgets. Only a
 fully initialized heartbeat clears membership recovery; only fetching the affected
-partition clears its outage. Revocation drops that partition's outage, and a
+partition clears its outage. Newly assigned partitions resolve their starting
+positions independently, so unresolved partitions do not stop healthy ones.
+Revocations take effect after the commit attempt, without waiting for additions.
+Revocation drops that partition's outage, and a
 successful commit or discarded pending offsets clears commit recovery.
 Recovery stops attempt one bounded final commit of flushed progress. An idle
 stop exits 0 if the commit is confirmed, otherwise 1 with a replay warning.

@@ -50,6 +50,8 @@ pub const Cursor = struct {
     emitted: i64 = -1,
     committed: i64 = -1,
     leader_stale: bool = false,
+    awaiting_position: bool = false,
+    offsets_fetched: bool = false,
     fetch_recovery_deadline: ?std.Io.Timestamp = null,
 
     fn fetchSucceeded(cursor: *Cursor) void {
@@ -173,8 +175,6 @@ const GroupSession = struct {
     epoch: i32 = 0,
     interval: u64 = 5000,
     owned: std.ArrayList(Cursor) = .empty,
-    pending: ?std.ArrayList(Cursor) = null,
-    pending_offsets_fetched: bool = false,
     assignment_seen: bool = false,
     joined_once: bool = false,
     heartbeat_due: bool = true,
@@ -288,7 +288,6 @@ const GroupSession = struct {
 
     fn rejoin(s: *GroupSession) void {
         s.startRecovery();
-        s.clearPending();
         s.owned.clearRetainingCapacity();
         s.commit_recovery_deadline = null;
         s.epoch = 0;
@@ -367,7 +366,6 @@ const GroupSession = struct {
         s.beginRound();
         if (joining) s.c.vlog("joined group '{s}', member {s}, epoch {d}", .{ s.opts.group.?, s.member, s.epoch });
         if (result.assignment) |assignment| try s.initializeAssignment(arena, assignment);
-        try s.finishAssignment(arena);
         s.heartbeatSucceeded();
     }
 
@@ -386,77 +384,69 @@ const GroupSession = struct {
             }
             assigned = t.partitions;
         }
-        if (s.pending) |pending| if (!assignmentChanged(pending.items, assigned)) return;
-        if (!assignmentChanged(s.owned.items, assigned)) {
-            s.clearPending();
-            return;
-        }
-        s.commit(alloc, true) catch |err| {
-            // Leaving after a failed revoke commit lets the next owner replay progress.
-            s.c.vlog("group '{s}': revoke commit failed ({s}); progress may replay", .{ s.opts.group.?, @errorName(err) });
-            return err;
-        };
+        if (!assignmentChanged(s.owned.items, assigned)) return;
         var next: std.ArrayList(Cursor) = .empty;
-        errdefer next.deinit(s.c.alloc);
+        defer next.deinit(s.c.alloc);
         for (assigned) |p| {
             var retained: ?Cursor = null;
             for (s.owned.items) |cursor| if (cursor.pidx == p) {
                 retained = cursor;
             };
-            try next.append(s.c.alloc, retained orelse .{ .pidx = p, .leader = s.c.partitionLeader(p) orelse -1, .offset = -1 });
+            try next.append(s.c.alloc, retained orelse .{
+                .pidx = p,
+                .leader = s.c.partitionLeader(p) orelse -1,
+                .offset = -1,
+                .awaiting_position = true,
+                .fetch_recovery_deadline = s.attempt_started.addDuration(.fromMilliseconds(group_session_assumed_ms)),
+            });
         }
-        s.clearPending();
-        s.pending = next;
-        s.pending_offsets_fetched = false;
-    }
-
-    fn clearPending(s: *GroupSession) void {
-        if (s.pending) |*pending| pending.deinit(s.c.alloc);
-        s.pending = null;
-    }
-
-    fn finishAssignment(s: *GroupSession, arena: *std.heap.ArenaAllocator) !void {
-        const next = if (s.pending) |*pending| pending else return;
-        _ = try s.c.groupRemainingMs();
-        const alloc = arena.allocator();
-        var added: std.ArrayList(i32) = .empty;
-        for (next.items) |cursor| {
-            var retained = false;
-            for (s.owned.items) |owned| if (owned.pidx == cursor.pidx) {
-                retained = true;
-            };
-            if (!retained) try added.append(alloc, cursor.pidx);
-        }
-        if (added.items.len > 0) {
-            if (!s.pending_offsets_fetched) {
-                try s.c.refreshMetadata(s.opts.topic);
-                const fetched = try s.c.fetchGroupOffsets(alloc, .{
-                    .group = s.opts.group.?,
-                    .member_id = &s.member,
-                    .member_epoch = s.epoch,
-                    .topics = &.{.{ .name = s.opts.topic, .partitions = added.items }},
-                });
-                for (next.items) |*cursor| {
-                    cursor.leader = s.c.partitionLeader(cursor.pidx) orelse -1;
-                    for (added.items) |p| {
-                        if (p != cursor.pidx) continue;
-                        for (fetched.offsets) |offset| {
-                            if (offset.partition == p) {
-                                cursor.offset = offset.offset;
-                                cursor.committed = offset.offset;
-                            }
-                        }
-                    }
-                }
-                s.pending_offsets_fetched = true;
-            }
-            try listOffsets(s.c, arena, s.opts.topic, next.items, s.opts.start);
-        }
-        s.owned.deinit(s.c.alloc);
-        s.owned = next.*;
-        s.pending = null;
+        var commit_error: ?anyerror = null;
+        s.commit(alloc, true) catch |err| {
+            // Leaving after a failed revoke commit lets the next owner replay progress.
+            s.c.vlog("group '{s}': revoke commit failed ({s}); progress may replay", .{ s.opts.group.?, @errorName(err) });
+            commit_error = err;
+        };
+        for (next.items) |*cursor| for (s.owned.items) |owned| {
+            if (cursor.pidx == owned.pidx) cursor.* = owned;
+        };
+        std.mem.swap(std.ArrayList(Cursor), &s.owned, &next);
+        var pending_offsets = false;
+        for (s.owned.items) |cursor| if (pendingCommit(cursor) != null) {
+            pending_offsets = true;
+            break;
+        };
+        if (!pending_offsets) s.commit_recovery_deadline = null;
         s.heartbeat_due = true;
         s.c.vlog("group '{s}': assignment {d} partition(s), epoch {d}", .{ s.opts.group.?, s.owned.items.len, s.epoch });
+        if (commit_error) |err| return err;
+    }
+
+    fn resolvePosition(s: *GroupSession, arena: *std.heap.ArenaAllocator, cursor: *Cursor) !void {
+        if (!cursor.awaiting_position) return;
+        _ = try s.c.groupRemainingMs();
+        errdefer cursor.leader_stale = true;
+        if (cursor.leader_stale or !cursor.offsets_fetched) {
+            try s.c.refreshMetadata(s.opts.topic);
+            cursor.leader = s.c.partitionLeader(cursor.pidx) orelse -1;
+            cursor.leader_stale = false;
+        }
+        if (!cursor.offsets_fetched) {
+            const fetched = try s.c.fetchGroupOffsets(arena.allocator(), .{
+                .group = s.opts.group.?,
+                .member_id = &s.member,
+                .member_epoch = s.epoch,
+                .topics = &.{.{ .name = s.opts.topic, .partitions = &.{cursor.pidx} }},
+            });
+            for (fetched.offsets) |offset| if (offset.partition == cursor.pidx) {
+                cursor.offset = offset.offset;
+                cursor.committed = offset.offset;
+            };
+            cursor.offsets_fetched = true;
+        }
+        if (cursor.leader < 0) return error.RetryFetch;
+        if (cursor.offset < 0) try listOffsetsLeader(s.c, arena.allocator(), s.opts.topic, &.{.{ .pidx = cursor.pidx, .cursor = cursor }}, s.opts.start);
+        cursor.awaiting_position = false;
+        cursor.fetch_recovery_deadline = null;
     }
 
     fn leave(s: *GroupSession) void {
@@ -702,7 +692,6 @@ test "partition outage recovery survives unrelated fetches and drops on revocati
     session.beginAttempt();
     const assigned = [_]protocol.TopicAssignment{.{ .topic_id = c.topic_id, .partitions = &.{1} }};
     try session.initializeAssignment(&arena, &assigned);
-    try session.finishAssignment(&arena);
     try std.testing.expect(session.recoveryDeadline() == null);
     try std.testing.expectEqual(@as(usize, 1), session.owned.items.len);
     try std.testing.expectEqual(@as(i32, 1), session.owned.items[0].pidx);
@@ -741,21 +730,30 @@ test "unfinished assignments yield to heartbeats without losing resolved offsets
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const now = std.Io.Timestamp.now(c.io, .awake);
-    var session: GroupSession = .{ .c = &c, .opts = .{ .topic = "t", .group = "g" }, .member = @splat('m'), .epoch = 2, .last_heartbeat = now, .last_record = now, .pending = .empty, .pending_offsets_fetched = true };
-    defer session.clearPending();
+    var session: GroupSession = .{ .c = &c, .opts = .{ .topic = "t", .group = "g" }, .member = @splat('m'), .epoch = 2, .last_heartbeat = now, .last_record = now };
     defer session.owned.deinit(alloc);
-    try session.pending.?.append(alloc, .{ .pidx = 0, .leader = 1, .offset = 12 });
-    try session.pending.?.append(alloc, .{ .pidx = 1, .leader = 1, .offset = -1 });
-    session.recovery_deadline = now.addDuration(.fromMilliseconds(-1));
-    const result: protocol.HeartbeatResult = .{ .code = .none, .message = null, .member_id = "m", .member_epoch = 2, .heartbeat_interval_ms = 1000, .assignment = null };
-    try std.testing.expectError(error.GroupDeadlineExceeded, session.applyHeartbeat(&arena, result));
-    try std.testing.expectEqual(@as(i64, 12), session.pending.?.items[0].offset);
-    try std.testing.expectEqual(@as(i64, -1), session.pending.?.items[1].offset);
-    try std.testing.expect(session.pending_offsets_fetched);
-    session.pending.?.items[1].offset = 20;
-    session.recovery_deadline = now.addDuration(.fromMilliseconds(group_session_assumed_ms));
+    try session.owned.append(alloc, .{ .pidx = 0, .leader = 1, .offset = 12 });
+    try session.owned.append(alloc, .{ .pidx = 2, .leader = 1, .offset = 0 });
+    var assignment = [_]protocol.TopicAssignment{.{ .topic_id = c.topic_id, .partitions = &.{ 0, 1 } }};
+    var result: protocol.HeartbeatResult = .{ .code = .none, .message = null, .member_id = "m", .member_epoch = 2, .heartbeat_interval_ms = 1000, .assignment = &assignment };
     try session.applyHeartbeat(&arena, result);
-    try std.testing.expect(session.pending == null);
+    try std.testing.expectEqual(@as(usize, 2), session.owned.items.len);
+    try std.testing.expectEqual(@as(i32, 1), session.owned.items[1].pidx);
+    try std.testing.expect(session.owned.items[1].awaiting_position);
+    const deadline = session.owned.items[1].fetch_recovery_deadline.?;
+    session.owned.items[1].offsets_fetched = true;
+    session.owned.items[1].leader = 1;
+    c.group_deadline = .zero;
+    try std.testing.expectError(error.GroupDeadlineExceeded, session.resolvePosition(&arena, &session.owned.items[1]));
+    try std.testing.expectEqual(@as(i64, 12), session.owned.items[0].offset);
+    try std.testing.expectEqual(@as(i64, -1), session.owned.items[1].offset);
+    result.assignment = null;
+    try session.applyHeartbeat(&arena, result);
+    try std.testing.expectEqual(deadline, session.owned.items[1].fetch_recovery_deadline.?);
+    session.owned.items[1].offset = 20;
+    session.beginAttempt();
+    try session.resolvePosition(&arena, &session.owned.items[1]);
+    try std.testing.expect(!session.owned.items[1].awaiting_position);
     try std.testing.expect(session.recoveryDeadline() == null);
     try std.testing.expectEqual(@as(i64, 12), session.owned.items[0].offset);
     try std.testing.expectEqual(@as(i64, 20), session.owned.items[1].offset);
@@ -808,7 +806,6 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
     const now = std.Io.Timestamp.now(c.io, .awake);
     var session: GroupSession = .{ .c = c, .opts = opts, .member = std.fmt.bytesToHex(random, .lower), .last_heartbeat = now, .last_record = now };
     defer session.owned.deinit(c.alloc);
-    defer session.clearPending();
     defer session.leave();
     var arena = std.heap.ArenaAllocator.init(c.alloc);
     defer arena.deinit();
@@ -851,6 +848,16 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         }
         const selected = leader_index % session.owned.items.len;
         leader_index +%= 1;
+        if (session.owned.items[selected].awaiting_position) {
+            session.resolvePosition(&arena, &session.owned.items[selected]) catch |err| {
+                if (err != error.RetryFetch and !session.recoverEpoch(err)) {
+                    exit_error = err;
+                    break;
+                }
+                _ = retry.pause(c);
+                continue;
+            };
+        }
         if (session.owned.items[selected].leader_stale) {
             c.refreshMetadata(opts.topic) catch |err| {
                 if (!session.recoverEpoch(err)) {
@@ -867,7 +874,7 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         }
         const leader = session.owned.items[selected].leader;
         var parts: std.ArrayList(FetchPart) = .empty;
-        for (session.owned.items) |*cursor| if (cursor.leader == leader and !cursor.leader_stale) {
+        for (session.owned.items) |*cursor| if (cursor.leader == leader and !cursor.leader_stale and !cursor.awaiting_position) {
             try parts.append(arena.allocator(), .{ .pidx = cursor.pidx, .cursor = cursor });
         };
         var fetch_opts = opts;

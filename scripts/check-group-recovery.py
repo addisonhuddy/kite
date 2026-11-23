@@ -59,6 +59,74 @@ class Broker(socketserver.ThreadingTCPServer):
         self.started = time.monotonic()
         self.reset_started = None
         self.reset_fetches = []
+        self.assignment_changed = None
+        self.revoked_commit = False
+        self.revoked_released = False
+        self.partition_deliveries = []
+
+
+def assignment_response(broker, api, req):
+    pos = 11 + struct.unpack_from(">h", req, 8)[0]
+    if api == 3:
+        address = pack("i", 1) + text(b"127.0.0.1") + pack("i", broker.server_address[1]) + b"\x00\x00"
+        partitions = b"".join(pack("hiii", 0, p, 1, 1) + b"\x01\x01\x01\x00" for p in range(4))
+        topic = b"\x00\x00" + text(b"example") + b"\x00" * 17 + b"\x05" + partitions + b"\x00" * 5
+        return b"\x00" * 4 + b"\x02" + address + b"\x00" + pack("i", 1) + b"\x02" + topic + b"\x00"
+    if api == 68:
+        _, pos = string(req, pos)
+        member, pos = string(req, pos)
+        epoch, = struct.unpack_from(">i", req, pos)
+        pos += 10  # epoch, null instance/rack, rebalance timeout
+        topics = req[pos] - 1
+        pos += 1
+        for _ in range(max(0, topics)):
+            _, pos = string(req, pos)
+        pos += 2  # null regex and assignor
+        owned = None
+        if req[pos] > 1:
+            pos += 17  # topic array length and UUID
+            count = req[pos] - 1
+            owned = list(struct.unpack_from(">" + "i" * count, req, pos + 1))
+        if epoch >= 0:
+            broker.beats.append(time.monotonic())
+            if broker.revoked_commit and owned is not None:
+                assert 2 not in owned, owned
+                broker.revoked_released = True
+        if broker.delivered:
+            broker.assignment_changed = broker.assignment_changed or time.monotonic()
+        assigned = (0, 1, 3) if broker.assignment_changed else (0, 2)
+        assignment = b"\x01\x02" + b"\x00" * 16 + bytes([len(assigned) + 1]) + pack("i" * len(assigned), *assigned) + b"\x00\x00\x00"
+        return b"\x00" * 7 + text(member) + pack("ii", 2 if broker.assignment_changed else 1, 1000) + assignment
+    if api == 9:
+        offsets = b"".join(pack("iqi", p, -1, -1) + b"\x00" * 4 for p in range(4))
+        return b"\x00" * 4 + b"\x02" + text(b"g") + b"\x02" + text(b"example") + b"\x05" + offsets + b"\x00" * 5
+    if api == 2:
+        _, pos = string(req, pos + 6)
+        partition, = struct.unpack_from(">i", req, pos + 1)
+        unresolved = partition == 1 and time.monotonic() - broker.assignment_changed < 8
+        return b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ihqqi", partition, 6 if unresolved else 0, 0, 0, 0) + b"\x00\x00\x00"
+    if api == 1:
+        _, pos = string(req, pos + 26)
+        count = req[pos] - 1
+        pos += 1
+        parts = b""
+        for _ in range(count):
+            partition, _, offset = struct.unpack_from(">iiq", req, pos)
+            pos += 33
+            limit = {0: 2 if broker.revoked_released else 1, 1: 1, 2: 0, 3: 1}[partition]
+            records = batch(offset) if offset < limit else b""
+            if records:
+                broker.partition_deliveries.append((partition, offset, time.monotonic()))
+                broker.delivered = broker.delivered or time.monotonic()
+            parts += pack("ihqqq", partition, 0, limit, -1, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
+        time.sleep(0.01)
+        return b"\x00" * 10 + b"\x02" + text(b"example") + bytes([count + 1]) + parts + b"\x00\x00"
+    if api == 8:
+        broker.commits.append(time.monotonic())
+        broker.revoked_commit = bool(broker.assignment_changed)
+        code = 14 if not broker.revoked_released else 0
+        parts = b"".join(pack("ih", p, code) + b"\x00" for p in range(4))
+        return b"\x00" * 4 + b"\x02" + text(b"example") + b"\x05" + parts + b"\x00\x00"
 
 
 class Handler(socketserver.StreamRequestHandler):
@@ -69,6 +137,11 @@ class Handler(socketserver.StreamRequestHandler):
                 size, = struct.unpack(">I", header)
                 req = self.rfile.read(size)
                 api, _, corr = struct.unpack_from(">hhi", req)
+                if broker.mode == "assignment" and api in (1, 2, 3, 8, 9, 68):
+                    response = assignment_response(broker, api, req)
+                    payload = pack("i", corr) + b"\x00" + response
+                    self.wfile.write(pack("I", len(payload)) + payload)
+                    continue
                 if api == 1 and broker.mode == "throttle-idle":
                     payload = pack("i", corr) + b"\x00" + pack("ihi", 30000, 0, 0) + b"\x01\x00"
                     self.wfile.write(pack("I", len(payload)) + payload)
@@ -183,6 +256,8 @@ def check(mode):
             flags = ["--idle", "200ms"]
         elif mode in ("reset", "reset-fail"):
             flags = ["--idle", "2m", "-n", "1"]
+        elif mode == "assignment":
+            flags = ["-v", "--idle", "20s", "-n", "4"]
         elif mode == "healthy":
             flags = ["--idle", "20s", "-n", "2"]
         elif mode.startswith("follow"):
@@ -221,6 +296,18 @@ def check(mode):
             return
         assert rows and all(row["value"] == "kept" for row in rows), (mode, result.stderr, rows)
         assert broker.commits, (mode, result.stderr)
+        if mode == "assignment":
+            assert result.returncode == 0 and len(rows) == 4, (result.stderr, rows)
+            assert sorted((r["partition"], r["offset"]) for r in rows) == [(0, 0), (0, 1), (1, 0), (3, 0)], rows
+            assert broker.revoked_released, result.stderr
+            for partition, offset, delivered in broker.partition_deliveries:
+                if partition == 3 or (partition == 0 and offset == 1):
+                    assert delivered - broker.assignment_changed < 8, broker.partition_deliveries
+                if partition == 1:
+                    assert delivered - broker.assignment_changed >= 8, broker.partition_deliveries
+            assert max(b - a for a, b in zip(broker.beats, broker.beats[1:])) < 2, broker.beats
+            print("PASS group recovery assignment", flush=True)
+            return
         if mode == "partition-bound":
             assert result.returncode == 1 and "next run may replay records" in result.stderr, result.stderr
             assert len(rows) == 1 and broker.fetch_nodes.count(2) > 10, (rows, broker.fetch_nodes)
@@ -271,4 +358,4 @@ def check(mode):
 
 
 with concurrent.futures.ThreadPoolExecutor() as pool:
-    list(pool.map(check, sys.argv[2:] or ("leader", "healthy", "partition-bound", "reset", "reset-fail", "reset-fair", "throttle-idle", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-partition", "follow-coordinator", "no-join", "no-join-heartbeat", "follow-join")))
+    list(pool.map(check, sys.argv[2:] or ("assignment", "leader", "healthy", "partition-bound", "reset", "reset-fail", "reset-fair", "throttle-idle", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-partition", "follow-coordinator", "no-join", "no-join-heartbeat", "follow-join")))
