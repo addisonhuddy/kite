@@ -14,6 +14,7 @@ pub const Options = struct {
     pub const Start = enum { earliest, latest, offset };
     topic: []const u8,
     group: ?[]const u8 = null,
+    follow: bool = false,
     fetch_wait_ms: ?u64 = null,
     start: Start = .latest,
     offset: i64 = 0,
@@ -168,6 +169,7 @@ const GroupSession = struct {
     attempt_started: std.Io.Timestamp = .zero,
     recovery_deadline: ?std.Io.Timestamp = null,
     fetch_recovery_deadline: ?std.Io.Timestamp = null,
+    last_recovery_warning: ?std.Io.Timestamp = null,
 
     fn beginAttempt(s: *GroupSession) void {
         s.attempt_started = std.Io.Timestamp.now(s.c.io, .awake);
@@ -177,7 +179,7 @@ const GroupSession = struct {
     fn beginRound(s: *GroupSession) void {
         s.beginAttempt();
         s.capDeadline(s.last_heartbeat.addDuration(.fromMilliseconds(@intCast(s.interval))));
-        if (s.recoveryDeadline()) |deadline| s.capDeadline(deadline);
+        if (!s.opts.follow) if (s.recoveryDeadline()) |deadline| s.capDeadline(deadline);
         if (s.assignment_seen) if (s.opts.idle_ms) |idle| {
             const io_slack: u64 = if (s.recoveryDeadline() == null) 1000 else 0;
             s.capDeadline(s.last_record.addDuration(.fromMilliseconds(@intCast(idle +| io_slack))));
@@ -220,6 +222,13 @@ const GroupSession = struct {
     fn checkRecovery(s: *GroupSession) !void {
         const deadline = s.recoveryDeadline() orelse return;
         const now = std.Io.Timestamp.now(s.c.io, .awake);
+        if (s.opts.follow) {
+            if (s.last_recovery_warning == null or s.last_recovery_warning.?.durationTo(now).toMilliseconds() >= 15000) {
+                std.debug.print("kite: warning: consumer group recovery ongoing; retrying (records may replay after rejoining)\n", .{});
+                s.last_recovery_warning = now;
+            }
+            return;
+        }
         if (now.nanoseconds >= deadline.nanoseconds or s.idleExpired(now)) return s.recoveryFailed();
     }
 
@@ -230,10 +239,7 @@ const GroupSession = struct {
 
     fn recoverEpoch(s: *GroupSession, err: anyerror) bool {
         const failure = switch (err) {
-            error.MetadataFailed, error.MetadataUnavailable => blk: {
-                _ = s.c.groupRemainingMs() catch break :blk error.GroupDeadlineExceeded;
-                break :blk err;
-            },
+            error.MetadataFailed, error.MetadataUnavailable => error.GroupDeadlineExceeded,
             else => err,
         };
         switch (failure) {
@@ -660,6 +666,28 @@ test "unfinished assignments yield to heartbeats without losing resolved offsets
     try std.testing.expect(try c.groupRemainingMs() <= 50);
 }
 
+test "follow ignores expired recovery budgets without renewing them" {
+    var c: client.Client = undefined;
+    c.io = std.testing.io;
+    const now = std.Io.Timestamp.now(c.io, .awake);
+    const expired = now.addDuration(.fromMilliseconds(-1));
+    var session: GroupSession = .{ .c = &c, .opts = .{ .topic = "t", .follow = true }, .member = @splat('m'), .epoch = 3, .last_heartbeat = now, .last_record = now, .recovery_deadline = expired, .fetch_recovery_deadline = expired };
+    session.beginRound();
+    try std.testing.expect(try c.groupRemainingMs() > 0);
+    try session.checkRecovery();
+    const warned = session.last_recovery_warning.?;
+    session.startRecovery();
+    session.startFetchRecovery();
+    try session.checkRecovery();
+    try std.testing.expectEqual(warned, session.last_recovery_warning.?);
+    try std.testing.expectEqual(expired, session.recovery_deadline.?);
+    try std.testing.expectEqual(expired, session.fetch_recovery_deadline.?);
+    session.opts.follow = false;
+    try std.testing.expectError(error.FetchFailed, session.checkRecovery());
+    session.heartbeatSucceeded();
+    try session.checkRecovery();
+}
+
 test "failed final commits preserve pending progress and report replay" {
     var c: client.Client = undefined;
     var session: GroupSession = undefined;
@@ -693,18 +721,24 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
     var count: u64 = 0;
     var leader_index: usize = 0;
     var retry: client.Retry = .{};
+    var exit_error: ?anyerror = null;
     while (true) {
         if (opts.stop) |flag| if (flag.load(.acquire)) break;
         if (opts.max_records) |max| if (count >= max) break;
         if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
-        try session.checkRecovery();
+        session.checkRecovery() catch break;
         if (session.idleExpired(std.Io.Timestamp.now(c.io, .awake))) break;
         _ = arena.reset(.retain_capacity);
         session.beginRound();
         const elapsed = session.last_heartbeat.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds();
         if (session.heartbeat_due or elapsed >= session.interval) {
             session.beat(&arena) catch |err| {
-                if (!session.recoverEpoch(err)) return err;
+                if (!session.recoverEpoch(err)) {
+                    exit_error = err;
+                    break;
+                }
+                session.beginRound();
+                _ = retry.pause(c);
             };
             if (session.heartbeat_due) continue;
         }
@@ -751,7 +785,10 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
                 session.startFetchRecovery();
                 failed = true;
             },
-            else => return err,
+            else => {
+                exit_error = err;
+                break;
+            },
         };
         try out.flush();
         if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
@@ -759,7 +796,10 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         if (!failed) session.fetchSucceeded();
         session.beginRound();
         session.commit(arena.allocator(), false) catch |err| {
-            if (!session.recoverEpoch(err)) return err;
+            if (!session.recoverEpoch(err)) {
+                exit_error = err;
+                break;
+            }
             continue;
         };
         session.stale_retries = 0;
@@ -782,6 +822,7 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         if (session.epoch <= 0) return session.finalCommitFailed(error.FencedMemberEpoch);
         session.commit(arena.allocator(), true) catch |commit_err| return session.finalCommitFailed(commit_err);
     };
+    if (exit_error) |err| return err;
     return count;
 }
 

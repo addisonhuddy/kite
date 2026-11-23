@@ -1,6 +1,7 @@
 """Scripted Kafka broker faults exercise group heartbeat and recovery boundaries."""
 
 import json
+import concurrent.futures
 import os
 import socketserver
 import struct
@@ -23,7 +24,7 @@ def string(data, pos):
     return data[pos + 1:pos + 1 + size], pos + 1 + size
 
 
-def batch():
+def batch(offset=0):
     record = b"\x14\x00\x00\x00\x01\x08kept\x00"
     data = pack("hiqqqhii", 0, 0, 0, 0, -1, -1, -1, 1) + record
     crc = 0xffffffff
@@ -32,19 +33,23 @@ def batch():
         for _ in range(8):
             crc = (crc >> 1) ^ (0x82f63b78 if crc & 1 else 0)
     body = pack("ibI", 0, 2, crc ^ 0xffffffff) + data
-    return pack("qi", 0, len(body)) + body
+    return pack("qi", offset, len(body)) + body
 
 
 class Broker(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self):
+    def __init__(self, mode):
         super().__init__(("127.0.0.1", 0), Handler)
         self.joined = None
         self.beats = []
         self.epochs = []
         self.commits = []
+        self.mode = mode
+        self.delivered = None
+        self.fenced = False
+        self.generation = 1
 
 
 class Handler(socketserver.StreamRequestHandler):
@@ -55,6 +60,15 @@ class Handler(socketserver.StreamRequestHandler):
                 size, = struct.unpack(">I", header)
                 req = self.rfile.read(size)
                 api, _, corr = struct.unpack_from(">hhi", req)
+                elapsed = time.monotonic() - broker.delivered if broker.delivered else 0
+                if broker.mode == "follow-coordinator" and broker.delivered and elapsed < 50 and api in (8, 9, 10, 68):
+                    return
+                if broker.mode in ("idle-confirmed", "idle-unconfirmed", "bounded", "follow-fetch") and broker.delivered and api == 1:
+                    if broker.mode != "follow-fetch" or elapsed < 50:
+                        return
+                adopting = broker.joined and time.monotonic() - broker.joined < 8
+                if adopting and ((broker.mode == "metadata" and api == 3) or (broker.mode == "offsets" and api == 9)):
+                    return
                 tags = b"\x00"
                 if api == 18:
                     tags = b""
@@ -77,20 +91,29 @@ class Handler(socketserver.StreamRequestHandler):
                         broker.joined = broker.joined or now
                         broker.beats.append(now)
                         broker.epochs.append(epoch)
+                    if broker.mode == "follow-coordinator" and broker.delivered and not broker.fenced and epoch > 0:
+                        broker.fenced = True
+                        broker.generation = 2
+                        response = pack("ih", 0, 110) + b"\x00\x00" + pack("ii", 0, 1000) + b"\xff\x00"
+                        payload = pack("i", corr) + tags + response
+                        self.wfile.write(pack("I", len(payload)) + payload)
+                        continue
                     assignment = b"\x01\x02" + b"\x00" * 16 + b"\x02" + pack("i", 0) + b"\x00\x00\x00"
-                    response = b"\x00" * 7 + text(member) + pack("ii", 1, 1000) + assignment
+                    response = b"\x00" * 7 + text(member) + pack("ii", broker.generation, 1000) + assignment
                 elif api == 9:
                     response = b"\x00" * 4 + b"\x02" + text(b"g") + b"\x02" + text(b"example") + b"\x02" + pack("iqi", 0, -1, -1) + b"\x00" * 9
                 elif api == 2:
-                    code = 6 if time.monotonic() - broker.joined < 8 else 0
+                    code = 6 if broker.mode == "adoption" and adopting else 0
                     response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ihqqi", 0, code, 0, 0, 0) + b"\x00\x00\x00"
                 elif api == 1:
-                    records = batch()
+                    records = batch(1 if broker.delivered and broker.mode == "follow-fetch" else 0)
+                    broker.delivered = broker.delivered or time.monotonic()
                     part = pack("ihqqq", 0, 0, 1, -1, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
                     response = b"\x00" * 10 + b"\x02" + text(b"example") + b"\x02" + part + b"\x00\x00"
                 elif api == 8:
                     broker.commits.append(time.monotonic())
-                    response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ih", 0, 0) + b"\x00\x00\x00"
+                    code = 14 if broker.mode in ("idle-unconfirmed", "bounded") or (broker.mode == "idle-confirmed" and elapsed < 1.7) else 0
+                    response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ih", 0, code) + b"\x00\x00\x00"
                 else:
                     raise AssertionError(api)
                 payload = pack("i", corr) + tags + response
@@ -99,18 +122,48 @@ class Handler(socketserver.StreamRequestHandler):
             pass
 
 
-with Broker() as broker:
-    threading.Thread(target=broker.serve_forever, daemon=True).start()
-    result = subprocess.run(
-        [sys.argv[1], "consume", "-g", "g", "-B", "-n", "1", "--idle", "20s", "--json", "example"],
-        env={**os.environ, "BOOTSTRAP_SERVERS": f"127.0.0.1:{broker.server_address[1]}"},
-        capture_output=True, text=True, timeout=30,
-    )
-    broker.shutdown()
-    assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["value"] == "kept", result.stdout
-    assert len(broker.beats) >= 8, broker.beats
-    assert max(b - a for a, b in zip(broker.beats, broker.beats[1:])) < 2, broker.beats
-    assert broker.epochs[0] == 0 and all(e == 1 for e in broker.epochs[1:]), broker.epochs
-    assert broker.commits
-    print("PASS group adoption retries yield to heartbeats without rejoining")
+def check(mode):
+    with Broker(mode) as broker:
+        threading.Thread(target=broker.serve_forever, daemon=True).start()
+        if mode.startswith("follow"):
+            flags = ["--follow", "-n", "2"]
+        elif mode.startswith("idle"):
+            flags = ["--idle", "1500ms"]
+        elif mode == "bounded":
+            flags = ["--idle", "2m"]
+        else:
+            flags = ["--idle", "20s", "-n", "1"]
+        result = subprocess.run(
+            [sys.argv[1], "consume", "-g", "g", "-B", *flags, "--json", "example"],
+            env={**os.environ, "BOOTSTRAP_SERVERS": f"127.0.0.1:{broker.server_address[1]}"},
+            capture_output=True, text=True, timeout=65,
+        )
+        broker.shutdown()
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        assert rows and all(row["value"] == "kept" for row in rows), (mode, result.stderr, rows)
+        assert broker.commits, (mode, result.stderr)
+        if mode in ("idle-unconfirmed", "bounded"):
+            assert result.returncode == 1, (mode, result.stderr)
+            assert "final commit failed" in result.stderr and "next run may replay records" in result.stderr, result.stderr
+            if mode == "bounded":
+                assert 44 <= time.monotonic() - broker.delivered < 52
+        else:
+            assert result.returncode == 0, (mode, result.stderr)
+        if mode.startswith("follow"):
+            assert len(rows) == 2 and time.monotonic() - broker.delivered >= 50, (mode, rows)
+            assert result.stderr.count("recovery ongoing") >= 2, result.stderr
+            if mode == "follow-coordinator":
+                assert broker.fenced and broker.epochs.count(0) >= 2, broker.epochs
+            else:
+                assert [row["offset"] for row in rows] == [0, 1], rows
+        elif mode == "idle-confirmed":
+            assert any(t - broker.delivered >= 1.7 for t in broker.commits), broker.commits
+        elif mode in ("adoption", "metadata", "offsets"):
+            assert len(broker.beats) >= 8, (mode, broker.beats)
+            assert max(b - a for a, b in zip(broker.beats, broker.beats[1:])) < 2, (mode, broker.beats)
+            assert broker.epochs[0] == 0 and all(e == 1 for e in broker.epochs[1:]), broker.epochs
+        print(f"PASS group recovery {mode}", flush=True)
+
+
+with concurrent.futures.ThreadPoolExecutor() as pool:
+    list(pool.map(check, ("adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "follow-fetch", "follow-coordinator")))

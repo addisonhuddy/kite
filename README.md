@@ -423,6 +423,13 @@ that idle window unless `--follow` is used. `-v` logs joins, assignments, and
 commits. Heartbeats run between fetches; no background process is started.
 The stdout reader must drain within the broker's group session timeout (45s
 by default). A slower reader can cause fencing and replay of uncommitted records.
+Network lookups and retries yield to the next heartbeat; unfinished assignments
+resume after it. With `--follow`, coordinator and broker outages are retried with
+backoff indefinitely, with a periodic stderr warning. kite rejoins if the broker
+expired its membership. Without `--follow`, recovery stops at the idle timeout
+(if set), or after the session-sized recovery budget. Recovery stops also attempt
+one bounded final commit of flushed progress: a confirmed commit exits 0;
+an unconfirmed commit exits 1 with a warning that the next run may replay records.
 
 ## Common recipes
 

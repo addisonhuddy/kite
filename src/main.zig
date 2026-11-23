@@ -711,6 +711,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     const consumed = consumer.run(&cli, .{
         .topic = topic_name,
         .group = consume.group,
+        .follow = consume.follow,
         .start = consume.start,
         .offset = consume.offset,
         .partition = consume.partition,
