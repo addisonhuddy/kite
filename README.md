@@ -430,6 +430,11 @@ expired its membership. Without `--follow`, recovery stops at the idle timeout
 (if set), or after the session-sized recovery budget. Recovery stops also attempt
 one bounded final commit of flushed progress: a confirmed commit exits 0;
 an unconfirmed commit exits 1 with a warning that the next run may replay records.
+Commit outages have their own recovery bound, which successful fetches and
+heartbeats do not reset. Exhausting it without `--follow` exits 1 with the replay
+warning, even if the final best-effort commit succeeds.
+If bounded recovery ends before kite has ever joined the group, it exits 1 with
+a join failure rather than reporting a successful empty read.
 
 ## Common recipes
 

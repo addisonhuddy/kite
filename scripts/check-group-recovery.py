@@ -56,6 +56,7 @@ class Broker(socketserver.ThreadingTCPServer):
         self.secondary = None
         self.fetch_old_fault = False
         self.fetch_nodes = []
+        self.started = time.monotonic()
 
 
 class Handler(socketserver.StreamRequestHandler):
@@ -66,6 +67,8 @@ class Handler(socketserver.StreamRequestHandler):
                 size, = struct.unpack(">I", header)
                 req = self.rfile.read(size)
                 api, _, corr = struct.unpack_from(">hhi", req)
+                if api == 10 and (broker.mode == "no-join" or (broker.mode == "follow-join" and time.monotonic() - broker.started < 50)):
+                    return
                 if api == 1 and broker.mode == "leader":
                     broker.fetch_nodes.append(self.server.node)
                     if self.server.node == 1:
@@ -147,10 +150,10 @@ def check(mode):
             threading.Thread(target=broker.secondary.serve_forever, daemon=True).start()
         threading.Thread(target=broker.serve_forever, daemon=True).start()
         if mode.startswith("follow"):
-            flags = ["--follow", "-n", "2"]
+            flags = ["--follow", "-n", "1" if mode == "follow-join" else "2"]
         elif mode.startswith("idle"):
             flags = ["--idle", "1500ms"]
-        elif mode in ("bounded", "commit-bound"):
+        elif mode in ("bounded", "commit-bound", "no-join"):
             flags = ["--idle", "2m"]
         else:
             flags = ["--idle", "20s", "-n", "1"]
@@ -163,6 +166,12 @@ def check(mode):
         if broker.secondary:
             broker.secondary.shutdown()
         rows = [json.loads(line) for line in result.stdout.splitlines()]
+        if mode == "no-join":
+            assert result.returncode == 1 and not rows and not broker.beats, result.stderr
+            assert "before joining group" in result.stderr, result.stderr
+            assert 35 <= time.monotonic() - broker.started < 50
+            print("PASS group recovery no-join", flush=True)
+            return
         assert rows and all(row["value"] == "kept" for row in rows), (mode, result.stderr, rows)
         assert broker.commits, (mode, result.stderr)
         if mode in ("idle-unconfirmed", "bounded", "commit-bound"):
@@ -174,7 +183,10 @@ def check(mode):
                 assert len(broker.commits) > 10 and len(broker.beats) > 30
         else:
             assert result.returncode == 0, (mode, result.stderr)
-        if mode.startswith("follow"):
+        if mode == "follow-join":
+            assert len(rows) == 1 and time.monotonic() - broker.started >= 50, rows
+            assert result.stderr.count("recovery ongoing") >= 2, result.stderr
+        elif mode.startswith("follow"):
             assert len(rows) == 2 and time.monotonic() - broker.delivered >= 50, (mode, rows)
             assert result.stderr.count("recovery ongoing") >= 2, result.stderr
             if mode == "follow-coordinator":
@@ -193,4 +205,4 @@ def check(mode):
 
 
 with concurrent.futures.ThreadPoolExecutor() as pool:
-    list(pool.map(check, sys.argv[2:] or ("leader", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-coordinator")))
+    list(pool.map(check, sys.argv[2:] or ("leader", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-coordinator", "no-join", "follow-join")))

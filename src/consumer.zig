@@ -162,6 +162,7 @@ const GroupSession = struct {
     pending_offsets_fetched: bool = false,
     leaders_stale: bool = false,
     assignment_seen: bool = false,
+    joined_once: bool = false,
     heartbeat_due: bool = true,
     last_heartbeat: std.Io.Timestamp,
     last_record: std.Io.Timestamp,
@@ -331,6 +332,7 @@ const GroupSession = struct {
             return;
         }
         try s.c.groupResult(result.code);
+        s.joined_once = true;
         s.epoch = result.member_epoch;
         s.interval = @intCast(@max(1, result.heartbeat_interval_ms));
         s.last_heartbeat = std.Io.Timestamp.now(s.c.io, .awake);
@@ -852,6 +854,10 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
     if (exit_error) |err| {
         if (err == error.CommitRecoveryExpired) return session.finalCommitFailed(err);
         return err;
+    }
+    if (!opts.follow and !session.joined_once) {
+        c.setErr("consumer group: recovery ended before joining group '{s}'", .{opts.group.?});
+        return error.GroupJoinFailed;
     }
     return count;
 }
