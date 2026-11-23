@@ -69,6 +69,10 @@ class Handler(socketserver.StreamRequestHandler):
                 size, = struct.unpack(">I", header)
                 req = self.rfile.read(size)
                 api, _, corr = struct.unpack_from(">hhi", req)
+                if api == 1 and broker.mode == "throttle-idle":
+                    payload = pack("i", corr) + b"\x00" + pack("ihi", 30000, 0, 0) + b"\x01\x00"
+                    self.wfile.write(pack("I", len(payload)) + payload)
+                    continue
                 if api == 10 and (broker.mode == "no-join" or (broker.mode == "follow-join" and time.monotonic() - broker.started < 50)):
                     return
                 if api == 68 and broker.mode == "no-join-heartbeat":
@@ -175,7 +179,9 @@ def check(mode):
             broker.secondary = stack.enter_context(Broker(mode, broker))
             threading.Thread(target=broker.secondary.serve_forever, daemon=True).start()
         threading.Thread(target=broker.serve_forever, daemon=True).start()
-        if mode in ("reset", "reset-fail"):
+        if mode == "throttle-idle":
+            flags = ["--idle", "200ms"]
+        elif mode in ("reset", "reset-fail"):
             flags = ["--idle", "2m", "-n", "1"]
         elif mode == "healthy":
             flags = ["--idle", "20s", "-n", "2"]
@@ -188,7 +194,7 @@ def check(mode):
         else:
             flags = ["--idle", "20s", "-n", "1"]
         result = subprocess.run(
-            [sys.argv[1], "consume", "-g", "g", "-B", *flags, "--json", "example"],
+            [sys.argv[1], "consume", *([] if mode == "throttle-idle" else ["-g", "g"]), "-B", *flags, "--json", "example"],
             env={**os.environ, "BOOTSTRAP_SERVERS": f"127.0.0.1:{broker.server_address[1]}"},
             capture_output=True, text=True, timeout=65,
         )
@@ -196,6 +202,11 @@ def check(mode):
         if broker.secondary:
             broker.secondary.shutdown()
         rows = [json.loads(line) for line in result.stdout.splitlines()]
+        if mode == "throttle-idle":
+            assert result.returncode == 0 and not rows, (result.stderr, rows)
+            assert time.monotonic() - broker.started < 2, result.stderr
+            print("PASS group recovery throttle-idle", flush=True)
+            return
         if mode == "reset-fail":
             assert result.returncode == 1 and not rows, result.stderr
             assert "next run may replay records" in result.stderr, result.stderr
@@ -260,4 +271,4 @@ def check(mode):
 
 
 with concurrent.futures.ThreadPoolExecutor() as pool:
-    list(pool.map(check, sys.argv[2:] or ("leader", "healthy", "partition-bound", "reset", "reset-fail", "reset-fair", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-partition", "follow-coordinator", "no-join", "no-join-heartbeat", "follow-join")))
+    list(pool.map(check, sys.argv[2:] or ("leader", "healthy", "partition-bound", "reset", "reset-fail", "reset-fair", "throttle-idle", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-partition", "follow-coordinator", "no-join", "no-join-heartbeat", "follow-join")))

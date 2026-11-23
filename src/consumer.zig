@@ -16,6 +16,7 @@ pub const Options = struct {
     group: ?[]const u8 = null,
     follow: bool = false,
     fetch_wait_ms: ?u64 = null,
+    fetch_idle_deadline: ?std.Io.Timestamp = null,
     start: Start = .latest,
     offset: i64 = 0,
     partition: ?i32 = null,
@@ -113,8 +114,9 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         round_alloc = round_arena.allocator();
         var progress = false;
         var failed_leader: ?i32 = null;
+        var idle_reached = false;
         var leader_seen: std.AutoHashMapUnmanaged(i32, void) = .empty;
-        for (cursors[0..cursor_count]) |*cursor| {
+        broker_loop: for (cursors[0..cursor_count]) |*cursor| {
             if (leader_seen.contains(cursor.leader)) continue;
             try leader_seen.put(round_alloc, cursor.leader, {});
 
@@ -123,7 +125,13 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
                 if (candidate.leader == cursor.leader)
                     try parts.append(round_alloc, .{ .pidx = candidate.pidx, .cursor = candidate });
 
-            fetchLeaderLegacy(c, round_alloc, opts, parts.items, out, &scratch, &count, &progress) catch |err| switch (err) {
+            var fetch_opts = opts;
+            if (opts.idle_ms) |idle| fetch_opts.fetch_idle_deadline = last_record.addDuration(.fromMilliseconds(@intCast(idle)));
+            fetchLeaderLegacy(c, round_alloc, fetch_opts, parts.items, out, &scratch, &count, &progress) catch |err| switch (err) {
+                error.FetchIdleExpired => {
+                    idle_reached = true;
+                    break :broker_loop;
+                },
                 error.RetryFetch => {
                     c.dropNode(cursor.leader);
                     failed_leader = cursor.leader;
@@ -138,6 +146,7 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         try out.flush();
         if (opts.stats) |s| s.maybeRender();
         if (progress) last_record = std.Io.Timestamp.now(c.io, .awake);
+        if (idle_reached and !progress) break;
         if (opts.max_records) |max| if (count >= max) break;
         if (failed_leader) |node| {
             if (!retry.pause(c)) {
@@ -1373,8 +1382,15 @@ fn decodeFetch(
     try d.tagBuffer();
     if (throttle_ms > 0) {
         if (!has_records and !has_partition_error) @memset(outcomes, .throttled);
-        const delay = if (opts.group != null) @min(throttle_ms, c.groupRemainingMs() catch 0) else throttle_ms;
+        var delay = if (opts.group != null) @min(throttle_ms, c.groupRemainingMs() catch 0) else throttle_ms;
+        if (opts.group == null) if (opts.fetch_idle_deadline) |deadline| {
+            const remaining = std.Io.Timestamp.now(c.io, .awake).durationTo(deadline).toMilliseconds();
+            delay = @min(delay, @as(u64, @intCast(@max(0, remaining))));
+        };
         c.sleep(delay);
+        if (opts.group == null) if (opts.fetch_idle_deadline) |deadline| {
+            if (std.Io.Timestamp.now(c.io, .awake).nanoseconds >= deadline.nanoseconds) return error.FetchIdleExpired;
+        };
     }
     return outcomes;
 }
