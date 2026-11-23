@@ -891,10 +891,6 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             break;
         };
         const failed = session.applyFetchOutcomes(parts.items, outcomes);
-        for (outcomes) |outcome| if (outcome == .offset_reset) {
-            leader_index = selected;
-            break;
-        };
         if (failed) c.dropNode(leader);
         try out.flush();
         if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;

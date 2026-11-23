@@ -73,12 +73,12 @@ class Handler(socketserver.StreamRequestHandler):
                     return
                 if api == 68 and broker.mode == "no-join-heartbeat":
                     return
-                split = broker.mode in ("healthy", "partition-bound", "follow-partition")
+                split = broker.mode in ("healthy", "partition-bound", "follow-partition", "reset-fair")
                 if api == 3 and split and broker.fetch_old_fault and not (broker.mode == "follow-partition" and time.monotonic() - broker.started >= 50):
                     return
                 if api == 1 and (broker.mode == "leader" or split):
                     broker.fetch_nodes.append(self.server.node)
-                    if self.server.node == 1 and not (broker.mode == "follow-partition" and time.monotonic() - broker.started >= 50):
+                    if self.server.node == 1 and broker.mode != "reset-fair" and not (broker.mode == "follow-partition" and time.monotonic() - broker.started >= 50):
                         broker.fetch_old_fault = True
                         time.sleep(1.1)
                         return
@@ -138,6 +138,8 @@ class Handler(socketserver.StreamRequestHandler):
                     response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ihqqi", self.server.node - 1 if split else 0, code, 0, 0, 0) + b"\x00\x00\x00"
                 elif api == 1:
                     fetch_code = 0
+                    if broker.mode == "reset-fair" and self.server.node == 1:
+                        fetch_code = 1
                     if broker.mode in ("reset", "reset-fail"):
                         broker.reset_started = broker.reset_started or time.monotonic()
                         broker.reset_fetches.append(time.monotonic())
@@ -147,7 +149,7 @@ class Handler(socketserver.StreamRequestHandler):
                     records = batch(1 if broker.delivered and broker.mode == "follow-fetch" else 0)
                     if split:
                         records = batch(broker.fetch_nodes.count(2) - 1)
-                        if broker.mode != "healthy" and broker.delivered and not (broker.mode == "follow-partition" and self.server.node == 1):
+                        if broker.mode not in ("healthy", "reset-fair") and broker.delivered and not (broker.mode == "follow-partition" and self.server.node == 1):
                             records = b""
                     if broker.delivered and broker.mode in ("commit-bound", "follow-commit"):
                         records = batch(1) if broker.mode == "follow-commit" and elapsed >= 50 else b""
@@ -169,7 +171,7 @@ class Handler(socketserver.StreamRequestHandler):
 def check(mode):
     with contextlib.ExitStack() as stack:
         broker = stack.enter_context(Broker(mode))
-        if mode in ("leader", "healthy", "partition-bound", "follow-partition"):
+        if mode in ("leader", "healthy", "partition-bound", "follow-partition", "reset-fair"):
             broker.secondary = stack.enter_context(Broker(mode, broker))
             threading.Thread(target=broker.secondary.serve_forever, daemon=True).start()
         threading.Thread(target=broker.serve_forever, daemon=True).start()
@@ -247,6 +249,9 @@ def check(mode):
             assert time.monotonic() - broker.reset_started >= 50
             assert len(broker.reset_fetches) > 500, len(broker.reset_fetches)
             assert "recovery ongoing" not in result.stderr, result.stderr
+        elif mode == "reset-fair":
+            assert broker.fetch_nodes == [1, 2], broker.fetch_nodes
+            assert rows[0]["partition"] == 1, rows
         elif mode in ("adoption", "metadata", "offsets"):
             assert len(broker.beats) >= 8, (mode, broker.beats)
             assert max(b - a for a, b in zip(broker.beats, broker.beats[1:])) < 2, (mode, broker.beats)
@@ -255,4 +260,4 @@ def check(mode):
 
 
 with concurrent.futures.ThreadPoolExecutor() as pool:
-    list(pool.map(check, sys.argv[2:] or ("leader", "healthy", "partition-bound", "reset", "reset-fail", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-partition", "follow-coordinator", "no-join", "no-join-heartbeat", "follow-join")))
+    list(pool.map(check, sys.argv[2:] or ("leader", "healthy", "partition-bound", "reset", "reset-fail", "reset-fair", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-partition", "follow-coordinator", "no-join", "no-join-heartbeat", "follow-join")))
