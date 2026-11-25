@@ -2,7 +2,16 @@
 #   mkdir -p ~/.config/fish/completions && cp completions/kite.fish ~/.config/fish/completions/
 
 # First word: the commands (plus the p/c aliases).
-complete -c kite -n 'test (count (commandline -opc)[2..-1]) -eq 0' -f -a 'produce p consume c cluster topic update'
+complete -c kite -n 'test (count (commandline -opc)[2..-1]) -eq 0' -f -a 'produce p consume c cluster topic group update'
+
+complete -c kite -n '__fish_seen_subcommand_from group' -s b -l bootstrap -x
+complete -c kite -n '__fish_seen_subcommand_from group' -l config -rF
+complete -c kite -n '__fish_seen_subcommand_from group' -l json -d 'JSON output'
+complete -c kite -n '__fish_seen_subcommand_from group' -s q -l quiet
+complete -c kite -n '__fish_seen_subcommand_from group' -s v -l verbose
+complete -c kite -n '__fish_seen_subcommand_from group' -s h -l help
+complete -c kite -n '__fish_seen_subcommand_from group; and not __fish_seen_subcommand_from list describe' -f -a 'list describe'
+complete -c kite -n '__fish_seen_subcommand_from group; and __fish_seen_subcommand_from list' -s a -l all -d 'Include classic groups'
 
 # Cluster names from kite.yaml for @NAME positionals.
 complete -c kite -f -a '(begin; test -f kite.yaml; and awk "/^clusters:/{f=1;next} f&&/^[^ ]/{f=0} f&&/^  [A-Za-z0-9_-]+:/{sub(/^  /,\"@\");sub(/:.*/,\"\");print}" kite.yaml | sort -u; end)'
@@ -24,6 +33,7 @@ complete -c kite -n '__fish_seen_subcommand_from produce p' -l csv -d 'Read RFC 
 complete -c kite -n '__fish_seen_subcommand_from produce p' -l key -d 'Use CSV column as record key' -x
 
 # consume only.
+complete -c kite -n '__fish_seen_subcommand_from consume c' -s g -l group -d 'Join consumer group' -x
 complete -c kite -n '__fish_seen_subcommand_from consume c' -s B -l from-beginning -d 'Start at earliest offset'
 complete -c kite -n '__fish_seen_subcommand_from consume c' -l offset -d 'Start at offset N' -x
 complete -c kite -n '__fish_seen_subcommand_from consume c' -l partition -d 'Read one partition' -x

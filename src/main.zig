@@ -157,6 +157,7 @@ pub fn main(init: std.process.Init) !void {
             runTopic(init, command_args.rest, alloc);
             return;
         },
+        .group => runGroup(init, command_args.rest, alloc),
         .update => runUpdate(init, command_args.rest, alloc),
         .produce => {},
     }
@@ -709,6 +710,8 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     installSignalHandlers();
     const consumed = consumer.run(&cli, .{
         .topic = topic_name,
+        .group = consume.group,
+        .follow = consume.follow,
         .start = consume.start,
         .offset = consume.offset,
         .partition = consume.partition,
@@ -728,6 +731,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
             fatal("cannot write stdout: {s}", .{@errorName(write_err)});
         },
         error.FetchFailed => fatalErr(&cli, "consume failed"),
+        error.FinalCommitFailed => fatalErr(&cli, "final commit failed"),
         else => fatalErr(&cli, "consume failed"),
     };
     stdout.flush() catch |err| switch (err) {
@@ -967,6 +971,143 @@ fn updateErr(cli: *client.Client, alloc: std.mem.Allocator, name: []const u8, er
         error.TopicAuthorizationFailed => fatal("{s}", .{cli_args.errCat(alloc, &.{ "not authorized to alter topic '", name, "' (check ACLs for this principal)" })}),
         else => fatalErr(cli, "could not update topic"),
     }
+}
+
+fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.Allocator) noreturn {
+    const opts = switch (cli_args.parseGroup(alloc, args)) {
+        .help => {
+            showHelpPage(init, alloc, cli_args.group_help);
+            std.process.exit(0);
+        },
+        .err => |m| parseFatal(init, m, cli_args.group_usage),
+        .ok => |v| v,
+    };
+    var cfg = loadConfig(init, alloc, opts.common, &dummy_source);
+    var c = client.Client.init(alloc, init.io, init.environ_map, &cfg);
+    c.bootstrap() catch fatalErr(&c, "could not reach any bootstrap server");
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(init.io, &buf);
+    const outw = &writer.interface;
+    const as_json = opts.common.format == .json;
+    const tty = std.Io.File.stdout().isTty(init.io) catch false;
+    if (opts.action == .list) {
+        const groups = c.listGroups(alloc, opts.all) catch fatalErr(&c, "could not list groups");
+        if (!as_json and tty) outw.writeAll("GROUP\tSTATE\n") catch {};
+        for (groups) |g| {
+            if (as_json) {
+                outw.writeAll("{\"group\":") catch {};
+                json.writeString(outw, g.group) catch {};
+                outw.writeAll(",\"state\":") catch {};
+                json.writeString(outw, g.state) catch {};
+                outw.writeAll(",\"type\":") catch {};
+                json.writeString(outw, g.group_type) catch {};
+                outw.writeAll("}\n") catch {};
+            } else outw.print("{s}\t{s}\n", .{ g.group, g.state }) catch {};
+        }
+        outw.flush() catch {};
+        if (!opts.common.quiet) note("{d} group(s)", .{groups.len});
+        std.process.exit(0);
+    }
+    const group = opts.group.?;
+    const described = c.describeGroup(alloc, group) catch |err| switch (err) {
+        error.GroupNotFound => classic: {
+            const groups = c.listCoordinatorGroups(alloc, group) catch fatalErr(&c, "could not describe classic group");
+            for (groups) |g| {
+                if (std.mem.eql(u8, g.group, group)) break :classic protocol.DescribedGroup{ .code = .none, .message = null, .group = group, .state = g.state, .partitions = &.{} };
+            }
+            fatalErr(&c, "could not describe group");
+        },
+        else => fatalErr(&c, "could not describe group"),
+    };
+    const fetched = c.fetchGroupOffsets(alloc, .{ .group = group }) catch fatalErr(&c, "could not fetch group offsets");
+    const Row = struct { topic: []const u8, partition: i32, committed: i64 = -1, member: []const u8 = "", client_id: []const u8 = "" };
+    var rows: std.ArrayList(Row) = .empty;
+    for (fetched.offsets) |p| rows.append(alloc, .{ .topic = p.topic, .partition = p.partition, .committed = p.offset }) catch oom();
+    for (described.partitions) |p| {
+        var found = false;
+        for (rows.items) |*r| {
+            if (r.partition == p.partition and std.mem.eql(u8, r.topic, p.topic)) {
+                r.member = p.member_id;
+                r.client_id = p.client_id;
+                found = true;
+            }
+        }
+        if (!found) rows.append(alloc, .{ .topic = p.topic, .partition = p.partition, .member = p.member_id, .client_id = p.client_id }) catch oom();
+    }
+    std.mem.sort(Row, rows.items, {}, struct {
+        fn less(_: void, a: Row, b: Row) bool {
+            const order = std.mem.order(u8, a.topic, b.topic);
+            return order == .lt or (order == .eq and a.partition < b.partition);
+        }
+    }.less);
+    if (!as_json and tty) outw.writeAll("GROUP\tTOPIC\tPARTITION\tCOMMITTED\tEND\tLAG\tMEMBER_ID\tCLIENT_ID\n") catch {};
+    var i: usize = 0;
+    while (i < rows.items.len) {
+        const topic = rows.items[i].topic;
+        const available = if (c.refreshMetadata(topic)) |_| true else |err| switch (err) {
+            error.TopicNotFound => false,
+            else => fatalErr(&c, "could not resolve topic"),
+        };
+        const cursors = alloc.alloc(consumer.Cursor, if (available) c.partitions.items.len else 0) catch oom();
+        if (available) for (c.partitions.items, cursors) |p, *cursor| {
+            cursor.* = .{ .pidx = p.index, .leader = p.leader, .offset = -1 };
+        };
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        if (available) consumer.listOffsets(&c, &arena, topic, cursors, .latest) catch fatalErr(&c, "could not fetch end offsets");
+        while (i < rows.items.len and std.mem.eql(u8, topic, rows.items[i].topic)) : (i += 1) {
+            const r = rows.items[i];
+            var end: ?i64 = null;
+            for (cursors) |cursor| if (cursor.pidx == r.partition) {
+                end = cursor.offset;
+            };
+            if (end == null) note("warning: {s}/{d} no longer exists; end and lag unavailable", .{ topic, r.partition });
+            if (end) |latest| {
+                if (r.committed > latest) note("warning: {s}/{d} committed offset exceeds end; lag clamped to 0", .{ topic, r.partition });
+            }
+            const lag = groupLag(r.committed, end);
+            if (as_json) {
+                outw.writeAll("{\"group\":") catch {};
+                json.writeString(outw, group) catch {};
+                outw.writeAll(",\"topic\":") catch {};
+                json.writeString(outw, topic) catch {};
+                outw.print(",\"partition\":{d},\"committed\":", .{r.partition}) catch {};
+                if (r.committed < 0) outw.writeAll("null") catch {} else outw.print("{d}", .{r.committed}) catch {};
+                outw.writeAll(",\"end\":") catch {};
+                if (end) |latest| outw.print("{d}", .{latest}) catch {} else outw.writeAll("null") catch {};
+                outw.writeAll(",\"lag\":") catch {};
+                if (lag) |value| outw.print("{d}", .{value}) catch {} else outw.writeAll("null") catch {};
+                outw.writeAll(",\"member_id\":") catch {};
+                json.writeString(outw, r.member) catch {};
+                outw.writeAll(",\"client_id\":") catch {};
+                json.writeString(outw, r.client_id) catch {};
+                outw.writeAll("}\n") catch {};
+            } else {
+                outw.print("{s}\t{s}\t{d}\t", .{ group, topic, r.partition }) catch {};
+                if (r.committed < 0) outw.writeByte('-') catch {} else outw.print("{d}", .{r.committed}) catch {};
+                outw.writeByte('\t') catch {};
+                if (end) |latest| outw.print("{d}", .{latest}) catch {} else outw.writeByte('-') catch {};
+                outw.writeByte('\t') catch {};
+                if (lag) |value| outw.print("{d}", .{value}) catch {} else outw.writeByte('-') catch {};
+                outw.print("\t{s}\t{s}\n", .{ if (r.member.len == 0) "-" else r.member, if (r.client_id.len == 0) "-" else r.client_id }) catch {};
+            }
+        }
+    }
+    outw.flush() catch {};
+    if (!opts.common.quiet) note("{s}: {s}, {d} partition(s)", .{ group, described.state, rows.items.len });
+    std.process.exit(0);
+}
+
+fn groupLag(committed: i64, end: ?i64) ?i64 {
+    if (committed < 0) return null;
+    return @max(0, (end orelse return null) - committed);
+}
+
+test "group lag handles missing and truncated offsets" {
+    try std.testing.expectEqual(@as(?i64, 3), groupLag(2, 5));
+    try std.testing.expectEqual(@as(?i64, 0), groupLag(8, 5));
+    try std.testing.expect(groupLag(-1, 5) == null);
+    try std.testing.expect(groupLag(2, null) == null);
 }
 
 /// `kite topic [list|create|delete|update]`: topic administration over the

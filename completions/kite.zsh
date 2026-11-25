@@ -34,13 +34,14 @@ _kite() {
         _arguments -s \
             '(-V --version)'{-V,--version}'[print version]' \
             '(-h --help)'{-h,--help}'[show help]' \
-            '1:command:(produce p consume c cluster topic update)'
+            '1:command:(produce p consume c cluster topic group update)'
         return
     fi
 
     case "$words[2]" in
         consume | c)
             _arguments -s $shared \
+                '(-g --group)'{-g,--group}'[join consumer group]:group:' \
                 '(-B --from-beginning)'{-B,--from-beginning}'[start at earliest offset]' \
                 '--offset[start at offset N]:offset:' \
                 '--partition[read one partition]:partition:' \
@@ -75,6 +76,15 @@ _kite() {
             ;;
         update)
             _arguments -s '(-h --help)'{-h,--help}'[show help]'
+            ;;
+        group)
+            if (( CURRENT == 3 )); then
+                _arguments -s '1:action:(list describe)'
+            elif [[ "$words[3]" == list ]]; then
+                _arguments -s $shared '(-a --all)'{-a,--all}'[include classic groups]' '*:arg:_kite_at_targets'
+            else
+                _arguments -s $shared '*:arg:_kite_at_targets'
+            fi
             ;;
         topic)
             if (( CURRENT == 3 )); then

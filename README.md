@@ -27,7 +27,7 @@
 
 <p>
   <strong>kite is an ultra-lightweight Kafka CLI built for agents and sandboxes.</strong><br>
-  One binary under 700 KB, no JVM, no runtime, no daemon. stdin in, stdout out,
+  One binary under 1 MB, no JVM, no runtime, no daemon. stdin in, stdout out,
   non-zero exit on failure.
 </p>
 </div>
@@ -48,9 +48,8 @@ topic — or list, create, delete, and update topics — from a shell, a
 script, a container, or an agent tool call, and you want one small static
 binary with no JVM, no librdkafka, and no daemon.
 
-**Do not use kite when** you need consumer-group administration, offset
-commits, or ACLs, or a long-lived consumer group member; use your Kafka
-admin tooling or a client library for those.
+**Do not use kite when** you need consumer-group offset resets/deletion, ACLs,
+or a full application framework; use Kafka admin tooling or a client library.
 
 **Need schemas?** kite moves bytes and never talks to Schema Registry. Its
 companion [wing](https://github.com/addisonhuddy/wing) validates and decodes
@@ -103,7 +102,7 @@ See [Troubleshooting](#troubleshooting) if the roundtrip does not print
 If you are an agent reading this (or a human who also likes Kafka), here's
 why I think you will love kite.
 
-- **Small.** The stripped binary is under 700 KB (CI-gated by
+- **Small.** The stripped binary is under 1 MB (1,000,000 bytes; CI-gated by
   `scripts/check-size.sh`). It fits in a container layer, a
   sandbox, or a tool call without anyone noticing.
 - **Unix philosophy.** kite does one thing per invocation and composes with
@@ -119,8 +118,8 @@ why I think you will love kite.
   stderr with exit code 1 and a `Try 'kite --help'` hint. Help pages are
   plain text, ≤ 80 columns, no ANSI unless stderr is a terminal.
 
-kite is not a full Kafka admin tool: it never manages consumer groups or
-commits offsets, but it does manage topics (`kite topic`). When producing
+kite is not a full Kafka admin tool: it supports group consumption and lag
+inspection, but not group resets/deletion or ACLs. When producing
 to a topic that does not exist it offers to create it — prompting on a
 terminal, creating automatically in scripts and pipes — with the broker's
 default partition count and replication factor. Consume never creates a
@@ -132,7 +131,7 @@ kite is optimized for the case where a program, not a person, is on the
 other end of the pipe: a shell script, a CI step, a container entrypoint, or
 an AI agent's tool call. That shapes every design choice:
 
-- **Zero-dependency install.** One static binary under 700 KB, fetched with
+- **Zero-dependency install.** One static binary under 1 MB, fetched with
   `curl` and verified against `SHA256SUMS`. Nothing to apt-get, brew, or
   build; nothing that needs a JVM or a shared library at runtime.
 - **Bounded by default.** A piped consume with no `-n`, `--idle`, or `-f`
@@ -147,9 +146,8 @@ an AI agent's tool call. That shapes every design choice:
 - **Safe defaults.** Idempotent, batched producing; bounded consuming;
   no writes to disk; no connections other than to the brokers you name.
 
-What it deliberately leaves out: consumer-group administration, offset
-commits, ACLs, and every knob that is not needed to move records or manage
-topics.
+What it deliberately leaves out: consumer-group resets/deletion, ACLs, and
+application-framework features not needed to move records or manage topics.
 
 ## For AI agents
 
@@ -184,7 +182,8 @@ the facts you need. They are stable across releases.
   success, `1` on any error with a single-line `kite: MESSAGE`, `130` on
   Ctrl-C. No interactive prompts, no color when stdout/stderr is not a TTY,
   no config written to disk, no network calls other than to the brokers.
-- **Does not:** join consumer groups, commit offsets, or manage ACLs.
+- **Does:** join consumer groups and commit stdout-flushed offsets with `consume -g`.
+- **Does not:** reset/delete consumer groups or manage ACLs.
   Produce creates a missing topic (automatically when not on a TTY); consume
   never does.
 
@@ -376,6 +375,78 @@ kite topic delete -y --if-exists gone
 Delete confirms on a terminal; when stderr is not a terminal it refuses
 unless `-y`/`--yes` is given. `list` writes topic names (or JSON lines) to
 stdout; all notes go to stderr.
+
+## Consumer groups
+
+```sh
+kite group list @prod
+kite group list --all --json  # include classic groups
+kite group describe orders --json
+kite consume -g orders -B events
+```
+
+`group list` queries every broker and lists consumer-protocol groups by default.
+`group describe` supports consumer-protocol and classic groups. It prints
+one row per assigned or committed partition with `group`, `topic`, `partition`,
+`committed`, `end`, `lag`, `member_id`, and `client_id`. Output is tab-separated
+(with a header on terminals), or one JSON object per partition with `--json`.
+Missing commits and lag appear as `-` (JSON `null`); unassigned partitions have
+empty member/client IDs in JSON. These commands are read-only, accept common
+connection flags and `@CLUSTER`, and do not change consumer offsets. Lag is a
+snapshot: producing or committing concurrently can change it during the query.
+Classic groups show offsets and lag without member/client IDs. Deleted topics
+or partitions retain committed offsets but show unavailable end/lag (`-`, or
+JSON null). Negative lag after truncation is clamped to zero with a warning.
+Lag uses the high watermark (`read_uncommitted`), like the stock tools, not
+the last stable offset used by `read_committed` consumers. Group listing warns
+and returns partial results when some brokers are unreachable.
+
+`consume -g GROUP` (or `--group GROUP`) joins a Kafka 4.0 consumer-protocol
+group and shares partitions with its other members. It resumes committed
+offsets; `-B` selects earliest only for partitions without a commit, otherwise
+new groups start at latest. `--offset` and `--partition` cannot be used with
+groups. Without `-g`, consuming remains independent and does not commit.
+
+Offsets are committed after successful stdout flushes, at most once per second
+(and always on revoke or exit), using the fetch position or the last emitted
+offset plus one when `-n` stops mid-batch. **A commit means the record reached
+stdout, not that
+the downstream reader processed it.** Output errors do not commit the failed
+round; a crash can replay records (at-least-once delivery). `-n` commits only
+the records emitted within the limit. On idle, SIGINT, or reaching `-n`, kite
+commits flushed progress and leaves the group; on broken pipe it leaves without
+committing the failed round. SIGINT still exits 130.
+
+Group idle time excludes joining and the initial position-resolution pass. Each
+ready partition gets an initial fetch before an idle exit; unresolved partitions
+remain under their outage deadlines. A member assigned zero partitions exits after
+that idle window unless `--follow` is used. `-v` logs joins, assignments, and
+commits. Heartbeats run between fetches; no background process is started.
+The stdout reader must drain within the broker's group session timeout (45s
+by default). A slower reader can cause fencing and replay of uncommitted records.
+Network lookups and retries yield to the next heartbeat; unfinished assignments
+resume after it. With `--follow`, coordinator and broker outages are retried with
+backoff indefinitely, with a periodic stderr warning. kite rejoins if the broker
+expired its membership. Failed commits pause fetching under `--follow` until the
+flushed offsets are committed, while heartbeats and commit retries continue.
+Without `--follow`, recovery stops at the idle timeout
+(if set), or after a session-sized recovery budget. Group membership, each
+partition's leader outage, and pending commits have independent budgets. Only a
+fully initialized heartbeat clears membership recovery; only fetching the affected
+partition clears its outage. Newly assigned partitions resolve starting positions
+before fetching: one OffsetFetch batch, then ListOffsets batches by leader.
+Unresolved partitions retry one leader batch per round, using the remaining
+heartbeat window without splitting it between leaders. Progress survives rounds,
+and ready partitions get a fetch turn between retries.
+Revocations take effect after the commit attempt, without waiting for additions.
+Revocation drops that partition's outage, and a
+successful commit or discarded pending offsets clears commit recovery.
+Recovery stops attempt one bounded final commit of flushed progress. An idle
+stop exits 0 if the commit is confirmed, otherwise 1 with a replay warning.
+Exhausting any recovery budget without `--follow` exits 1 with the replay warning,
+even if the final best-effort commit succeeds.
+If bounded recovery ends before kite has ever joined the group, it exits 1 with
+a join failure rather than reporting a successful empty read.
 
 ## Common recipes
 
@@ -780,7 +851,7 @@ pipe.
 - `KITE_DEBUG=1` enables frame and TLS diagnostics.
 - `KITE_TIME=1` prints producer timing totals and connection count.
 
-The default stripped binary is under 700 KB (CI-gated by
+The default stripped binary is under 1 MB (CI-gated by
 `scripts/check-size.sh`).
 `scripts/pack.sh` can produce an optional UPX/LZMA artifact of about 200 KiB.
 
@@ -998,14 +1069,16 @@ by either kite or wing.
 No. kite is one static binary with no runtime dependencies.
 
 **How big is kite and how fast does it start?**
-The stripped binary is under 700 KB (CI-gated) and starts in milliseconds.
+The stripped binary is under 1 MB (CI-gated) and starts in milliseconds.
 
 **Can kite create topics or manage consumer groups?**
 `kite produce` creates a missing topic — after a y/N prompt on a terminal,
 automatically from a script or pipe (a broker policy or missing ACL can
 refuse). Declining the prompt exits 1 without creating it. `kite consume`
-never creates topics. kite does not delete or reconfigure topics, join
-consumer groups, or commit offsets; each consume run is stateless.
+never creates topics. `kite topic` lists, creates, deletes, and updates topics.
+`kite consume -g GROUP` joins a group and commits flushed stdout progress;
+`kite group list` and `describe` inspect groups and lag. Without `-g`, consume
+does not join a group or commit offsets. Group reset/deletion is not supported.
 
 **Is kite safe to call from an AI agent or CI job?**
 Yes: it never prompts, never hangs in a pipe, writes data only to stdout and

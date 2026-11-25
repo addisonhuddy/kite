@@ -1,13 +1,17 @@
 # kite
 
-> kite is a single-binary, dependency-free Kafka CLI (under 700 KB, written in Zig) that produces stdin lines to a topic and consumes a topic to stdout. It is built for scripts, containers, CI, and AI agents: no JVM, no librdkafka, no daemon, no prompts, and piped reads terminate on idle by default.
+> kite is a single-binary, dependency-free Kafka CLI (under 1 MB, written in Zig) that produces stdin lines to a topic and consumes a topic to stdout. It is built for scripts, containers, CI, and AI agents: no JVM, no librdkafka, no daemon, no prompts, and piped reads terminate on idle by default.
+
+Consumer groups (Kafka 4.0): `kite group list [--all] [--json]` lists consumer groups on every broker (`--all` includes classic groups), warning on partial results. `kite group describe GROUP [--json]` shows group/topic/partition/committed/end/lag/member_id/client_id; classic groups show offsets only, with empty member/client IDs. Missing commits or unavailable end/lag are `-` in TSV, null in JSON. Lag is clamped to zero after truncation and measured against the high watermark (read_uncommitted). Both commands accept @CLUSTER and common flags. These commands do not modify group offsets.
 
 Repository: https://github.com/addisonhuddy/kite
 License: Apache-2.0
 Platforms: Linux x86_64/aarch64, macOS x86_64/arm64
 Brokers: any Kafka-protocol broker (Apache Kafka, Confluent Cloud, Redpanda, Amazon MSK with SASL/SCRAM, Aiven, WarpStream)
 Security: PLAINTEXT, SSL, SASL_SSL, SASL_PLAINTEXT; SASL PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
-Scope: produce, consume, and topic management (list/create/delete/update). kite does not join consumer groups, commit offsets, manage ACLs, or administer clusters.
+Scope: produce, consume, topic management (list/create/delete/update), consumer group consumption and inspection. kite does not reset/delete groups, manage ACLs, or administer clusters.
+
+`kite consume -g GROUP TOPIC` / `--group GROUP` joins a Kafka 4.0 consumer-protocol group, shares partitions, resumes commits, and commits the flushed fetch position (last emitted + 1 when -n stops mid-batch). Commits have a 1s floor, bypassed on revoke/exit. `-B` applies only without an existing commit; otherwise a new partition starts at latest. Conflicts: --offset, --partition. A commit means stdout accepted the record, NOT that the downstream reader processed it. Drain stdout within the session timeout (45s default) to avoid fencing/replay. Failed output rounds are not committed; crashes can replay records. Idle/-n/SIGINT commit flushed progress and leave; broken pipe leaves without committing the failed round. Group idle starts at the first assignment heartbeat, including an empty assignment; zero-partition members exit after the idle window unless --follow. Without -g consume remains independent and never commits. -v logs joins/assignments/commits.
 
 ## Install
 

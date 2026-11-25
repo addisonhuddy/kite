@@ -31,6 +31,7 @@ pub const ProduceArgs = struct {
 
 pub const ConsumeArgs = struct {
     topic: []const u8,
+    group: ?[]const u8 = null,
     common: Common = .{},
     start: consumer.Options.Start = .latest,
     offset: i64 = 0,
@@ -55,6 +56,7 @@ pub const Command = enum {
     consume,
     cluster,
     topic,
+    group,
     update,
 };
 
@@ -65,6 +67,103 @@ pub const ClusterArgs = struct {
     name: ?[]const u8 = null,
     common: Common = .{},
 };
+
+pub const GroupArgs = struct {
+    action: enum { list, describe } = .list,
+    group: ?[]const u8 = null,
+    all: bool = false,
+    common: Common = .{},
+};
+
+pub const group_usage = "Usage: kite group [list|describe GROUP] [--json] [OPTIONS] [@CLUSTER]\n" ++
+    "Try 'kite group --help' for examples.\n";
+
+pub const group_help =
+    "kite group - List consumer groups and describe partition lag\n\n" ++
+    group_usage ++ "\n" ++
+    "  kite group list [--all]       List consumer groups on every broker.\n" ++
+    "  kite group describe GROUP     Show committed offsets, end offsets, lag, and members.\n\n" ++
+    "  --json                        One JSON object per group or partition.\n" ++
+    "  -a, --all                     Include classic groups (list only).\n" ++
+    "  -b, --bootstrap HOST:PORT     Bootstrap broker(s).\n" ++
+    "  --config PATH                 Kafka properties file.\n" ++
+    "  -q, --quiet                   Suppress summary.\n" ++
+    "  -v, --verbose                 Verbose diagnostics.\n" ++
+    "  -h, --help                    Show this help.\n\n" ++
+    "Examples:\n  kite group list @prod --json\n  kite group describe orders\n\n" ++
+    "Describe shows offsets only for classic groups (member/client IDs are empty).\n" ++
+    "A missing commit is shown as '-' (JSON null), including lag.\n";
+
+pub fn parseGroup(alloc: std.mem.Allocator, args: []const []const u8) Result(GroupArgs) {
+    var parsed: GroupArgs = .{};
+    var action_seen = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return .help;
+        if (parseCommon(alloc, &parsed.common, args, &i)) |step| {
+            switch (step) {
+                .ok => continue,
+                .err => |m| return .{ .err = m },
+            }
+        }
+        if (std.mem.eql(u8, arg, "--all") or std.mem.eql(u8, arg, "-a")) {
+            parsed.all = true;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return .{ .err = unknownOption(alloc, .group, arg) };
+        } else if (!action_seen) {
+            if (std.mem.eql(u8, arg, "list")) {
+                parsed.action = .list;
+            } else if (std.mem.eql(u8, arg, "describe")) {
+                parsed.action = .describe;
+            } else return errorResult(GroupArgs, alloc, "unknown group action '{s}' (want list or describe)", .{arg});
+            action_seen = true;
+        } else if (parsed.action == .describe and parsed.group == null) {
+            if (arg.len == 0) return .{ .err = "GROUP must not be empty" };
+            parsed.group = arg;
+        } else return errorResult(GroupArgs, alloc, "unexpected argument '{s}'", .{arg});
+    }
+    if (parsed.action == .describe and parsed.group == null) return .{ .err = "missing GROUP" };
+    if (parsed.action == .describe and parsed.all) return .{ .err = "--all is only valid for group list" };
+    if (parsed.common.format != .auto and parsed.common.format != .json and parsed.common.format != .tsv)
+        return .{ .err = "group supports --json or --format tsv" };
+    if (finishCommon(parsed.common)) |m| return .{ .err = m };
+    return .{ .ok = parsed };
+}
+
+test "group parser actions flags and cluster selector" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const list = parseGroup(a, &.{ "list", "--all", "--json", "@prod", "-b", "localhost:9092" }).ok;
+    try std.testing.expect(list.all);
+    try std.testing.expectEqual(Format.json, list.common.format);
+    try std.testing.expectEqualStrings("prod", list.common.target.?);
+    const desc = parseGroup(a, &.{ "@prod", "describe", "g" }).ok;
+    try std.testing.expectEqualStrings("g", desc.group.?);
+    try std.testing.expect(parseGroup(a, &.{}).ok.action == .list);
+    try std.testing.expect(parseGroup(a, &.{ "describe", "--help" }) == .help);
+    for ([_][]const []const u8{
+        &.{"describe"},                 &.{ "describe", "" }, &.{ "list", "g" },  &.{ "describe", "g", "extra" },
+        &.{ "describe", "g", "--all" }, &.{"delete"},         &.{"--bogus"},      &.{ "-q", "-v" },
+        &.{ "--format", "csv" },        &.{ "@a", "@b" },     &.{"--bootstrap="},
+    }) |args| try std.testing.expect(parseGroup(a, args) == .err);
+    try std.testing.expectEqual(Command.group, splitCommand(a, &.{ "group", "list" }).ok.command);
+}
+
+test "consume group flags and conflicts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const []const u8{ &.{ "-g", "g", "t" }, &.{ "--group=g", "t" }, &.{ "--group", "g", "-B", "t" } }) |args| {
+        try std.testing.expectEqualStrings("g", parseConsume(a, args).ok.group.?);
+    }
+    for ([_][]const []const u8{
+        &.{ "-g", "g", "--offset=0", "t" },    &.{ "--offset", "0", "--group=g", "t" },
+        &.{ "-g", "g", "--partition=0", "t" }, &.{ "--partition", "0", "-g", "g", "t" },
+        &.{ "--group=", "t" },                 &.{"-g"},
+    }) |args| try std.testing.expect(parseConsume(a, args) == .err);
+}
 
 pub const TopicAction = enum { list, create, delete, update };
 
@@ -95,6 +194,7 @@ pub const CommandSplit = struct {
 };
 
 fn matchCommand(arg: []const u8) ?Command {
+    if (std.mem.eql(u8, arg, "group")) return .group;
     if (std.mem.eql(u8, arg, "produce") or std.mem.eql(u8, arg, "p")) return .produce;
     if (std.mem.eql(u8, arg, "consume") or std.mem.eql(u8, arg, "c")) return .consume;
     if (std.mem.eql(u8, arg, "cluster")) return .cluster;
@@ -103,7 +203,7 @@ fn matchCommand(arg: []const u8) ?Command {
     return null;
 }
 
-const command_names = [_][]const u8{ "produce", "consume", "cluster", "topic", "update" };
+const command_names = [_][]const u8{ "produce", "consume", "cluster", "topic", "group", "update" };
 
 /// Closest command name when exactly one is within distance 2.
 fn suggestCommand(name: []const u8) ?[]const u8 {
@@ -143,7 +243,7 @@ pub fn splitCommand(alloc: std.mem.Allocator, args: []const []const u8) Result(C
         return .{ .err = firstArgError(alloc, arg) };
     }
     if (want_help) return .help;
-    return .{ .err = "missing command (want produce, consume, cluster, or topic)" };
+    return .{ .err = "missing command (want produce, consume, cluster, topic, or group)" };
 }
 
 /// Migration errors for the 0.1 flag-mode spellings and the removed
@@ -201,6 +301,8 @@ pub const overview_help =
     "  kite consume [OPTIONS] [@CLUSTER] TOPIC   Read TOPIC to stdout.\n" ++
     "  kite topic [ACTION] [OPTIONS] [@CLUSTER] [TOPIC...]\n" ++
     "                                            List, create, delete, update topics.\n" ++
+    "  kite group [list|describe GROUP] [OPTIONS] [@CLUSTER]\n" ++
+    "                                            List groups and inspect lag.\n" ++
     "  kite cluster [list|set NAME|init]         Pick or set the current cluster.\n" ++
     "  kite update [VERSION]                     Install the latest kite release.\n" ++
     "  kite --help                               Show this help.\n" ++
@@ -274,6 +376,8 @@ pub const consume_help =
     "  @NAME                 Use cluster NAME from kite.yaml for this\n" ++
     "                        run only (also $KITE_TARGET).\n" ++
     "  -B, --from-beginning  Start at the earliest available offset.\n" ++
+    "  -g, --group GROUP     Join a consumer group and commit flushed records.\n" ++
+    "                        Cannot be combined with --offset or --partition.\n" ++
     "  --offset N            Start at offset N in each selected partition.\n" ++
     "                        Cannot be combined with --from-beginning.\n" ++
     "  --partition P         Read partition P only (default: all partitions).\n" ++
@@ -298,6 +402,13 @@ pub const consume_help =
     "By default, start at the latest offset. When stdout is a terminal the read\n" ++
     "follows new records until Ctrl-C; when stdout is a pipe or file and none of\n" ++
     "--max, --idle, or --follow is given, the read stops after 5s idle.\n" ++
+    "With --group, resume committed offsets; -B applies only without a commit.\n" ++
+    "Group idle time starts with the first assignment heartbeat, including an\n" ++
+    "empty assignment; a member with zero partitions exits after that window.\n" ++
+    "Commits mean records reached stdout, not that a downstream reader processed\n" ++
+    "them. Failed output is not committed; records may be replayed after a crash.\n" ++
+    "Drain stdout within the group session timeout (45s default), or the broker\n" ++
+    "may fence this member and replay uncommitted records.\n" ++
     "\n" ++
     "Examples:\n" ++
     "  kite consume events\n" ++
@@ -515,10 +626,10 @@ pub fn parseHeaderArg(s: []const u8) !protocol.Header {
 }
 
 const produce_only = [_][]const u8{ "-H", "--csv", "--key" };
-const consume_only = [_][]const u8{ "-B", "--from-beginning", "--offset", "--partition", "-n", "--max", "-t", "--idle", "-f", "--follow" };
+const consume_only = [_][]const u8{ "-g", "--group", "-B", "--from-beginning", "--offset", "--partition", "-n", "--max", "-t", "--idle", "-f", "--follow" };
 
 const produce_options = [_][]const u8{ "--bootstrap", "--config", "--format", "--json", "--csv", "--key", "--quiet", "--verbose", "--help" };
-const consume_options = [_][]const u8{ "--bootstrap", "--config", "--from-beginning", "--offset", "--partition", "--max", "--idle", "--follow", "--format", "--json", "--quiet", "--verbose", "--help" };
+const consume_options = [_][]const u8{ "--bootstrap", "--config", "--group", "--from-beginning", "--offset", "--partition", "--max", "--idle", "--follow", "--format", "--json", "--quiet", "--verbose", "--help" };
 const cluster_options = [_][]const u8{ "--config", "--json", "--format", "--quiet", "--verbose", "--help" };
 const update_options = [_][]const u8{"--help"};
 const topic_options = [_][]const u8{ "--bootstrap", "--config", "--format", "--json", "--all", "--partitions", "--replication-factor", "--set", "--unset", "--yes", "--if-exists", "--if-not-exists", "--quiet", "--verbose", "--help" };
@@ -550,6 +661,7 @@ fn suggestOption(command: Command, name: []const u8) ?[]const u8 {
         .consume => &consume_options,
         .cluster => &cluster_options,
         .topic => &topic_options,
+        .group => &.{ "--bootstrap", "--config", "--json", "--all", "--quiet", "--verbose", "--help" },
         .update => &update_options,
     };
     var best: ?[]const u8 = null;
@@ -592,7 +704,7 @@ fn unknownOption(alloc: std.mem.Allocator, command: Command, arg: []const u8) []
             return errMsg(alloc, "'{s}' is a consume option; use 'kite consume [OPTIONS] TOPIC'", .{name}),
         .consume => if (isOneOf(name, &produce_only))
             return errMsg(alloc, "'{s}' is a produce option; use 'kite produce [OPTIONS] TOPIC'", .{name}),
-        .cluster, .topic, .update => {},
+        .cluster, .topic, .group, .update => {},
     }
     if (suggestOption(command, name)) |candidate|
         return errMsg(alloc, "unknown option '{s}' (did you mean '{s}'?)", .{ arg, candidate });
@@ -797,7 +909,12 @@ pub fn parseConsume(alloc: std.mem.Allocator, args: []const []const u8) Result(C
                 .ok => continue,
             }
         }
-        if (std.mem.eql(u8, arg, "-B") or std.mem.eql(u8, arg, "--from-beginning")) {
+        var group_value: ?[]const u8 = null;
+        if (optionValue(args, &i, &group_value, arg, "-g", "--group")) {
+            const value = group_value orelse return .{ .err = "--group requires a value" };
+            if (value.len == 0) return .{ .err = "--group must not be empty" };
+            parsed.group = value;
+        } else if (std.mem.eql(u8, arg, "-B") or std.mem.eql(u8, arg, "--from-beginning")) {
             if (parsed.start == .offset)
                 return errorResult(ConsumeArgs, alloc, "--offset cannot be combined with --from-beginning", .{});
             parsed.start = .earliest;
@@ -902,6 +1019,8 @@ pub fn parseConsume(alloc: std.mem.Allocator, args: []const []const u8) Result(C
 
     const topic_name = topic orelse return errorResult(ConsumeArgs, alloc, "missing TOPIC", .{});
     if (topic_name.len == 0) return errorResult(ConsumeArgs, alloc, "TOPIC must not be empty", .{});
+    if (parsed.group != null and parsed.start == .offset) return .{ .err = "--group cannot be combined with --offset" };
+    if (parsed.group != null and parsed.partition != null) return .{ .err = "--group cannot be combined with --partition" };
     if (parsed.follow and parsed.idle_ms != null)
         return errorResult(ConsumeArgs, alloc, "--follow cannot be combined with --idle", .{});
     if (parsed.common.format == .csv)
@@ -1297,7 +1416,7 @@ test "the first argument names the command" {
     // -h / --help with no command asks for the top-level overview.
     try std.testing.expectEqual(Result(CommandSplit).help, splitCommand(alloc, &.{"--help"}));
     try std.testing.expectEqual(Result(CommandSplit).help, splitCommand(alloc, &.{"-h"}));
-    try expectErr(CommandSplit, splitCommand(alloc, &.{}), "missing command (want produce, consume, cluster, or topic)");
+    try expectErr(CommandSplit, splitCommand(alloc, &.{}), "missing command (want produce, consume, cluster, topic, or group)");
 }
 
 test "update takes an optional release tag" {

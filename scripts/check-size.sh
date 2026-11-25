@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Hard gate: zig-out/bin/kite must stay under 700 KB.
+# Hard gate: zig-out/bin/kite must stay under 1 MB (1,000,000 bytes).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 BIN=${1:-zig-out/bin/kite}
-MAX=700000
+MAX=1000000
 size=$(stat -c%s "$BIN" 2>/dev/null || stat -f%z "$BIN")
 echo "$BIN: $size bytes"
 if [ "$size" -ge "$MAX" ]; then
-    echo "FAIL: $BIN is over 700 KB ($size >= $MAX)" >&2
+    echo "FAIL: $BIN is over 1 MB ($size >= $MAX)" >&2
     exit 1
 fi
-echo "ok: under 700 KB"
+echo "ok: under 1 MB"

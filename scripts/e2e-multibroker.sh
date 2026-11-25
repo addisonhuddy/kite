@@ -276,4 +276,56 @@ PY
 }
 run 07-offset-cursor offset_cursor
 run 08-idle-during-recovery python3 scripts/check-idle-recovery.py "$KITE"
+
+group_coordinator() {
+    local t=mb-group g coordinator found=0
+    cli topic create -p 6 -r 3 "$t"
+    fixture 60 | cli produce "$t"
+    for i in $(seq 1 12); do
+        g="mb-group-$i"
+        # Use only broker 1 as bootstrap, even though the coordinator may differ.
+        BOOTSTRAP_SERVERS=127.0.0.1:19092 cli consume -g "$g" -B -n 1 --idle 15s --json "$t" >"$LOG/09-group-first.jsonl"
+        admin kafka-consumer-groups.sh --bootstrap-server "$NAME-1:9092" --describe --state --group "$g" >"$LOG/09-group-state.txt"
+        coordinator=$(awk -v g="$g" '$1==g {for(i=2;i<=NF;i++) if($i ~ /^\([0-9]+\)$/) {gsub(/[()]/,"",$i); print $i; exit}}' "$LOG/09-group-state.txt")
+        [ -n "$coordinator" ]
+        if [ "$coordinator" != 1 ]; then found=1; break; fi
+    done
+    [ "$found" -eq 1 ]
+    echo "group $g coordinator is broker $coordinator (bootstrap broker 1)"
+    BOOTSTRAP_SERVERS=127.0.0.1:19092 cli consume -g "$g" -B --idle 3s --json "$t" >"$LOG/09-group-rest.jsonl"
+    cat "$LOG/09-group-first.jsonl" "$LOG/09-group-rest.jsonl" >"$LOG/09-group-all.jsonl"
+    verify "$LOG/09-group-all.jsonl" 60
+    BOOTSTRAP_SERVERS=127.0.0.1:19092 cli group describe "$g" --json >"$LOG/09-group-description.jsonl"
+    python3 - "$LOG/09-group-description.jsonl" <<'PY'
+import json,sys
+rows=[json.loads(s) for s in open(sys.argv[1])]
+assert len(rows)==6 and all(r['lag']==0 and not r['member_id'] for r in rows), rows
+PY
+}
+run 09-group-nonbootstrap-coordinator group_coordinator
+
+group_failover() {
+    local coordinator g pid deadline
+    g=$(awk 'NR==3 {print $1}' "$LOG/09-group-state.txt")
+    coordinator=$(awk 'NR==3 {for(i=2;i<=NF;i++) if($i ~ /^\([0-9]+\)$/) {gsub(/[()]/,"",$i); print $i}}' "$LOG/09-group-state.txt")
+    [ -n "$g" ] && [ -n "$coordinator" ]
+    BOOTSTRAP_SERVERS="127.0.0.1:$((19091 + coordinator))" cli consume -g "$g" -B -n 120 --idle 60s --json mb-group >"$LOG/10-group-recovered.jsonl" 2>"$LOG/10-group-recovered.err" &
+    pid=$!
+    deadline=$((SECONDS + 30))
+    until grep -q 'joined group' "$LOG/10-group-recovered.err"; do
+        kill -0 "$pid"
+        [ "$SECONDS" -lt "$deadline" ]
+        sleep 0.2
+    done
+    docker kill "$NAME-$coordinator" >/dev/null
+    fixture 120 0 60 | cli produce mb-group
+    wait "$pid"
+    cli group list --all --json >"$LOG/10-group-partial-list.jsonl" 2>"$LOG/10-group-partial-list.err"
+    cat "$LOG/09-group-all.jsonl" "$LOG/10-group-recovered.jsonl" >"$LOG/10-group-all.jsonl"
+    verify "$LOG/10-group-all.jsonl" 180
+    echo "recovered after killing bootstrap/coordinator broker $coordinator"
+    restore
+}
+run 10-group-bootstrap-coordinator-loss group_failover
+run 11-group-recovery-heartbeats python3 scripts/check-group-recovery.py "$KITE"
 exit "$status"
