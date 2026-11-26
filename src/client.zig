@@ -1463,7 +1463,16 @@ pub const Client = struct {
             if (commit) if (stop) |s| if (s.load(.acquire)) {
                 return if (commit_in_flight) error.CommitOutcomeUnknown else error.Interrupted;
             };
-            const node = try c.findTxnCoordinator();
+            const node = c.findTxnCoordinator() catch |err| {
+                if (commit) if (stop) |s| if (s.load(.acquire)) {
+                    return if (commit_in_flight) error.CommitOutcomeUnknown else error.Interrupted;
+                };
+                if (commit_in_flight) {
+                    c.setErr("EndTxn (commit '{s}'): coordinator lookup failed (outcome unknown; broker may have committed)", .{txn_id});
+                    return error.ProduceFailed;
+                }
+                return err;
+            };
             if (commit) if (stop) |s| if (s.load(.acquire)) {
                 return if (commit_in_flight) error.CommitOutcomeUnknown else error.Interrupted;
             };
