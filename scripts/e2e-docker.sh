@@ -354,7 +354,7 @@ rc=$?
 set -e
 exec 3>&-
 rm -f "$TXN_FIFO"
-[ "$rc" -ne 0 ] || fail "txn: SIGINT produce exited 0, want non-zero"
+[ "$rc" -eq 130 ] || fail "txn: SIGINT produce exited $rc, want 130"
 rc_out=$(zig-out/bin/kite consume -B --idle 2s --format value "$TXN_INT" 2>/dev/null)
 [ -z "$rc_out" ] || fail "txn: read_committed saw SIGINT-aborted records: [$rc_out]"
 ru_out=$(zig-out/bin/kite consume -B --read-uncommitted -n 2 --idle 3s --format value "$TXN_INT" 2>/dev/null | sort)

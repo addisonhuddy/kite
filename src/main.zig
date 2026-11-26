@@ -44,7 +44,7 @@ var live_stats: ?*stats_mod.Stats = null;
 /// Active transactional client to abort before exiting on a fatal error.
 var active_txn: ?*client.Client = null;
 
-fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
+fn fatalExit(code: u8, comptime fmt: []const u8, args: anytype) noreturn {
     if (live_stats) |s| s.clearLine();
     if (active_txn) |c| {
         active_txn = null;
@@ -54,7 +54,15 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
         out(term.red ++ "kite:" ++ term.reset ++ " " ++ fmt ++ "\n", args)
     else
         out("kite: " ++ fmt ++ "\n", args);
-    std.process.exit(1);
+    std.process.exit(code);
+}
+
+fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
+    fatalExit(1, fmt, args);
+}
+
+fn abortInterrupted() noreturn {
+    fatalExit(130, "transaction aborted (interrupted)", .{});
 }
 
 /// A per-item error line in fatal()'s format, without exiting — delete
@@ -237,7 +245,7 @@ pub fn main(init: std.process.Init) !void {
     live_stats = &stats;
     read_loop: while (true) {
         if (produce.txn != null and interrupted.load(.acquire))
-            fatal("transaction aborted (interrupted)", .{});
+            abortInterrupted();
         // Linger: with pending records and no stdin data within linger_ms,
         // flush rather than block indefinitely on a slow producer. Skip the
         // poll when a full line is already buffered — no read() can block.
@@ -250,7 +258,7 @@ pub fn main(init: std.process.Init) !void {
                 var fds = [_]std.posix.pollfd{.{ .fd = stdin_fd, .events = std.posix.POLL.IN, .revents = 0 }};
                 const nready = std.posix.poll(&fds, @intCast(@min(cfg.linger_ms, std.math.maxInt(i32)))) catch 1;
                 if (produce.txn != null and interrupted.load(.acquire))
-                    fatal("transaction aborted (interrupted)", .{});
+                    abortInterrupted();
                 if (nready == 0) {
                     flushAll(&cli, topic, pend) catch |err| produceFatal(&cli, err);
                     stats.maybeRender();
@@ -260,7 +268,7 @@ pub fn main(init: std.process.Init) !void {
                 var fds = [_]std.posix.pollfd{.{ .fd = stdin_fd, .events = std.posix.POLL.IN, .revents = 0 }};
                 const nready = std.posix.poll(&fds, 100) catch 1;
                 if (interrupted.load(.acquire))
-                    fatal("transaction aborted (interrupted)", .{});
+                    abortInterrupted();
                 if (nready == 0) continue;
             }
         }
@@ -311,12 +319,12 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (produce.txn != null and interrupted.load(.acquire))
-        fatal("transaction aborted (interrupted)", .{});
+        abortInterrupted();
     flushAll(&cli, topic, pend) catch |err| produceFatal(&cli, err);
     cli.produceDrain(topic) catch |err| produceFatal(&cli, err);
     if (produce.txn != null) {
         if (interrupted.load(.acquire))
-            fatal("transaction aborted (interrupted)", .{});
+            abortInterrupted();
         active_txn = null;
         cli.endTransaction(true) catch |err| produceFatal(&cli, err);
     }
