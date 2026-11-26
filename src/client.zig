@@ -1315,15 +1315,17 @@ pub const Client = struct {
         try c.requireVersion(protocol.api_key.add_partitions_to_txn, protocol.version.add_partitions_to_txn, "AddPartitionsToTxn");
         try c.requireVersion(protocol.api_key.end_txn, protocol.version.end_txn, "EndTxn");
         c.txn_id = txn_id;
+        const InitArgs = struct { id: []const u8, timeout_ms: i32 };
         const body = struct {
-            fn f(e: *Encoder, id: []const u8) protocol.ProtoError!void {
-                try e.compactString(id);
-                try e.i32v(60000); // transaction_timeout_ms
+            fn f(e: *Encoder, args: InitArgs) protocol.ProtoError!void {
+                try e.compactString(args.id);
+                try e.i32v(args.timeout_ms); // transaction_timeout_ms
                 try e.i64v(-1); // producer_id
                 try e.i16v(-1); // producer_epoch
                 try e.tagBuffer();
             }
         }.f;
+        const init_args: InitArgs = .{ .id = txn_id, .timeout_ms = c.cfg.transaction_timeout_ms };
         var retry: Retry = .{};
         while (true) {
             const node = try c.findTxnCoordinator();
@@ -1333,7 +1335,7 @@ pub const Client = struct {
                 c.setErr("InitProducerId (txn '{s}'): coordinator unreachable", .{txn_id});
                 return error.ProduceFailed;
             };
-            const resp = c.sendRequest(conn, protocol.api_key.init_producer_id, protocol.version.init_producer_id, txn_id, body) catch {
+            const resp = c.sendRequest(conn, protocol.api_key.init_producer_id, protocol.version.init_producer_id, init_args, body) catch {
                 c.invalidateTxnCoordinator();
                 if (retry.pause(c)) continue;
                 c.setErr("InitProducerId (txn '{s}'): request failed", .{txn_id});

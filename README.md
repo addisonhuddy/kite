@@ -707,6 +707,7 @@ replaced by `_`, so `bootstrap.servers` becomes `BOOTSTRAP_SERVERS`.
 | `fetch.max.bytes` | — | `8388608` | Maximum bytes requested per fetch. |
 | `fetch.max.wait.ms` | — | `500` | Maximum broker wait for a fetch. |
 | `enable.idempotence` | — | `true` | Broker deduplicates retried producer batches. |
+| `transaction.timeout.ms` | — | `60000` | Transaction timeout in milliseconds for `produce --txn`. |
 
 Templates are in [`examples/config/`](examples/config). Idempotence means
 broker deduplication of retried batches, not end-to-end exactly-once
