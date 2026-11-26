@@ -326,7 +326,13 @@ pub fn main(init: std.process.Init) !void {
         if (interrupted.load(.acquire))
             abortInterrupted();
         active_txn = null;
-        cli.endTransaction(true) catch |err| produceFatal(&cli, err);
+        cli.endTransaction(true, &interrupted) catch |err| {
+            if (err == error.Interrupted) {
+                active_txn = &cli;
+                abortInterrupted();
+            }
+            produceFatal(&cli, err);
+        };
     }
     for (cli.last_offsets.items) |po| stats.noteOffset(po.pidx, po.offset);
     if (timing) std.debug.print("read {d}ms send {d}ms drain {d}ms conns {d}\n", .{ t_read / 1_000_000, t_flush / 1_000_000, (t_drain + timer.lap()) / 1_000_000, cli.conns.count() });

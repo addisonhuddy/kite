@@ -1440,16 +1440,22 @@ pub const Client = struct {
     }
 
     /// Commit (`commit=true`) or abort (`commit=false`) the active transaction.
-    /// No-op when no partitions were added to the transaction.
-    pub fn endTransaction(c: *Client, commit: bool) !void {
+    /// No-op when no partitions were added to the transaction. When `commit` is
+    /// true and `stop` becomes set before a commit request is sent (including
+    /// after a coordinator rejection such as NOT_COORDINATOR), returns
+    /// `error.Interrupted` so the caller can abort instead of committing.
+    pub fn endTransaction(c: *Client, commit: bool, stop: ?*const std.atomic.Value(bool)) !void {
         if (!c.hasActiveTxn()) return;
         const txn_id = c.txn_id.?;
         const verb = if (commit) "commit" else "abort";
         var retry: Retry = .{};
         while (true) {
+            if (commit) if (stop) |s| if (s.load(.acquire)) return error.Interrupted;
             const node = try c.findTxnCoordinator();
+            if (commit) if (stop) |s| if (s.load(.acquire)) return error.Interrupted;
             const conn = c.connFor(node, connKey(node, txn_coord_slot)) catch {
                 c.invalidateTxnCoordinator();
+                if (commit) if (stop) |s| if (s.load(.acquire)) return error.Interrupted;
                 if (retry.pause(c)) continue;
                 c.setErr("EndTxn ({s} '{s}'): coordinator unreachable", .{ verb, txn_id });
                 return error.ProduceFailed;
@@ -1480,6 +1486,7 @@ pub const Client = struct {
                 return;
             }
             if (isCoordinatorError(code)) c.invalidateTxnCoordinator();
+            if (commit) if (stop) |s| if (s.load(.acquire)) return error.Interrupted;
             if ((isCoordinatorError(code) or code.retriable()) and retry.pause(c)) continue;
             if (commit and code == .transaction_abortable) {
                 c.abortTransactionBestEffort();
@@ -1494,7 +1501,7 @@ pub const Client = struct {
         if (!c.hasActiveTxn()) return;
         const saved_err = c.err_ctx;
         defer c.err_ctx = saved_err;
-        c.endTransaction(false) catch {
+        c.endTransaction(false, null) catch {
             const detail = c.errDetail();
             if (detail.len > 0)
                 std.debug.print("kite: warning: failed to abort transaction: {s}\n", .{detail})
