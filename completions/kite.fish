@@ -31,6 +31,7 @@ complete -c kite -n '__fish_seen_subcommand_from produce p consume c' -l json -d
 complete -c kite -n '__fish_seen_subcommand_from produce p' -s H -d 'Add a name: value header' -x
 complete -c kite -n '__fish_seen_subcommand_from produce p' -l csv -d 'Read RFC 4180 CSV (--format csv)'
 complete -c kite -n '__fish_seen_subcommand_from produce p' -l key -d 'Use CSV column as record key' -x
+complete -c kite -n '__fish_seen_subcommand_from produce p' -l txn -d 'Produce stdin atomically under transactional ID' -x
 
 # consume only.
 complete -c kite -n '__fish_seen_subcommand_from consume c' -s g -l group -d 'Join consumer group' -x

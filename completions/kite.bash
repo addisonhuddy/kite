@@ -57,7 +57,7 @@ _kite() {
             COMPREPLY=($(compgen -f -- "$cur"))
             return
             ;;
-        -g | --group | -b | --bootstrap | -H | --key | --offset | --partition | -n | --max | -t | --idle | --set | --unset | -p | --partitions | -r | --replication-factor | -s)
+        -g | --group | -b | --bootstrap | -H | --key | --txn | --offset | --partition | -n | --max | -t | --idle | --set | --unset | -p | --partitions | -r | --replication-factor | -s)
             return
             ;;
     esac
@@ -77,7 +77,7 @@ _kite() {
             fi
             ;;
         produce | p)
-            opts="-b --bootstrap --config --format --json -H --csv --key \
+            opts="-b --bootstrap --config --format --json -H --csv --key --txn \
                 -q --quiet -v --verbose -h --help"
             ;;
         update)

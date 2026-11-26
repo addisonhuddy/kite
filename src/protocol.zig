@@ -23,6 +23,8 @@ pub const api_key = struct {
     pub const incremental_alter_configs: i16 = 44;
     pub const sasl_handshake: i16 = 17;
     pub const init_producer_id: i16 = 22;
+    pub const add_partitions_to_txn: i16 = 24;
+    pub const end_txn: i16 = 26;
     pub const sasl_authenticate: i16 = 36;
 };
 
@@ -42,6 +44,8 @@ pub const version = struct {
     pub const sasl_handshake: i16 = 1;
     pub const sasl_authenticate: i16 = 2;
     pub const init_producer_id: i16 = 4;
+    pub const add_partitions_to_txn: i16 = 3;
+    pub const end_txn: i16 = 4;
     pub const create_topics: i16 = 7;
     pub const delete_topics: i16 = 6;
     pub const create_partitions: i16 = 3;
@@ -70,8 +74,17 @@ pub const ErrorCode = enum(i16) {
     out_of_order_sequence_number = 45,
     duplicate_sequence_number = 46,
     invalid_producer_epoch = 47,
+    invalid_txn_state = 48,
     invalid_producer_id_mapping = 49,
+    invalid_transaction_timeout = 50,
+    concurrent_transactions = 51,
+    transaction_coordinator_fenced = 52,
+    transactional_id_authorization_failed = 53,
+    operation_not_attempted = 55,
     unknown_producer_id = 59,
+    producer_fenced = 90,
+    transactional_id_not_found = 105,
+    transaction_abortable = 120,
     invalid_required_ack = 21,
     topic_authorization_failed = 29,
     cluster_authorization_failed = 31,
@@ -134,8 +147,17 @@ pub const ErrorCode = enum(i16) {
             .out_of_order_sequence_number => "OUT_OF_ORDER_SEQUENCE_NUMBER",
             .duplicate_sequence_number => "DUPLICATE_SEQUENCE_NUMBER",
             .invalid_producer_epoch => "INVALID_PRODUCER_EPOCH",
+            .invalid_txn_state => "INVALID_TXN_STATE",
             .invalid_producer_id_mapping => "INVALID_PRODUCER_ID_MAPPING",
+            .invalid_transaction_timeout => "INVALID_TRANSACTION_TIMEOUT",
+            .concurrent_transactions => "CONCURRENT_TRANSACTIONS",
+            .transaction_coordinator_fenced => "TRANSACTION_COORDINATOR_FENCED",
+            .transactional_id_authorization_failed => "TRANSACTIONAL_ID_AUTHORIZATION_FAILED",
+            .operation_not_attempted => "OPERATION_NOT_ATTEMPTED",
             .unknown_producer_id => "UNKNOWN_PRODUCER_ID",
+            .producer_fenced => "PRODUCER_FENCED",
+            .transactional_id_not_found => "TRANSACTIONAL_ID_NOT_FOUND",
+            .transaction_abortable => "TRANSACTION_ABORTABLE",
             .invalid_required_ack => "INVALID_REQUIRED_ACK",
             .topic_authorization_failed => "TOPIC_AUTHORIZATION_FAILED",
             .cluster_authorization_failed => "CLUSTER_AUTHORIZATION_FAILED",
@@ -179,6 +201,7 @@ pub const ErrorCode = enum(i16) {
             .group_load_in_progress,
             .coordinator_not_available,
             .not_coordinator,
+            .concurrent_transactions,
             => true,
             else => false,
         };
@@ -579,6 +602,85 @@ pub fn findCoordinatorRequest(e: *Encoder, group: []const u8) ProtoError!void {
     try e.compactArrayLen(1);
     try e.compactString(group);
     try e.tagBuffer();
+}
+
+pub fn findTxnCoordinatorRequest(e: *Encoder, txn_id: []const u8) ProtoError!void {
+    try e.i8v(1);
+    try e.compactArrayLen(1);
+    try e.compactString(txn_id);
+    try e.tagBuffer();
+}
+
+pub const AddPartitionsToTxn = struct {
+    txn_id: []const u8,
+    producer_id: i64,
+    producer_epoch: i16,
+    topic: []const u8,
+    partitions: []const i32,
+};
+
+pub const TxnPartitionResult = struct {
+    partition: i32,
+    code: ErrorCode,
+};
+
+/// AddPartitionsToTxn v3 (flexible client-facing version; v4+ are inter-broker).
+pub fn addPartitionsToTxnRequest(e: *Encoder, req: AddPartitionsToTxn) ProtoError!void {
+    try e.compactString(req.txn_id);
+    try e.i64v(req.producer_id);
+    try e.i16v(req.producer_epoch);
+    try e.compactArrayLen(1);
+    try e.compactString(req.topic);
+    try e.compactArrayLen(req.partitions.len);
+    for (req.partitions) |p| try e.i32v(p);
+    try e.tagBuffer(); // topic tags
+    try e.tagBuffer(); // request tags
+}
+
+pub fn addPartitionsToTxnResponse(d: *Decoder, alloc: std.mem.Allocator) ProtoError![]TxnPartitionResult {
+    _ = try d.i32v(); // throttle_time_ms
+    const ntopics = try d.compactArrayLen();
+    if (ntopics < 0) return error.NegativeLength;
+    var results: std.ArrayListUnmanaged(TxnPartitionResult) = .empty;
+    errdefer results.deinit(alloc);
+    var t: i64 = 0;
+    while (t < ntopics) : (t += 1) {
+        _ = try d.compactString(); // topic name
+        const nparts = try d.compactArrayLen();
+        if (nparts < 0) return error.NegativeLength;
+        var p: i64 = 0;
+        while (p < nparts) : (p += 1) {
+            const partition = try d.i32v();
+            const code: ErrorCode = @enumFromInt(try d.i16v());
+            try d.tagBuffer(); // partition tags
+            try results.append(alloc, .{ .partition = partition, .code = code });
+        }
+        try d.tagBuffer(); // topic tags
+    }
+    try d.tagBuffer(); // response tags
+    return results.toOwnedSlice(alloc);
+}
+
+pub const EndTxn = struct {
+    txn_id: []const u8,
+    producer_id: i64,
+    producer_epoch: i16,
+    committed: bool,
+};
+
+pub fn endTxnRequest(e: *Encoder, req: EndTxn) ProtoError!void {
+    try e.compactString(req.txn_id);
+    try e.i64v(req.producer_id);
+    try e.i16v(req.producer_epoch);
+    try e.boolean(req.committed);
+    try e.tagBuffer();
+}
+
+pub fn endTxnResponse(d: *Decoder) ProtoError!ErrorCode {
+    _ = try d.i32v(); // throttle_time_ms
+    const code: ErrorCode = @enumFromInt(try d.i16v());
+    try d.tagBuffer();
+    return code;
 }
 
 pub const Coordinator = struct {
@@ -1198,11 +1300,13 @@ pub fn encodeRecordBatch(
     producer_id: i64,
     producer_epoch: i16,
     base_sequence: i32,
+    transactional: bool,
 ) ProtoError!void {
     var body = Encoder.init(e.aw.allocator);
     defer body.deinit();
 
-    try body.i16v(0); // attributes: no compression, ts=CreateTime
+    // attributes: no compression, ts=CreateTime, bit 4 = transactional
+    try body.i16v(if (transactional) 0x10 else 0);
     try body.i32v(@intCast(records.len - 1)); // last offset delta
     try body.i64v(base_timestamp_ms);
     try body.i64v(base_timestamp_ms); // max timestamp
@@ -1308,7 +1412,7 @@ test "decodes record batch v2" {
         .{ .key = "key", .value = "value", .headers = &headers },
         .{ .value = "empty-key" },
     };
-    try encodeRecordBatch(&e, &input, 1000, -1, -1, -1);
+    try encodeRecordBatch(&e, &input, 1000, -1, -1, -1, false);
 
     var sink = DecodeTestSink{};
     try std.testing.expectEqual(@as(?i64, 2), try decodeBatches(std.testing.allocator, e.written(), .{}, &sink, decodeTestRecord));
@@ -1321,7 +1425,7 @@ test "skips control batches and returns next complete offset" {
     var control_encoder = Encoder.init(std.testing.allocator);
     defer control_encoder.deinit();
     const control_input = [_]Record{.{ .value = "control" }};
-    try encodeRecordBatch(&control_encoder, &control_input, 1000, -1, -1, -1);
+    try encodeRecordBatch(&control_encoder, &control_input, 1000, -1, -1, -1, false);
     const control = try std.testing.allocator.dupe(u8, control_encoder.written());
     defer std.testing.allocator.free(control);
     std.mem.writeInt(i16, control[21..23], 1 << 5, .big);
@@ -1330,7 +1434,7 @@ test "skips control batches and returns next complete offset" {
     var normal_encoder = Encoder.init(std.testing.allocator);
     defer normal_encoder.deinit();
     const normal_input = [_]Record{.{ .value = "normal" }};
-    try encodeRecordBatch(&normal_encoder, &normal_input, 2000, -1, -1, -1);
+    try encodeRecordBatch(&normal_encoder, &normal_input, 2000, -1, -1, -1, false);
     const normal = try std.testing.allocator.dupe(u8, normal_encoder.written());
     defer std.testing.allocator.free(normal);
     std.mem.writeInt(i64, normal[0..8], 1, .big);
@@ -1371,7 +1475,7 @@ test "filters aborted batches by producer and bounds progress by the last stable
     defer e.deinit();
     for (batches, 1..) |batch, offset| {
         const pos = e.written().len;
-        try encodeRecordBatch(&e, &.{.{ .key = batch.key, .value = "" }}, 0, batch.producer, 0, 0);
+        try encodeRecordBatch(&e, &.{.{ .key = batch.key, .value = "" }}, 0, batch.producer, 0, 0, false);
         const encoded = e.written()[pos..];
         std.mem.writeInt(i64, encoded[0..8], @intCast(offset), .big);
         std.mem.writeInt(i16, encoded[21..23], batch.attributes, .big);
@@ -1480,7 +1584,7 @@ test "record batch smoke" {
     var e = Encoder.init(std.testing.allocator);
     defer e.deinit();
     const recs = [_]Record{ .{ .value = "a" }, .{ .value = "b" }, .{ .value = "c" } };
-    try encodeRecordBatch(&e, &recs, 1700000000000, -1, -1, -1);
+    try encodeRecordBatch(&e, &recs, 1700000000000, -1, -1, -1, false);
     const batch = e.written();
     var d = Decoder.init(batch);
     try std.testing.expectEqual(@as(i64, 0), try d.i64v());
@@ -1492,4 +1596,101 @@ test "record batch smoke" {
     const crc_pos = d.pos;
     const computed = std.hash.crc.Crc32Iscsi.hash(batch[crc_pos..]);
     try std.testing.expectEqual(@as(u32, @bitCast(crc)), computed);
+}
+
+test "transactional record batch sets transactional attribute bit" {
+    var e = Encoder.init(std.testing.allocator);
+    defer e.deinit();
+    const recs = [_]Record{.{ .value = "tx" }};
+    try encodeRecordBatch(&e, &recs, 1700000000000, 42, 1, 0, true);
+    const batch = e.written();
+    const attrs = std.mem.readInt(i16, batch[21..23], .big);
+    try std.testing.expectEqual(@as(i16, 0x10), attrs);
+    var sink = DecodeTestSink{};
+    try std.testing.expectEqual(@as(?i64, 1), try decodeBatches(std.testing.allocator, batch, .{}, &sink, decodeTestRecord));
+    try std.testing.expectEqual(@as(usize, 1), sink.count);
+}
+
+test "transactional wire requests and responses" {
+    const a = std.testing.allocator;
+
+    // FindCoordinator (transaction key_type = 1)
+    var fc = Encoder.init(a);
+    defer fc.deinit();
+    try findTxnCoordinatorRequest(&fc, "my-txn");
+    var fcd = Decoder.init(fc.written());
+    try std.testing.expectEqual(@as(i8, 1), try fcd.i8v());
+    try std.testing.expectEqual(@as(i64, 1), try fcd.compactArrayLen());
+    try std.testing.expectEqualStrings("my-txn", (try fcd.compactString()).?);
+    try fcd.tagBuffer();
+    try std.testing.expectEqual(fcd.data.len, fcd.pos);
+
+    // AddPartitionsToTxn v3 request
+    var ap = Encoder.init(a);
+    defer ap.deinit();
+    try addPartitionsToTxnRequest(&ap, .{
+        .txn_id = "my-txn",
+        .producer_id = 7,
+        .producer_epoch = 2,
+        .topic = "orders",
+        .partitions = &.{ 0, 3 },
+    });
+    var apd = Decoder.init(ap.written());
+    try std.testing.expectEqualStrings("my-txn", (try apd.compactString()).?);
+    try std.testing.expectEqual(@as(i64, 7), try apd.i64v());
+    try std.testing.expectEqual(@as(i16, 2), try apd.i16v());
+    try std.testing.expectEqual(@as(i64, 1), try apd.compactArrayLen());
+    try std.testing.expectEqualStrings("orders", (try apd.compactString()).?);
+    try std.testing.expectEqual(@as(i64, 2), try apd.compactArrayLen());
+    try std.testing.expectEqual(@as(i32, 0), try apd.i32v());
+    try std.testing.expectEqual(@as(i32, 3), try apd.i32v());
+    try apd.tagBuffer();
+    try apd.tagBuffer();
+    try std.testing.expectEqual(apd.data.len, apd.pos);
+
+    // AddPartitionsToTxn v3 response
+    var apr = Encoder.init(a);
+    defer apr.deinit();
+    try apr.i32v(0);
+    try apr.compactArrayLen(1);
+    try apr.compactString("orders");
+    try apr.compactArrayLen(2);
+    try apr.i32v(0);
+    try apr.i16v(0);
+    try apr.tagBuffer();
+    try apr.i32v(3);
+    try apr.i16v(@intFromEnum(ErrorCode.concurrent_transactions));
+    try apr.tagBuffer();
+    try apr.tagBuffer();
+    try apr.tagBuffer();
+    var aprd = Decoder.init(apr.written());
+    const results = try addPartitionsToTxnResponse(&aprd, a);
+    defer a.free(results);
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqual(@as(i32, 0), results[0].partition);
+    try std.testing.expectEqual(ErrorCode.none, results[0].code);
+    try std.testing.expectEqual(@as(i32, 3), results[1].partition);
+    try std.testing.expectEqual(ErrorCode.concurrent_transactions, results[1].code);
+    try std.testing.expectEqual(aprd.data.len, aprd.pos);
+
+    // EndTxn v4 request & response
+    var et = Encoder.init(a);
+    defer et.deinit();
+    try endTxnRequest(&et, .{ .txn_id = "my-txn", .producer_id = 7, .producer_epoch = 2, .committed = true });
+    var etd = Decoder.init(et.written());
+    try std.testing.expectEqualStrings("my-txn", (try etd.compactString()).?);
+    try std.testing.expectEqual(@as(i64, 7), try etd.i64v());
+    try std.testing.expectEqual(@as(i16, 2), try etd.i16v());
+    try std.testing.expect(try etd.boolean());
+    try etd.tagBuffer();
+    try std.testing.expectEqual(etd.data.len, etd.pos);
+
+    var etr = Encoder.init(a);
+    defer etr.deinit();
+    try etr.i32v(5);
+    try etr.i16v(@intFromEnum(ErrorCode.producer_fenced));
+    try etr.tagBuffer();
+    var etrd = Decoder.init(etr.written());
+    try std.testing.expectEqual(ErrorCode.producer_fenced, try endTxnResponse(&etrd));
+    try std.testing.expectEqual(etrd.data.len, etrd.pos);
 }

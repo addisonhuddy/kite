@@ -89,6 +89,11 @@ pub const Client = struct {
     producer_id: i64 = -1,
     producer_epoch: i16 = -1,
     producer_inited: bool = false,
+    /// Transactional produce state (null = non-transactional).
+    txn_id: ?[]const u8 = null,
+    txn_coordinator_node: i32 = -1,
+    /// Partitions already registered with AddPartitionsToTxn in this transaction.
+    txn_added_parts: std.AutoHashMapUnmanaged(i32, void) = .empty,
     last_offset: ?i64 = null,
     /// Highest acked offset per partition (sorted by pidx), for the summary.
     last_offsets: std.ArrayListUnmanaged(PartOffset) = .empty,
@@ -148,6 +153,7 @@ pub const Client = struct {
         }
         c.outstanding.deinit(c.alloc);
         c.seqs.deinit(c.alloc);
+        c.txn_added_parts.deinit(c.alloc);
         c.last_offsets.deinit(c.alloc);
         if (c.ca) |*b| b.deinit(c.alloc);
     }
@@ -1249,6 +1255,255 @@ pub const Client = struct {
             try c.initProducerId();
     }
 
+    // -- Transactional produce -----------------------------------------------
+
+    const txn_coord_slot: u32 = 0xFFFF_FFFD;
+
+    fn invalidateTxnCoordinator(c: *Client) void {
+        if (c.txn_coordinator_node >= 0) c.dropConn(connKey(c.txn_coordinator_node, txn_coord_slot));
+        c.txn_coordinator_node = -1;
+    }
+
+    fn findTxnCoordinator(c: *Client) !i32 {
+        if (c.txn_coordinator_node >= 0) return c.txn_coordinator_node;
+        const txn_id = c.txn_id orelse return error.ProduceFailed;
+        var retry: Retry = .{};
+        while (true) {
+            if (c.control == null) c.reconnectControl() catch {
+                if (retry.pause(c)) continue;
+                c.setErr("FindCoordinator (txn '{s}'): control broker unreachable", .{txn_id});
+                return error.ProduceFailed;
+            };
+            const resp = c.sendRequest(
+                c.control.?,
+                protocol.api_key.find_coordinator,
+                protocol.version.find_coordinator,
+                txn_id,
+                protocol.findTxnCoordinatorRequest,
+            ) catch {
+                c.dropControl();
+                if (retry.pause(c)) continue;
+                c.setErr("FindCoordinator (txn '{s}'): request failed", .{txn_id});
+                return error.ProduceFailed;
+            };
+            defer c.alloc.free(resp.frame);
+            var d = Decoder.init(resp.body);
+            const coord = try protocol.coordinatorResponse(&d);
+            if ((isCoordinatorError(coord.code) or coord.code.retriable()) and retry.pause(c)) continue;
+            if (coord.code != .none) {
+                c.setErr("FindCoordinator (txn '{s}'): {s}", .{ txn_id, coord.code.name() });
+                return error.ProduceFailed;
+            }
+            if (coord.node < 0 or coord.host.len == 0 or coord.port < 1 or coord.port > 65535)
+                return error.MalformedResponse;
+            const host = try c.alloc.dupe(u8, coord.host);
+            errdefer c.alloc.free(host);
+            const entry = try c.brokers.getOrPut(c.alloc, coord.node);
+            if (entry.found_existing) c.alloc.free(entry.value_ptr.host);
+            entry.value_ptr.* = .{ .host = host, .port = @intCast(coord.port) };
+            c.txn_coordinator_node = coord.node;
+            c.vlog("txn coordinator for '{s}': broker {d} ({s}:{d})", .{ txn_id, coord.node, coord.host, coord.port });
+            return coord.node;
+        }
+    }
+
+    /// Initialize a transactional producer: discover the transaction
+    /// coordinator and obtain a producer id + epoch via InitProducerId v4.
+    pub fn initTransaction(c: *Client, txn_id: []const u8) !void {
+        try c.requireVersion(protocol.api_key.find_coordinator, protocol.version.find_coordinator, "FindCoordinator");
+        try c.requireVersion(protocol.api_key.init_producer_id, protocol.version.init_producer_id, "InitProducerId");
+        try c.requireVersion(protocol.api_key.add_partitions_to_txn, protocol.version.add_partitions_to_txn, "AddPartitionsToTxn");
+        try c.requireVersion(protocol.api_key.end_txn, protocol.version.end_txn, "EndTxn");
+        c.txn_id = txn_id;
+        const body = struct {
+            fn f(e: *Encoder, id: []const u8) protocol.ProtoError!void {
+                try e.compactString(id);
+                try e.i32v(60000); // transaction_timeout_ms
+                try e.i64v(-1); // producer_id
+                try e.i16v(-1); // producer_epoch
+                try e.tagBuffer();
+            }
+        }.f;
+        var retry: Retry = .{};
+        while (true) {
+            const node = try c.findTxnCoordinator();
+            const conn = c.connFor(node, connKey(node, txn_coord_slot)) catch {
+                c.invalidateTxnCoordinator();
+                if (retry.pause(c)) continue;
+                c.setErr("InitProducerId (txn '{s}'): coordinator unreachable", .{txn_id});
+                return error.ProduceFailed;
+            };
+            const resp = c.sendRequest(conn, protocol.api_key.init_producer_id, protocol.version.init_producer_id, txn_id, body) catch {
+                c.invalidateTxnCoordinator();
+                if (retry.pause(c)) continue;
+                c.setErr("InitProducerId (txn '{s}'): request failed", .{txn_id});
+                return error.ProduceFailed;
+            };
+            defer c.alloc.free(resp.frame);
+            var d = Decoder.init(resp.body);
+            _ = try d.i32v(); // throttle_time_ms
+            const code: protocol.ErrorCode = @enumFromInt(try d.i16v());
+            const pid = try d.i64v();
+            const epoch = try d.i16v();
+            try d.tagBuffer();
+            if (code == .none) {
+                c.producer_id = pid;
+                c.producer_epoch = epoch;
+                c.producer_inited = true;
+                c.vlog("transactional producer '{s}': id={d} epoch={d}", .{ txn_id, pid, epoch });
+                return;
+            }
+            if (isCoordinatorError(code)) c.invalidateTxnCoordinator();
+            if ((isCoordinatorError(code) or code.retriable()) and retry.pause(c)) continue;
+            c.setErr("InitProducerId (txn '{s}'): {s}", .{ txn_id, code.name() });
+            return error.ProduceFailed;
+        }
+    }
+
+    fn addPartitionsToTxn(c: *Client, topic: []const u8, parts: []const i32) !void {
+        const txn_id = c.txn_id orelse return;
+        var remaining: std.ArrayListUnmanaged(i32) = .empty;
+        defer remaining.deinit(c.alloc);
+        try remaining.appendSlice(c.alloc, parts);
+
+        var retry: Retry = .{};
+        while (remaining.items.len > 0) {
+            const node = try c.findTxnCoordinator();
+            const conn = c.connFor(node, connKey(node, txn_coord_slot)) catch {
+                c.invalidateTxnCoordinator();
+                if (retry.pause(c)) continue;
+                c.setErr("AddPartitionsToTxn ({s}): coordinator unreachable", .{topic});
+                return error.ProduceFailed;
+            };
+            const resp = c.sendRequest(
+                conn,
+                protocol.api_key.add_partitions_to_txn,
+                protocol.version.add_partitions_to_txn,
+                protocol.AddPartitionsToTxn{
+                    .txn_id = txn_id,
+                    .producer_id = c.producer_id,
+                    .producer_epoch = c.producer_epoch,
+                    .topic = topic,
+                    .partitions = remaining.items,
+                },
+                protocol.addPartitionsToTxnRequest,
+            ) catch {
+                c.invalidateTxnCoordinator();
+                if (retry.pause(c)) continue;
+                c.setErr("AddPartitionsToTxn ({s}): request failed", .{topic});
+                return error.ProduceFailed;
+            };
+            defer c.alloc.free(resp.frame);
+            var d = Decoder.init(resp.body);
+            const results = try protocol.addPartitionsToTxnResponse(&d, c.alloc);
+            defer c.alloc.free(results);
+
+            var coord_err = false;
+            var next: std.ArrayListUnmanaged(i32) = .empty;
+            errdefer next.deinit(c.alloc);
+            for (results) |res| {
+                if (res.code == .none) {
+                    try c.txn_added_parts.put(c.alloc, res.partition, {});
+                } else if (isCoordinatorError(res.code)) {
+                    coord_err = true;
+                    try next.append(c.alloc, res.partition);
+                } else if (res.code == .operation_not_attempted or res.code.retriable()) {
+                    try next.append(c.alloc, res.partition);
+                } else {
+                    c.setErr("AddPartitionsToTxn ({s}[{d}]): {s}", .{ topic, res.partition, res.code.name() });
+                    return error.ProduceFailed;
+                }
+            }
+            for (remaining.items) |p| {
+                if (!c.txn_added_parts.contains(p)) {
+                    var listed = false;
+                    for (next.items) |np| if (np == p) {
+                        listed = true;
+                        break;
+                    };
+                    if (!listed) return error.MalformedResponse;
+                }
+            }
+            remaining.deinit(c.alloc);
+            remaining = next;
+            if (remaining.items.len == 0) return;
+            if (coord_err) c.invalidateTxnCoordinator();
+            if (!retry.pause(c)) {
+                c.setErr("AddPartitionsToTxn ({s}): timed out after 30s", .{topic});
+                return error.ProduceFailed;
+            }
+        }
+    }
+
+    pub fn hasActiveTxn(c: *const Client) bool {
+        return c.txn_id != null and c.producer_inited and c.txn_added_parts.count() > 0;
+    }
+
+    /// Commit (`commit=true`) or abort (`commit=false`) the active transaction.
+    /// No-op when no partitions were added to the transaction.
+    pub fn endTransaction(c: *Client, commit: bool) !void {
+        if (!c.hasActiveTxn()) return;
+        const txn_id = c.txn_id.?;
+        const verb = if (commit) "commit" else "abort";
+        var retry: Retry = .{};
+        while (true) {
+            const node = try c.findTxnCoordinator();
+            const conn = c.connFor(node, connKey(node, txn_coord_slot)) catch {
+                c.invalidateTxnCoordinator();
+                if (retry.pause(c)) continue;
+                c.setErr("EndTxn ({s} '{s}'): coordinator unreachable", .{ verb, txn_id });
+                return error.ProduceFailed;
+            };
+            const resp = c.sendRequest(
+                conn,
+                protocol.api_key.end_txn,
+                protocol.version.end_txn,
+                protocol.EndTxn{
+                    .txn_id = txn_id,
+                    .producer_id = c.producer_id,
+                    .producer_epoch = c.producer_epoch,
+                    .committed = commit,
+                },
+                protocol.endTxnRequest,
+            ) catch {
+                c.invalidateTxnCoordinator();
+                if (retry.pause(c)) continue;
+                c.setErr("EndTxn ({s} '{s}'): request failed", .{ verb, txn_id });
+                return error.ProduceFailed;
+            };
+            defer c.alloc.free(resp.frame);
+            var d = Decoder.init(resp.body);
+            const code = try protocol.endTxnResponse(&d);
+            if (code == .none) {
+                c.txn_added_parts.clearRetainingCapacity();
+                c.vlog("transaction '{s}' {s}", .{ txn_id, if (commit) "committed" else "aborted" });
+                return;
+            }
+            if (isCoordinatorError(code)) c.invalidateTxnCoordinator();
+            if ((isCoordinatorError(code) or code.retriable()) and retry.pause(c)) continue;
+            if (commit and code == .transaction_abortable) {
+                c.abortTransactionBestEffort();
+            }
+            c.setErr("EndTxn ({s} '{s}'): {s}", .{ verb, txn_id, code.name() });
+            return error.ProduceFailed;
+        }
+    }
+
+    /// Best-effort abort for fatal/interrupt paths; preserves any prior err_ctx.
+    pub fn abortTransactionBestEffort(c: *Client) void {
+        if (!c.hasActiveTxn()) return;
+        const saved_err = c.err_ctx;
+        defer c.err_ctx = saved_err;
+        c.endTransaction(false) catch {
+            const detail = c.errDetail();
+            if (detail.len > 0)
+                std.debug.print("kite: warning: failed to abort transaction: {s}\n", .{detail})
+            else
+                std.debug.print("kite: warning: failed to abort transaction\n", .{});
+            c.txn_added_parts.clearRetainingCapacity();
+        };
+    }
+
     // -- Produce -------------------------------------------------------------
 
     /// A sent ProduceRequest awaiting its response. Batches stay alive in the
@@ -1312,6 +1567,22 @@ pub const Client = struct {
         sets: []const []const protocol.Record,
     ) !void {
         try c.ensureProducerId();
+        if (c.txn_id != null) {
+            var new_parts: std.ArrayListUnmanaged(i32) = .empty;
+            defer new_parts.deinit(c.alloc);
+            for (parts) |pi| {
+                const pidx: i32 = @intCast(pi);
+                if (!c.txn_added_parts.contains(pidx)) {
+                    var seen = false;
+                    for (new_parts.items) |np| if (np == pidx) {
+                        seen = true;
+                        break;
+                    };
+                    if (!seen) try new_parts.append(c.alloc, pidx);
+                }
+            }
+            if (new_parts.items.len > 0) try c.addPartitionsToTxn(topic, new_parts.items);
+        }
         for (parts, 0..) |pi, i| {
             const pidx: i32 = @intCast(pi);
             // Drain before allocating a sequence and queuing another batch.
@@ -1344,6 +1615,7 @@ pub const Client = struct {
                 c.producer_id,
                 c.producer_epoch,
                 base_seq,
+                c.txn_id != null,
             ) catch {
                 be.deinit();
                 return error.OutOfMemory;
@@ -1643,7 +1915,7 @@ pub const Client = struct {
 
         var head = Encoder.init(c.alloc);
         try protocol.encodeRequestHeader(&head, protocol.api_key.produce, protocol.version.produce, true, "kite");
-        try head.compactString(null); // transactional_id
+        try head.compactString(c.txn_id); // transactional_id
         try head.i16v(-1); // acks=all
         try head.i32v(15000); // timeout_ms
         try head.compactArrayLen(1); // one topic

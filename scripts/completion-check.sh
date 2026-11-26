@@ -64,6 +64,8 @@ if command -v bash >/dev/null; then
         _kite && printf "%s\n" "${COMPREPLY[@]}"
         COMP_WORDS=(kite produce --cs); COMP_CWORD=2; COMP_LINE="kite produce --cs"; COMP_POINT=${#COMP_LINE}
         _kite && printf "%s\n" "${COMPREPLY[@]}"
+        COMP_WORDS=(kite produce --tx); COMP_CWORD=2; COMP_LINE="kite produce --tx"; COMP_POINT=${#COMP_LINE}
+        _kite && printf "%s\n" "${COMPREPLY[@]}"
         COMP_WORDS=(kite con); COMP_CWORD=1; COMP_LINE="kite con"; COMP_POINT=${#COMP_LINE}
         _kite && printf "%s\n" "${COMPREPLY[@]}"
         COMP_WORDS=(kite produce @local); COMP_CWORD=2; COMP_LINE="kite produce @local"; COMP_POINT=${#COMP_LINE}
@@ -79,7 +81,7 @@ if command -v bash >/dev/null; then
         COMP_WORDS=(kite top); COMP_CWORD=1; COMP_LINE="kite top"; COMP_POINT=${#COMP_LINE}
         _kite && printf "%s\n" "${COMPREPLY[@]}"
     ') || fail "bash: completion script did not load"
-    expect bash "$out" --from-beginning --group --read-uncommitted --csv consume @local-b cluster set init --partitions topic
+    expect bash "$out" --from-beginning --group --read-uncommitted --csv --txn consume @local-b cluster set init --partitions topic
 else
     echo "SKIP bash"
 fi
@@ -146,10 +148,10 @@ for line in "$@"; do
 done
 zpty -w kite_zsh 'exit'
 EOF
-    raw=$(HOME=$H TERM=dumb timeout 60s zsh -f "$TMP/zsh-driver.zsh" 'kite consume --fr' 'kite consume --gr' 'kite consume --read' 'kite produce --cs' 'kite con' 'kite clu' 2>"$TMP/zsh-transcript") || true
+    raw=$(HOME=$H TERM=dumb timeout 60s zsh -f "$TMP/zsh-driver.zsh" 'kite consume --fr' 'kite consume --gr' 'kite consume --read' 'kite produce --cs' 'kite produce --tx' 'kite con' 'kite clu' 2>"$TMP/zsh-transcript") || true
     out=$(tr -d '\r' <<<"$raw" | sed -n '/<</,/>>/p' | sed 's/.*<<//; s/>>.*//' | tr -d ' ' | grep -v '^$') || true
     [ -n "$out" ] || { echo "--- zsh transcript:" >&2; cat -v "$TMP/zsh-transcript" >&2; echo >&2; }
-    expect zsh "$out" --from-beginning --group --read-uncommitted --csv consume cluster
+    expect zsh "$out" --from-beginning --group --read-uncommitted --csv --txn consume cluster
 else
     echo "SKIP zsh"
 fi
@@ -162,8 +164,8 @@ if command -v fish >/dev/null; then
         set -q __fish_config_dir; or set __fish_config_dir ~/.config/fish
         mkdir -p $__fish_config_dir/completions
         cp '"$ROOT"'/completions/kite.fish $__fish_config_dir/completions/'
-    out=$(HOME=$H XDG_CONFIG_HOME= fish -c 'complete -C "kite consume --fr"; complete -C "kite consume --gr"; complete -C "kite consume --read"; complete -C "kite produce --cs"; complete -C "kite con"; complete -C "kite clu"' | cut -f1)
-    expect fish "$out" --from-beginning --group --read-uncommitted --csv consume cluster
+    out=$(HOME=$H XDG_CONFIG_HOME= fish -c 'complete -C "kite consume --fr"; complete -C "kite consume --gr"; complete -C "kite consume --read"; complete -C "kite produce --cs"; complete -C "kite produce --tx"; complete -C "kite con"; complete -C "kite clu"' | cut -f1)
+    expect fish "$out" --from-beginning --group --read-uncommitted --csv --txn consume cluster
 else
     echo "SKIP fish"
 fi

@@ -41,8 +41,15 @@ fn out(comptime fmt: []const u8, args: anytype) void {
 /// Live stderr status line to erase before printing a fatal error.
 var live_stats: ?*stats_mod.Stats = null;
 
+/// Active transactional client to abort before exiting on a fatal error.
+var active_txn: ?*client.Client = null;
+
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
     if (live_stats) |s| s.clearLine();
+    if (active_txn) |c| {
+        active_txn = null;
+        c.abortTransactionBestEffort();
+    }
     if (term.color.enabled)
         out(term.red ++ "kite:" ++ term.reset ++ " " ++ fmt ++ "\n", args)
     else
@@ -180,8 +187,15 @@ pub fn main(init: std.process.Init) !void {
     const csv_key_col = produce.key_col;
 
     var cfg = loadConfig(init, alloc, produce.common, &dummy_source);
+    if (produce.txn != null and !cfg.enable_idempotence)
+        fatal("--txn requires enable.idempotence=true", .{});
     var cli = client.Client.init(alloc, io, init.environ_map, &cfg);
     connectAndResolve(&cli, topic, "write", quiet, true);
+    if (produce.txn) |txn_id| {
+        installSignalHandlers();
+        cli.initTransaction(txn_id) catch |err| produceFatal(&cli, err);
+        active_txn = &cli;
+    }
 
     const nparts = cli.partitionCount();
     var pend = alloc.alloc(Pending, nparts) catch fatal("out of memory", .{});
@@ -222,6 +236,8 @@ pub fn main(init: std.process.Init) !void {
     defer stats.deinit();
     live_stats = &stats;
     read_loop: while (true) {
+        if (produce.txn != null and interrupted.load(.acquire))
+            fatal("transaction aborted (interrupted)", .{});
         // Linger: with pending records and no stdin data within linger_ms,
         // flush rather than block indefinitely on a slow producer. Skip the
         // poll when a full line is already buffered — no read() can block.
@@ -229,13 +245,23 @@ pub fn main(init: std.process.Init) !void {
             csv.rowReady(r)
         else
             std.mem.indexOfScalar(u8, r.buffered(), '\n') != null;
-        if (pendingBytes(pend) > 0 and !ready) {
-            var fds = [_]std.posix.pollfd{.{ .fd = stdin_fd, .events = std.posix.POLL.IN, .revents = 0 }};
-            const nready = std.posix.poll(&fds, @intCast(@min(cfg.linger_ms, std.math.maxInt(i32)))) catch 1;
-            if (nready == 0) {
-                flushAll(&cli, topic, pend) catch |err| produceFatal(&cli, err);
-                stats.maybeRender();
-                continue;
+        if (!ready) {
+            if (pendingBytes(pend) > 0) {
+                var fds = [_]std.posix.pollfd{.{ .fd = stdin_fd, .events = std.posix.POLL.IN, .revents = 0 }};
+                const nready = std.posix.poll(&fds, @intCast(@min(cfg.linger_ms, std.math.maxInt(i32)))) catch 1;
+                if (produce.txn != null and interrupted.load(.acquire))
+                    fatal("transaction aborted (interrupted)", .{});
+                if (nready == 0) {
+                    flushAll(&cli, topic, pend) catch |err| produceFatal(&cli, err);
+                    stats.maybeRender();
+                    continue;
+                }
+            } else if (produce.txn != null) {
+                var fds = [_]std.posix.pollfd{.{ .fd = stdin_fd, .events = std.posix.POLL.IN, .revents = 0 }};
+                const nready = std.posix.poll(&fds, 100) catch 1;
+                if (interrupted.load(.acquire))
+                    fatal("transaction aborted (interrupted)", .{});
+                if (nready == 0) continue;
             }
         }
 
@@ -284,8 +310,16 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    if (produce.txn != null and interrupted.load(.acquire))
+        fatal("transaction aborted (interrupted)", .{});
     flushAll(&cli, topic, pend) catch |err| produceFatal(&cli, err);
     cli.produceDrain(topic) catch |err| produceFatal(&cli, err);
+    if (produce.txn != null) {
+        if (interrupted.load(.acquire))
+            fatal("transaction aborted (interrupted)", .{});
+        active_txn = null;
+        cli.endTransaction(true) catch |err| produceFatal(&cli, err);
+    }
     for (cli.last_offsets.items) |po| stats.noteOffset(po.pidx, po.offset);
     if (timing) std.debug.print("read {d}ms send {d}ms drain {d}ms conns {d}\n", .{ t_read / 1_000_000, t_flush / 1_000_000, (t_drain + timer.lap()) / 1_000_000, cli.conns.count() });
 
@@ -1798,7 +1832,7 @@ fn flushAll(c: *client.Client, topic: []const u8, pend: []Pending) !void {
 
 fn produceFatal(c: *client.Client, err: anyerror) noreturn {
     switch (err) {
-        error.ProduceFailed, error.MetadataFailed => {
+        error.ProduceFailed, error.MetadataFailed, error.AdminFailed => {
             const detail = c.errDetail();
             if (detail.len > 0) fatal("{s}", .{detail});
             fatal("produce failed", .{});
