@@ -210,9 +210,10 @@ pub fn main(init: std.process.Init) !void {
     for (pend) |*p| p.* = .{};
 
     var stdin_buf: [64 * 1024]u8 = undefined;
-    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
-    const r = &stdin_reader.interface;
     const stdin_fd = std.Io.File.stdin().handle;
+    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
+    var txn_stdin = InterruptibleStdin.init(stdin_fd, &stdin_buf);
+    const r: *std.Io.Reader = if (produce.txn != null) &txn_stdin.interface else &stdin_reader.interface;
     const stderr_tty = std.Io.File.stderr().isTty(io) catch false;
     if (!quiet and stderr_tty and (std.Io.File.stdin().isTty(io) catch false))
         note("reading records from the terminal, one per line (Ctrl-D to finish)", .{});
@@ -220,8 +221,10 @@ pub fn main(init: std.process.Init) !void {
     var cols: [][]const u8 = &.{};
     var key_idx: ?usize = null;
     if (csv_mode) {
-        const hdr = csv.nextRow(r, alloc) catch fatal("failed reading stdin", .{}) orelse
-            fatal("empty csv input (no header row)", .{});
+        const hdr = csv.nextRow(r, alloc) catch {
+            if (produce.txn != null and interrupted.load(.acquire)) abortInterrupted();
+            fatal("failed reading stdin", .{});
+        } orelse fatal("empty csv input (no header row)", .{});
         cols = csv.splitFields(alloc, hdr) catch fatal("malformed csv header row", .{});
         if (cols.len > 0) cols[0] = csv.stripBom(cols[0]);
         if (csv_key_col) |kc| {
@@ -253,33 +256,29 @@ pub fn main(init: std.process.Init) !void {
             csv.rowReady(r)
         else
             std.mem.indexOfScalar(u8, r.buffered(), '\n') != null;
-        if (!ready) {
-            if (pendingBytes(pend) > 0) {
-                var fds = [_]std.posix.pollfd{.{ .fd = stdin_fd, .events = std.posix.POLL.IN, .revents = 0 }};
-                const nready = std.posix.poll(&fds, @intCast(@min(cfg.linger_ms, std.math.maxInt(i32)))) catch 1;
-                if (produce.txn != null and interrupted.load(.acquire))
-                    abortInterrupted();
-                if (nready == 0) {
-                    flushAll(&cli, topic, pend) catch |err| produceFatal(&cli, err);
-                    stats.maybeRender();
-                    continue;
-                }
-            } else if (produce.txn != null) {
-                var fds = [_]std.posix.pollfd{.{ .fd = stdin_fd, .events = std.posix.POLL.IN, .revents = 0 }};
-                const nready = std.posix.poll(&fds, 100) catch 1;
-                if (interrupted.load(.acquire))
-                    abortInterrupted();
-                if (nready == 0) continue;
+        if (!ready and pendingBytes(pend) > 0) {
+            var fds = [_]std.posix.pollfd{.{ .fd = stdin_fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            const nready = std.posix.poll(&fds, @intCast(@min(cfg.linger_ms, std.math.maxInt(i32)))) catch 1;
+            if (produce.txn != null and interrupted.load(.acquire))
+                abortInterrupted();
+            if (nready == 0) {
+                flushAll(&cli, topic, pend) catch |err| produceFatal(&cli, err);
+                stats.maybeRender();
+                continue;
             }
         }
 
         const rec = if (csv_mode) blk: {
-            const row = csv.nextRow(r, alloc) catch fatal("failed reading stdin", .{}) orelse
-                break :read_loop;
+            const row = csv.nextRow(r, alloc) catch {
+                if (produce.txn != null and interrupted.load(.acquire)) abortInterrupted();
+                fatal("failed reading stdin", .{});
+            } orelse break :read_loop;
             break :blk csvRecord(alloc, row, cols, key_idx, static_headers, total + 1);
         } else blk: {
-            const owned = nextLine(r, alloc) catch fatal("failed reading stdin", .{}) orelse
-                break :read_loop;
+            const owned = nextLine(r, alloc) catch {
+                if (produce.txn != null and interrupted.load(.acquire)) abortInterrupted();
+                fatal("failed reading stdin", .{});
+            } orelse break :read_loop;
             if (json_mode) {
                 if (std.mem.trim(u8, owned, " \t").len == 0) continue;
                 break :blk jsonRecord(alloc, owned, static_headers, total + 1);
@@ -1802,6 +1801,54 @@ const batch_overhead = 96;
 fn stripCr(s: []const u8) []const u8 {
     return if (s.len > 0 and s[s.len - 1] == '\r') s[0 .. s.len - 1] else s;
 }
+
+/// Stdin reader for transactional produce that polls before reading so
+/// SIGINT/SIGTERM wakes up even when a pipe stalls mid-line or mid-CSV row.
+const InterruptibleStdin = struct {
+    fd: std.posix.fd_t,
+    interface: std.Io.Reader,
+
+    fn init(fd: std.posix.fd_t, buf: []u8) InterruptibleStdin {
+        return .{
+            .fd = fd,
+            .interface = .{
+                .vtable = &.{ .stream = stream },
+                .buffer = buf,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *InterruptibleStdin = @fieldParentPtr("interface", io_r);
+        while (true) {
+            if (interrupted.load(.acquire)) return error.ReadFailed;
+            var fds = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            const nready = std.posix.poll(&fds, 100) catch {
+                if (interrupted.load(.acquire)) return error.ReadFailed;
+                continue;
+            };
+            if (interrupted.load(.acquire)) return error.ReadFailed;
+            if (nready == 0) continue;
+            const dest = limit.slice(try w.writableSliceGreedy(1));
+            const rc = std.posix.system.read(self.fd, dest.ptr, dest.len);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => {
+                    const n: usize = @intCast(rc);
+                    if (n == 0) return error.EndOfStream;
+                    w.advance(n);
+                    return n;
+                },
+                .INTR => {
+                    if (interrupted.load(.acquire)) return error.ReadFailed;
+                    continue;
+                },
+                else => return error.ReadFailed,
+            }
+        }
+    }
+};
 
 /// Read one line (without the trailing newline). Lines longer than the
 /// reader's buffer spill into the arena. Returns null at EOF.

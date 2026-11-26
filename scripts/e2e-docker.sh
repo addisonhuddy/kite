@@ -347,6 +347,8 @@ TXN_PID=$!
 exec 3>"$TXN_FIFO"
 printf 'k1\tbefore-int-1\nk2\tbefore-int-2\n' >&3
 sleep 0.3
+printf 'k3\tpartial-without-newline' >&3
+sleep 0.1
 kill -INT "$TXN_PID" 2>/dev/null || true
 set +e
 wait "$TXN_PID"
