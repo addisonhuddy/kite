@@ -66,7 +66,9 @@ def stop(item):
 
 def check_transaction_isolation():
     topic = "kite-transaction-isolation"
+    split_topic = "kite-transaction-split"
     run("topic", "create", "-p", "1", topic)
+    run("topic", "create", "-p", "1", split_topic)
     docker = ["docker", "exec", "kite-e2e-kafka"]
     jar_path = subprocess.check_output(
         [*docker, "sh", "-c", "echo /opt/kafka/libs/kafka-clients-*.jar"], text=True
@@ -83,7 +85,7 @@ def check_transaction_isolation():
     with fixture_log.open("w") as out, fixture_errors.open("w") as errors:
         fixture = subprocess.Popen(
             ["docker", "exec", "-i", "kite-e2e-kafka", "java",
-             "-cp", "/tmp:/opt/kafka/libs/*", "TransactionFixture", topic],
+             "-cp", "/tmp:/opt/kafka/libs/*", "TransactionFixture", topic, split_topic],
             stdin=subprocess.PIPE, stdout=out, stderr=errors, text=True
         )
     latest = None
@@ -94,11 +96,10 @@ def check_transaction_isolation():
 
         wait_for(ready, "open transaction")
         committed = ["committed"]
-        uncommitted = ["aborted-first", "aborted-middle", "aborted-tail",
-                       "committed", "aborted-last", "open", "after-open"]
-        for flags, expected, end, boundary in [
-            ((), committed, 8, "last stable offset"),
-            (("--read-uncommitted",), uncommitted, 10, "high watermark"),
+        uncommitted = ["aborted-first", "committed", "aborted-last", "open", "after-open"]
+        for flags, expected, end, boundary_suffix in [
+            ((), committed, 6, "; read-committed records available up to last stable offset 6"),
+            (("--read-uncommitted",), uncommitted, 8, ""),
         ]:
             output = run("consume", "-B", "--format", "value", "--idle", "1s", *flags, topic)
             assert output.splitlines() == expected, (flags, output)
@@ -107,20 +108,28 @@ def check_transaction_isolation():
             assert [r["value"] for r in records] == expected, (flags, records)
             description = rows(run("group", "describe", group, "--json"))
             assert len(description) == 1 and description[0]["committed"] == end, description
-            assert description[0]["end"] == 10, description
+            assert description[0]["end"] == 8, description
             out_of_range = subprocess.run(
-                [kite, "consume", "--offset", "9223372036854775806", "--idle", "1s", *flags, topic],
+                [kite, "consume", "--offset", "9", "--idle", "1s", *flags, topic],
                 text=True, capture_output=True, timeout=15
             )
             assert out_of_range.returncode == 1 and not out_of_range.stdout, out_of_range
-            assert f"readable offsets are 0..{end - 1} ({boundary} {end})" in out_of_range.stderr, out_of_range
+            assert (
+                "kite: cannot start consuming: offset 9 is out of range for partition 0: "
+                f"valid offsets are 0..7 (high watermark 8{boundary_suffix})"
+            ) in out_of_range.stderr.splitlines(), out_of_range
+
+        assert run("consume", "--offset", "7", "--idle", "1s", "--format", "value", topic) == ""
+        assert run("consume", "--offset", "7", "--idle", "1s", "--format", "value",
+                   "--read-uncommitted", topic) == "after-open\n"
+        print("PASS seek between last stable offset and high watermark, and diagnostics above it", flush=True)
 
         # With a one-byte budget Kafka returns one batch at a time for progress.
         tiny_config = root / "tiny-fetch.properties"
         tiny_config.write_text("fetch.max.bytes=1\n")
         tiny_args = ("consume", "--config", str(tiny_config), "--offset", "1", "--json", "--idle", "2s")
         tiny = subprocess.run(
-            [kite, *tiny_args, "-v", "-n", "1", topic], text=True, capture_output=True, timeout=15
+            [kite, *tiny_args, "-v", "-n", "1", split_topic], text=True, capture_output=True, timeout=15
         )
         assert tiny.returncode == 0, tiny.stderr
         assert [(r["offset"], r["value"]) for r in rows(tiny.stdout)] == [(4, "committed")], tiny
@@ -129,7 +138,7 @@ def check_transaction_isolation():
             if "offsets empty..empty" in line and not line.endswith("records bytes 0")
         ]
         assert len(skipped_fetches) == 3, tiny.stderr  # Two aborted batches and their abort marker.
-        tiny_uncommitted = rows(run(*tiny_args, "--read-uncommitted", "-n", "3", topic))
+        tiny_uncommitted = rows(run(*tiny_args, "--read-uncommitted", "-n", "3", split_topic))
         assert [(r["offset"], r["value"]) for r in tiny_uncommitted] == [
             (1, "aborted-middle"), (2, "aborted-tail"), (4, "committed"),
         ], tiny_uncommitted

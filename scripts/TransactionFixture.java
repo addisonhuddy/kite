@@ -6,6 +6,7 @@ import org.apache.kafka.common.serialization.StringSerializer;
 class TransactionFixture {
     public static void main(String[] args) throws Exception {
         String topic = args[0];
+        String splitTopic = args[1];
         var config = Map.<String, Object>of("bootstrap.servers", "localhost:9092");
         try (var tx = new KafkaProducer<>(Map.<String, Object>of(
                  "bootstrap.servers", "localhost:9092",
@@ -14,11 +15,13 @@ class TransactionFixture {
             tx.initTransactions();
             tx.beginTransaction();
             tx.send(new ProducerRecord<>(topic, 0, null, "aborted-first")).get();
-            tx.send(new ProducerRecord<>(topic, 0, null, "aborted-middle")).get();
-            tx.send(new ProducerRecord<>(topic, 0, null, "aborted-tail")).get();
+            tx.send(new ProducerRecord<>(splitTopic, 0, null, "aborted-first")).get();
+            tx.send(new ProducerRecord<>(splitTopic, 0, null, "aborted-middle")).get();
+            tx.send(new ProducerRecord<>(splitTopic, 0, null, "aborted-tail")).get();
             tx.abortTransaction();
             tx.beginTransaction();
             tx.send(new ProducerRecord<>(topic, 0, null, "committed")).get();
+            tx.send(new ProducerRecord<>(splitTopic, 0, null, "committed")).get();
             tx.commitTransaction();
             tx.beginTransaction();
             tx.send(new ProducerRecord<>(topic, 0, null, "aborted-last")).get();

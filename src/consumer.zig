@@ -1727,8 +1727,8 @@ fn resetOffset(c: *client.Client, alloc: std.mem.Allocator, opts: Options, curso
     c.vlog("partition {d}: offset out of range; reset to {d}", .{ cursor.pidx, cursor.offset });
 }
 
-/// Fill `Client.errDetail()` with the partition's readable offset range so the
-/// user can pick an offset that exists instead of silently replaying.
+/// Fill `Client.errDetail()` with the seek range and, for read-committed
+/// consumers, the current boundary for visible records.
 fn reportOffsetRange(c: *client.Client, alloc: std.mem.Allocator, opts: Options, cursor: *Cursor) !void {
     const requested = cursor.offset;
     var probe = cursor.*;
@@ -1738,19 +1738,23 @@ fn reportOffsetRange(c: *client.Client, alloc: std.mem.Allocator, opts: Options,
         return;
     };
     const earliest = probe.offset;
-    listOffsetsLeader(c, alloc, opts.topic, &part, .latest, opts.isolation) catch {
+    listOffsetsLeader(c, alloc, opts.topic, &part, .latest, .read_uncommitted) catch {
         c.setErr("offset {d} is out of range for partition {d}", .{ requested, cursor.pidx });
         return;
     };
-    const latest = probe.offset;
-    const boundary = if (opts.isolation == .read_committed) "last stable offset" else "high watermark";
-    if (earliest == latest)
-        c.setErr("offset {d} is out of range for partition {d}: no readable offsets ({s} {d})", .{
-            requested, cursor.pidx, boundary, latest,
+    const high_watermark = probe.offset;
+    var boundary_buf: [96]u8 = undefined;
+    const boundary = if (opts.isolation == .read_committed) blk: {
+        listOffsetsLeader(c, alloc, opts.topic, &part, .latest, .read_committed) catch break :blk "";
+        break :blk std.fmt.bufPrint(&boundary_buf, "; read-committed records available up to last stable offset {d}", .{probe.offset}) catch unreachable;
+    } else "";
+    if (earliest == high_watermark)
+        c.setErr("offset {d} is out of range for partition {d}: partition is empty (high watermark {d}{s})", .{
+            requested, cursor.pidx, high_watermark, boundary,
         })
     else
-        c.setErr("offset {d} is out of range for partition {d}: readable offsets are {d}..{d} ({s} {d})", .{
-            requested, cursor.pidx, earliest, latest - 1, boundary, latest,
+        c.setErr("offset {d} is out of range for partition {d}: valid offsets are {d}..{d} (high watermark {d}{s})", .{
+            requested, cursor.pidx, earliest, high_watermark - 1, high_watermark, boundary,
         });
 }
 

@@ -569,9 +569,10 @@ By default, `kite consume` starts at the latest offset for its isolation
 level and selects all partitions.
 `-B`/`--from-beginning` starts at the earliest available offset; `--offset N`
 starts at offset N in every selected partition. If the broker rejects N as
-out of range, kite reports the readable range and its boundary (e.g.,
-`readable offsets are 0..334 (last stable offset 335)`) rather than silently
-replaying from the beginning. `--partition P` selects one partition.
+out of range, kite reports the seek range and the high watermark rather than
+silently replaying from the beginning. With read-committed isolation, the message
+also shows the last stable offset: a seek beyond it can succeed but returns no
+records until the transaction resolves. `--partition P` selects one partition.
 
 When the read stops depends on stdout:
 
@@ -1044,9 +1045,9 @@ General:
   operation on the topic.
 - **`batch of N exceeds the broker's max.message.bytes`:** split the input or
   raise the topic/broker limit.
-- **`offset N is out of range`:** the message shows the readable range and its
-  boundary (last stable offset or high watermark); use `-B` for the earliest
-  or omit `--offset` for the latest.
+- **`offset N is out of range`:** the message shows the seek range and high
+  watermark, plus the last stable offset in read-committed mode. Use `-B`
+  for the earliest or omit `--offset` for the latest.
 - **Consumer shows `waiting for records`:** the default starts at latest. Use
   `-B`, `--offset`, or a bounded `--idle` as appropriate.
 - **`kite -c TOPIC` fails with `'-c' is now a command`:** kite 0.2 turned
