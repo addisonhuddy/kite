@@ -346,7 +346,9 @@ pub const produce_help =
     "  --format FMT          Record shape: value, tsv, json (default: auto; see\n" ++
     "                        below). --json is short for --format json.\n" ++
     "  --txn ID              Produce all of stdin atomically under transactional\n" ++
-    "                        ID (commits on EOF, aborts on error or interrupt).\n" ++
+    "                        ID (commits on EOF, aborts on error or interrupt;\n" ++
+    "                        if interrupted after commit is sent, exits 130 with\n" ++
+    "                        an unknown-outcome message instead of aborting).\n" ++
     "  -q, --quiet           Suppress the summary and progress lines on stderr.\n" ++
     "  -v, --verbose         Write connection and retry diagnostics to stderr.\n" ++
     "  -h, --help            Show this help and exit.\n" ++

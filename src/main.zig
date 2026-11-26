@@ -48,7 +48,7 @@ fn fatalExit(code: u8, comptime fmt: []const u8, args: anytype) noreturn {
     if (live_stats) |s| s.clearLine();
     if (active_txn) |c| {
         active_txn = null;
-        c.abortTransactionBestEffort();
+        _ = c.abortTransactionBestEffort();
     }
     if (term.color.enabled)
         out(term.red ++ "kite:" ++ term.reset ++ " " ++ fmt ++ "\n", args)
@@ -62,7 +62,16 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
 }
 
 fn abortInterrupted() noreturn {
-    fatalExit(130, "transaction aborted (interrupted)", .{});
+    if (live_stats) |s| s.clearLine();
+    var aborted = true;
+    if (active_txn) |c| {
+        active_txn = null;
+        aborted = c.abortTransactionBestEffort();
+    }
+    if (aborted)
+        fatalExit(130, "transaction aborted (interrupted)", .{})
+    else
+        fatalExit(130, "transaction abort failed (interrupted)", .{});
 }
 
 /// A per-item error line in fatal()'s format, without exiting — delete
@@ -325,12 +334,13 @@ pub fn main(init: std.process.Init) !void {
         if (interrupted.load(.acquire))
             abortInterrupted();
         active_txn = null;
-        cli.endTransaction(true, &interrupted) catch |err| {
-            if (err == error.Interrupted) {
+        cli.endTransaction(true, &interrupted) catch |err| switch (err) {
+            error.Interrupted => {
                 active_txn = &cli;
                 abortInterrupted();
-            }
-            produceFatal(&cli, err);
+            },
+            error.CommitOutcomeUnknown => fatalExit(130, "transaction commit interrupted; outcome unknown (broker may have committed)", .{}),
+            else => produceFatal(&cli, err),
         };
     }
     for (cli.last_offsets.items) |po| stats.noteOffset(po.pidx, po.offset);

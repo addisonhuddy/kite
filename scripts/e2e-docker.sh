@@ -329,13 +329,19 @@ set +e
 rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "txn: aborted produce exited $rc, want 1"
-rc_out=$(zig-out/bin/kite consume -B --idle 2s --format value "$TXN_ABORT" 2>/dev/null)
-[ -z "$rc_out" ] || fail "txn: read_committed saw aborted records: [$rc_out]"
-ru_out=$(zig-out/bin/kite consume -B --read-uncommitted -n 2 --idle 3s --format value "$TXN_ABORT" 2>/dev/null | sort)
-ru_want=$(printf 'before-err-1\nbefore-err-2')
-[ "$ru_out" = "$ru_want" ] || fail "txn: read_uncommitted did not see flushed aborted records: [$ru_out]"
+txn_desc=$(docker exec "$NAME" /opt/kafka/bin/kafka-transactions.sh --bootstrap-server localhost:9092 describe --transactional-id kite-e2e-abort 2>/dev/null)
+echo "$txn_desc" | grep -q "CompleteAbort" || fail "txn: kite-e2e-abort state not CompleteAbort: [$txn_desc]"
+printf '{"key":"a","value":"sentinel-a"}\n{"key":"b","value":"sentinel-b"}\n' \
+    | zig-out/bin/kite produce --txn kite-e2e-abort-sentinel --json "$TXN_ABORT" >/dev/null 2>&1 \
+    || fail "txn: committed sentinel produce to $TXN_ABORT failed"
+rc_out=$(zig-out/bin/kite consume -B -n 2 --idle 3s --format value "$TXN_ABORT" 2>/dev/null | sort)
+rc_want=$(printf 'sentinel-a\nsentinel-b')
+[ "$rc_out" = "$rc_want" ] || fail "txn: read_committed did not see only sentinels after abort: [$rc_out]"
+ru_out=$(zig-out/bin/kite consume -B --read-uncommitted -n 4 --idle 3s --format value "$TXN_ABORT" 2>/dev/null | sort)
+ru_want=$(printf 'before-err-1\nbefore-err-2\nsentinel-a\nsentinel-b')
+[ "$ru_out" = "$ru_want" ] || fail "txn: read_uncommitted did not see aborted + sentinel records: [$ru_out]"
 
-# Aborted run on SIGINT after records flushed: read_committed sees nothing.
+# Aborted run on SIGINT after records flushed: read_committed sees only later sentinels.
 TXN_INT=kite-txn-sigint-e2e
 zig-out/bin/kite topic delete -y --if-exists "$TXN_INT" >/dev/null 2>&1 || true
 zig-out/bin/kite topic create -p 3 -r 1 "$TXN_INT" >/dev/null 2>&1 \
@@ -357,11 +363,19 @@ set -e
 exec 3>&-
 rm -f "$TXN_FIFO"
 [ "$rc" -eq 130 ] || fail "txn: SIGINT produce exited $rc, want 130"
-rc_out=$(zig-out/bin/kite consume -B --idle 2s --format value "$TXN_INT" 2>/dev/null)
-[ -z "$rc_out" ] || fail "txn: read_committed saw SIGINT-aborted records: [$rc_out]"
-ru_out=$(zig-out/bin/kite consume -B --read-uncommitted -n 2 --idle 3s --format value "$TXN_INT" 2>/dev/null | sort)
-ru_want=$(printf 'before-int-1\nbefore-int-2')
-[ "$ru_out" = "$ru_want" ] || fail "txn: read_uncommitted did not see SIGINT-aborted records: [$ru_out]"
+txn_int_desc=$(docker exec "$NAME" /opt/kafka/bin/kafka-transactions.sh --bootstrap-server localhost:9092 describe --transactional-id kite-e2e-sigint 2>/dev/null)
+echo "$txn_int_desc" | grep -q "CompleteAbort" || fail "txn: kite-e2e-sigint state not CompleteAbort: [$txn_int_desc]"
+printf 'k1\tsentinel-int-1\nk2\tsentinel-int-2\n' \
+    | zig-out/bin/kite produce --txn kite-e2e-sigint-sentinel "$TXN_INT" >/dev/null 2>&1 \
+    || fail "txn: committed sentinel produce to $TXN_INT failed"
+rc_out=$(zig-out/bin/kite consume -B -n 2 --idle 3s --format value "$TXN_INT" 2>/dev/null | sort)
+rc_want=$(printf 'sentinel-int-1\nsentinel-int-2')
+[ "$rc_out" = "$rc_want" ] || fail "txn: read_committed did not see only sentinels after SIGINT abort: [$rc_out]"
+ru_out=$(zig-out/bin/kite consume -B --read-uncommitted -n 4 --idle 3s --format value "$TXN_INT" 2>/dev/null | sort)
+ru_want=$(printf 'before-int-1\nbefore-int-2\nsentinel-int-1\nsentinel-int-2')
+[ "$ru_out" = "$ru_want" ] || fail "txn: read_uncommitted did not see SIGINT-aborted + sentinel records: [$ru_out]"
+
+python3 scripts/check-txn-faults.py "$PWD/zig-out/bin/kite" "$NAME"
 
 zig-out/bin/kite topic delete -y "$TXN_TOPIC" "$TXN_ABORT" "$TXN_INT" >/dev/null 2>&1 || true
 echo "PASS txn"

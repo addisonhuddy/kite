@@ -92,8 +92,11 @@ pub const Client = struct {
     /// Transactional produce state (null = non-transactional).
     txn_id: ?[]const u8 = null,
     txn_coordinator_node: i32 = -1,
-    /// Partitions already registered with AddPartitionsToTxn in this transaction.
+    /// Partitions acknowledged by AddPartitionsToTxn in this transaction.
     txn_added_parts: std.AutoHashMapUnmanaged(i32, void) = .empty,
+    /// Set once an AddPartitionsToTxn request has been sent on a coordinator
+    /// connection, so error cleanup still aborts if the reply is lost.
+    txn_add_attempted: bool = false,
     last_offset: ?i64 = null,
     /// Highest acked offset per partition (sorted by pidx), for the summary.
     last_offsets: std.ArrayListUnmanaged(PartOffset) = .empty,
@@ -1377,6 +1380,7 @@ pub const Client = struct {
                 c.setErr("AddPartitionsToTxn ({s}): coordinator unreachable", .{topic});
                 return error.ProduceFailed;
             };
+            c.txn_add_attempted = true;
             const resp = c.sendRequest(
                 conn,
                 protocol.api_key.add_partitions_to_txn,
@@ -1438,28 +1442,41 @@ pub const Client = struct {
     }
 
     pub fn hasActiveTxn(c: *const Client) bool {
-        return c.txn_id != null and c.producer_inited and c.txn_added_parts.count() > 0;
+        return c.txn_id != null and c.producer_inited and (c.txn_added_parts.count() > 0 or c.txn_add_attempted);
     }
 
     /// Commit (`commit=true`) or abort (`commit=false`) the active transaction.
-    /// No-op when no partitions were added to the transaction. When `commit` is
-    /// true and `stop` becomes set before a commit request is sent (including
-    /// after a coordinator rejection such as NOT_COORDINATOR), returns
-    /// `error.Interrupted` so the caller can abort instead of committing.
+    /// No-op when no partitions were registered (or attempted) in the transaction.
+    /// When `commit` is true and `stop` becomes set before any commit request is
+    /// sent (or after a definitive coordinator rejection), returns
+    /// `error.Interrupted` so the caller can safely abort. Once a commit request
+    /// has been sent and its reply is lost, the broker may have committed; if
+    /// `stop` is set then, returns `error.CommitOutcomeUnknown` instead of
+    /// switching to abort.
     pub fn endTransaction(c: *Client, commit: bool, stop: ?*const std.atomic.Value(bool)) !void {
         if (!c.hasActiveTxn()) return;
         const txn_id = c.txn_id.?;
         const verb = if (commit) "commit" else "abort";
         var retry: Retry = .{};
+        var commit_in_flight = false;
         while (true) {
-            if (commit) if (stop) |s| if (s.load(.acquire)) return error.Interrupted;
+            if (commit) if (stop) |s| if (s.load(.acquire)) {
+                return if (commit_in_flight) error.CommitOutcomeUnknown else error.Interrupted;
+            };
             const node = try c.findTxnCoordinator();
-            if (commit) if (stop) |s| if (s.load(.acquire)) return error.Interrupted;
+            if (commit) if (stop) |s| if (s.load(.acquire)) {
+                return if (commit_in_flight) error.CommitOutcomeUnknown else error.Interrupted;
+            };
             const conn = c.connFor(node, connKey(node, txn_coord_slot)) catch {
                 c.invalidateTxnCoordinator();
-                if (commit) if (stop) |s| if (s.load(.acquire)) return error.Interrupted;
+                if (commit) if (stop) |s| if (s.load(.acquire)) {
+                    return if (commit_in_flight) error.CommitOutcomeUnknown else error.Interrupted;
+                };
                 if (retry.pause(c)) continue;
-                c.setErr("EndTxn ({s} '{s}'): coordinator unreachable", .{ verb, txn_id });
+                if (commit_in_flight)
+                    c.setErr("EndTxn (commit '{s}'): coordinator unreachable (outcome unknown; broker may have committed)", .{txn_id})
+                else
+                    c.setErr("EndTxn ({s} '{s}'): coordinator unreachable", .{ verb, txn_id });
                 return error.ProduceFailed;
             };
             const resp = c.sendRequest(
@@ -1474,9 +1491,14 @@ pub const Client = struct {
                 },
                 protocol.endTxnRequest,
             ) catch {
+                if (commit) commit_in_flight = true;
                 c.invalidateTxnCoordinator();
+                if (commit) if (stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
                 if (retry.pause(c)) continue;
-                c.setErr("EndTxn ({s} '{s}'): request failed", .{ verb, txn_id });
+                if (commit_in_flight)
+                    c.setErr("EndTxn (commit '{s}'): request failed (outcome unknown; broker may have committed)", .{txn_id})
+                else
+                    c.setErr("EndTxn ({s} '{s}'): request failed", .{ verb, txn_id });
                 return error.ProduceFailed;
             };
             defer c.alloc.free(resp.frame);
@@ -1484,23 +1506,35 @@ pub const Client = struct {
             const code = try protocol.endTxnResponse(&d);
             if (code == .none) {
                 c.txn_added_parts.clearRetainingCapacity();
+                c.txn_add_attempted = false;
                 c.vlog("transaction '{s}' {s}", .{ txn_id, if (commit) "committed" else "aborted" });
                 return;
             }
+            if (!commit and c.txn_added_parts.count() == 0 and code == .invalid_txn_state) {
+                // AddPartitionsToTxn was attempted but never opened a transaction on the broker.
+                c.txn_add_attempted = false;
+                return;
+            }
             if (isCoordinatorError(code)) c.invalidateTxnCoordinator();
-            if (commit) if (stop) |s| if (s.load(.acquire)) return error.Interrupted;
+            if (commit) if (stop) |s| if (s.load(.acquire)) {
+                return if (commit_in_flight) error.CommitOutcomeUnknown else error.Interrupted;
+            };
             if ((isCoordinatorError(code) or code.retriable()) and retry.pause(c)) continue;
             if (commit and code == .transaction_abortable) {
-                c.abortTransactionBestEffort();
+                _ = c.abortTransactionBestEffort();
             }
-            c.setErr("EndTxn ({s} '{s}'): {s}", .{ verb, txn_id, code.name() });
+            if (commit_in_flight)
+                c.setErr("EndTxn (commit '{s}'): {s} (outcome unknown; broker may have committed)", .{ txn_id, code.name() })
+            else
+                c.setErr("EndTxn ({s} '{s}'): {s}", .{ verb, txn_id, code.name() });
             return error.ProduceFailed;
         }
     }
 
     /// Best-effort abort for fatal/interrupt paths; preserves any prior err_ctx.
-    pub fn abortTransactionBestEffort(c: *Client) void {
-        if (!c.hasActiveTxn()) return;
+    /// Returns true if no transaction was active or the abort succeeded.
+    pub fn abortTransactionBestEffort(c: *Client) bool {
+        if (!c.hasActiveTxn()) return true;
         const saved_err = c.err_ctx;
         defer c.err_ctx = saved_err;
         c.endTransaction(false, null) catch {
@@ -1510,7 +1544,10 @@ pub const Client = struct {
             else
                 std.debug.print("kite: warning: failed to abort transaction\n", .{});
             c.txn_added_parts.clearRetainingCapacity();
+            c.txn_add_attempted = false;
+            return false;
         };
+        return true;
     }
 
     // -- Produce -------------------------------------------------------------
