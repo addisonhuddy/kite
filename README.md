@@ -569,10 +569,11 @@ By default, `kite consume` starts at the latest offset for its isolation
 level and selects all partitions.
 `-B`/`--from-beginning` starts at the earliest available offset; `--offset N`
 starts at offset N in every selected partition. If the broker rejects N as
-out of range, kite reports the seek range and the high watermark rather than
-silently replaying from the beginning. With read-committed isolation, the message
-also shows the last stable offset: a seek beyond it can succeed but returns no
-records until the transaction resolves. `--partition P` selects one partition.
+out of range, kite reports the seek range, which includes the high watermark,
+rather than silently replaying from the beginning. With read-committed
+isolation, the message also shows the last stable offset: a seek beyond it can
+succeed but returns no records until the transaction resolves. `--partition P`
+selects one partition.
 
 When the read stops depends on stdout:
 

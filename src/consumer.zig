@@ -1749,12 +1749,12 @@ fn reportOffsetRange(c: *client.Client, alloc: std.mem.Allocator, opts: Options,
         break :blk std.fmt.bufPrint(&boundary_buf, "; read-committed records available up to last stable offset {d}", .{probe.offset}) catch unreachable;
     } else "";
     if (earliest == high_watermark)
-        c.setErr("offset {d} is out of range for partition {d}: partition is empty (high watermark {d}{s})", .{
-            requested, cursor.pidx, high_watermark, boundary,
+        c.setErr("offset {d} is out of range for partition {d}: partition is empty; valid offset is {d} (high watermark {d}{s})", .{
+            requested, cursor.pidx, high_watermark, high_watermark, boundary,
         })
     else
         c.setErr("offset {d} is out of range for partition {d}: valid offsets are {d}..{d} (high watermark {d}{s})", .{
-            requested, cursor.pidx, earliest, high_watermark - 1, high_watermark, boundary,
+            requested, cursor.pidx, earliest, high_watermark, high_watermark, boundary,
         });
 }
 
