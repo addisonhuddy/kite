@@ -408,6 +408,10 @@ offsets; `-B` selects earliest only for partitions without a commit, otherwise
 new groups start at latest. `--offset` and `--partition` cannot be used with
 groups. Without `-g`, consuming remains independent and does not commit.
 
+Use the same isolation mode for every member of a consumer group. Mixing
+the default with `--read-uncommitted` can commit past records still hidden
+from read-committed members and make lag misleading.
+
 Offsets are committed after successful stdout flushes, at most once per second
 (and always on revoke or exit), using the fetch position or the last emitted
 offset plus one when `-n` stops mid-batch. **A commit means the record reached
@@ -564,10 +568,10 @@ transactional records. Transaction markers never appear on stdout.
 By default, `kite consume` starts at the latest offset for its isolation
 level and selects all partitions.
 `-B`/`--from-beginning` starts at the earliest available offset; `--offset N`
-starts at offset N in every selected partition and fails with the valid range
-(`valid offsets are 0..334 (next offset 335)`) if N is outside it, rather
-than silently replaying from the beginning. `--partition P` selects one
-partition.
+starts at offset N in every selected partition. If the broker rejects N as
+out of range, kite reports the readable range and its boundary (e.g.,
+`readable offsets are 0..334 (last stable offset 335)`) rather than silently
+replaying from the beginning. `--partition P` selects one partition.
 
 When the read stops depends on stdout:
 
@@ -1040,8 +1044,9 @@ General:
   operation on the topic.
 - **`batch of N exceeds the broker's max.message.bytes`:** split the input or
   raise the topic/broker limit.
-- **`offset N is out of range`:** the message shows the valid range and the
-  next offset; use `-B` for the earliest or omit `--offset` for the latest.
+- **`offset N is out of range`:** the message shows the readable range and its
+  boundary (last stable offset or high watermark); use `-B` for the earliest
+  or omit `--offset` for the latest.
 - **Consumer shows `waiting for records`:** the default starts at latest. Use
   `-B`, `--offset`, or a bounded `--idle` as appropriate.
 - **`kite -c TOPIC` fails with `'-c' is now a command`:** kite 0.2 turned

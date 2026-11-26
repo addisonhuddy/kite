@@ -14,6 +14,8 @@ class TransactionFixture {
             tx.initTransactions();
             tx.beginTransaction();
             tx.send(new ProducerRecord<>(topic, 0, null, "aborted-first")).get();
+            tx.send(new ProducerRecord<>(topic, 0, null, "aborted-middle")).get();
+            tx.send(new ProducerRecord<>(topic, 0, null, "aborted-tail")).get();
             tx.abortTransaction();
             tx.beginTransaction();
             tx.send(new ProducerRecord<>(topic, 0, null, "committed")).get();

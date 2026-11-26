@@ -1727,7 +1727,7 @@ fn resetOffset(c: *client.Client, alloc: std.mem.Allocator, opts: Options, curso
     c.vlog("partition {d}: offset out of range; reset to {d}", .{ cursor.pidx, cursor.offset });
 }
 
-/// Fill `Client.errDetail()` with the partition's valid offset range so the
+/// Fill `Client.errDetail()` with the partition's readable offset range so the
 /// user can pick an offset that exists instead of silently replaying.
 fn reportOffsetRange(c: *client.Client, alloc: std.mem.Allocator, opts: Options, cursor: *Cursor) !void {
     const requested = cursor.offset;
@@ -1743,13 +1743,14 @@ fn reportOffsetRange(c: *client.Client, alloc: std.mem.Allocator, opts: Options,
         return;
     };
     const latest = probe.offset;
+    const boundary = if (opts.isolation == .read_committed) "last stable offset" else "high watermark";
     if (earliest == latest)
-        c.setErr("offset {d} is out of range for partition {d}: partition is empty (next offset {d})", .{
-            requested, cursor.pidx, latest,
+        c.setErr("offset {d} is out of range for partition {d}: no readable offsets ({s} {d})", .{
+            requested, cursor.pidx, boundary, latest,
         })
     else
-        c.setErr("offset {d} is out of range for partition {d}: valid offsets are {d}..{d} (next offset {d})", .{
-            requested, cursor.pidx, earliest, latest - 1, latest,
+        c.setErr("offset {d} is out of range for partition {d}: readable offsets are {d}..{d} ({s} {d})", .{
+            requested, cursor.pidx, earliest, latest - 1, boundary, latest,
         });
 }
 

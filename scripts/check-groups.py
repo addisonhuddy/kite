@@ -94,8 +94,12 @@ def check_transaction_isolation():
 
         wait_for(ready, "open transaction")
         committed = ["committed"]
-        uncommitted = ["aborted-first", "committed", "aborted-last", "open", "after-open"]
-        for flags, expected, end in [((), committed, 6), (("--read-uncommitted",), uncommitted, 8)]:
+        uncommitted = ["aborted-first", "aborted-middle", "aborted-tail",
+                       "committed", "aborted-last", "open", "after-open"]
+        for flags, expected, end, boundary in [
+            ((), committed, 8, "last stable offset"),
+            (("--read-uncommitted",), uncommitted, 10, "high watermark"),
+        ]:
             output = run("consume", "-B", "--format", "value", "--idle", "1s", *flags, topic)
             assert output.splitlines() == expected, (flags, output)
             group = f"kite-isolation-{end}"
@@ -103,7 +107,33 @@ def check_transaction_isolation():
             assert [r["value"] for r in records] == expected, (flags, records)
             description = rows(run("group", "describe", group, "--json"))
             assert len(description) == 1 and description[0]["committed"] == end, description
-            assert description[0]["end"] == 8, description
+            assert description[0]["end"] == 10, description
+            out_of_range = subprocess.run(
+                [kite, "consume", "--offset", "9223372036854775806", "--idle", "1s", *flags, topic],
+                text=True, capture_output=True, timeout=15
+            )
+            assert out_of_range.returncode == 1 and not out_of_range.stdout, out_of_range
+            assert f"readable offsets are 0..{end - 1} ({boundary} {end})" in out_of_range.stderr, out_of_range
+
+        # With a one-byte budget Kafka returns one batch at a time for progress.
+        tiny_config = root / "tiny-fetch.properties"
+        tiny_config.write_text("fetch.max.bytes=1\n")
+        tiny_args = ("consume", "--config", str(tiny_config), "--offset", "1", "--json", "--idle", "2s")
+        tiny = subprocess.run(
+            [kite, *tiny_args, "-v", "-n", "1", topic], text=True, capture_output=True, timeout=15
+        )
+        assert tiny.returncode == 0, tiny.stderr
+        assert [(r["offset"], r["value"]) for r in rows(tiny.stdout)] == [(4, "committed")], tiny
+        skipped_fetches = [
+            line for line in tiny.stderr.splitlines()
+            if "offsets empty..empty" in line and not line.endswith("records bytes 0")
+        ]
+        assert len(skipped_fetches) == 3, tiny.stderr  # Two aborted batches and their abort marker.
+        tiny_uncommitted = rows(run(*tiny_args, "--read-uncommitted", "-n", "3", topic))
+        assert [(r["offset"], r["value"]) for r in tiny_uncommitted] == [
+            (1, "aborted-middle"), (2, "aborted-tail"), (4, "committed"),
+        ], tiny_uncommitted
+        print("PASS seek inside multi-batch abort across small Kafka fetches", flush=True)
 
         with latest_log.open("w") as errors:
             latest = subprocess.Popen(
