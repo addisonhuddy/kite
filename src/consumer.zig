@@ -14,6 +14,7 @@ pub const Options = struct {
     pub const Start = enum { earliest, latest, offset };
     topic: []const u8,
     group: ?[]const u8 = null,
+    isolation: protocol.Isolation = .read_committed,
     follow: bool = false,
     fetch_wait_ms: ?u64 = null,
     fetch_idle_deadline: ?std.Io.Timestamp = null,
@@ -92,7 +93,7 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
     var round_alloc = round_arena.allocator();
 
     if (opts.start != .offset) {
-        try listOffsets(c, &round_arena, opts.topic, cursors[0..cursor_count], opts.start);
+        try listOffsets(c, &round_arena, opts.topic, cursors[0..cursor_count], opts.start, opts.isolation);
         _ = round_arena.reset(.retain_capacity);
         round_alloc = round_arena.allocator();
     }
@@ -534,7 +535,7 @@ const GroupSession = struct {
             cursor.position_attempted = true;
             try parts.append(alloc, .{ .pidx = cursor.pidx, .cursor = cursor });
         };
-        listOffsetsLeader(s.c, alloc, s.opts.topic, parts.items, s.opts.start) catch |err| {
+        listOffsetsLeader(s.c, alloc, s.opts.topic, parts.items, s.opts.start, s.opts.isolation) catch |err| {
             for (parts.items) |part| if (part.cursor.offset < 0) {
                 part.cursor.leader_stale = true;
             };
@@ -1133,10 +1134,11 @@ pub fn listOffsets(
     topic: []const u8,
     cursors: []Cursor,
     start: Options.Start,
+    isolation: protocol.Isolation,
 ) !void {
     var retry: client.Retry = .{};
     while (true) {
-        listOffsetsOnce(c, arena.allocator(), topic, cursors, start) catch |err| {
+        listOffsetsOnce(c, arena.allocator(), topic, cursors, start, isolation) catch |err| {
             if (err != error.RetryFetch) return err;
             if (!retry.pause(c)) {
                 _ = try c.groupRemainingMs();
@@ -1157,6 +1159,7 @@ fn listOffsetsOnce(
     topic: []const u8,
     cursors: []Cursor,
     start: Options.Start,
+    isolation: protocol.Isolation,
 ) !void {
     var leaders: std.AutoHashMapUnmanaged(i32, void) = .empty;
     for (cursors) |cursor| {
@@ -1171,7 +1174,7 @@ fn listOffsetsOnce(
         var parts: std.ArrayListUnmanaged(ListPart) = .empty;
         for (cursors) |*cursor| if (cursor.offset < 0 and cursor.leader == leader)
             try parts.append(alloc, .{ .pidx = cursor.pidx, .cursor = cursor });
-        listOffsetsLeader(c, alloc, topic, parts.items, start) catch |err| {
+        listOffsetsLeader(c, alloc, topic, parts.items, start, isolation) catch |err| {
             if (err != error.RetryFetch) return err;
             c.dropNode(leader);
             needs_retry = true;
@@ -1186,16 +1189,18 @@ fn listOffsetsLeader(
     topic: []const u8,
     parts: []const ListPart,
     start: Options.Start,
+    isolation: protocol.Isolation,
 ) !void {
     const Ctx = struct {
         topic: []const u8,
         parts: []const ListPart,
         start: Options.Start,
+        isolation: protocol.Isolation,
     };
     const body = struct {
         fn f(e: *Encoder, ctx: Ctx) protocol.ProtoError!void {
             try e.i32v(-1);
-            try e.i8v(0);
+            try e.i8v(@intFromEnum(ctx.isolation));
             try e.compactArrayLen(1);
             try e.compactString(ctx.topic);
             try e.compactArrayLen(ctx.parts.len);
@@ -1214,6 +1219,7 @@ fn listOffsetsLeader(
         .topic = topic,
         .parts = parts,
         .start = start,
+        .isolation = isolation,
     }, body) catch return error.RetryFetch;
     var d = Decoder.init(resp.body);
     _ = try d.i32v();
@@ -1394,6 +1400,7 @@ fn fetchLeader(
         parts: []const FetchPart,
         max_wait_ms: u64,
         max_bytes: usize,
+        isolation: protocol.Isolation,
     };
     const body = struct {
         fn f(e: *Encoder, ctx: Ctx) protocol.ProtoError!void {
@@ -1401,7 +1408,7 @@ fn fetchLeader(
             try e.i32v(@intCast(ctx.max_wait_ms));
             try e.i32v(1);
             try e.i32v(@intCast(ctx.max_bytes));
-            try e.i8v(0);
+            try e.i8v(@intFromEnum(ctx.isolation));
             try e.i32v(0);
             try e.i32v(-1);
             try e.compactArrayLen(1);
@@ -1432,6 +1439,7 @@ fn fetchLeader(
         .parts = parts,
         .max_wait_ms = opts.fetch_wait_ms orelse c.cfg.fetch_max_wait_ms,
         .max_bytes = c.cfg.fetch_max_bytes,
+        .isolation = opts.isolation,
     }, body) catch {
         c.dropNode(leader);
         return outcomes;
@@ -1477,15 +1485,21 @@ fn decodeFetch(
             const pidx = try d.i32v();
             const code: protocol.ErrorCode = @enumFromInt(try d.i16v());
             const high_watermark = try d.i64v();
+            const last_stable_offset = try d.i64v();
+            const end_offset = if (opts.isolation == .read_committed) last_stable_offset else high_watermark;
             _ = try d.i64v();
-            _ = try d.i64v();
-            const aborted = try d.compactArrayLen();
-            if (aborted >= 0) {
-                for (0..@as(usize, @intCast(aborted))) |_| {
-                    _ = try d.i64v();
-                    _ = try d.i64v();
-                    try d.tagBuffer();
-                }
+            const aborted_count: usize = @intCast(@max(0, try d.compactArrayLen()));
+            if (aborted_count > (d.data.len - d.pos) / 17) return error.Truncated;
+            const aborted: []protocol.AbortedTransaction = if (opts.isolation == .read_committed and aborted_count > 0)
+                try alloc.alloc(protocol.AbortedTransaction, aborted_count)
+            else
+                &.{};
+            defer if (aborted.len > 0) alloc.free(aborted);
+            for (0..aborted_count) |i| {
+                const producer_id = try d.i64v();
+                const first_offset = try d.i64v();
+                try d.tagBuffer();
+                if (i < aborted.len) aborted[i] = .{ .producer_id = producer_id, .first_offset = first_offset };
             }
             _ = try d.i32v();
             const records = try d.compactBytes();
@@ -1532,7 +1546,7 @@ fn decodeFetch(
                     .color = opts.color,
                     .scratch = scratch,
                 };
-                next_from_batches = protocol.decodeBatches(alloc, blob, &ctx, onRecord) catch |err| switch (err) {
+                next_from_batches = protocol.decodeBatches(alloc, blob, .{ .end_offset = end_offset, .aborted = aborted }, &ctx, onRecord) catch |err| switch (err) {
                     error.WriteFailed => return error.WriteFailed,
                     else => {
                         c.setErr("decode fetch partition {d}: {s}", .{ pidx, @errorName(err) });
@@ -1552,14 +1566,15 @@ fn decodeFetch(
             }
             if (opts.group != null and !limited) part.cursor.emitted = part.cursor.offset;
             outcomes[part_idx] = .success;
+            const boundary = if (opts.isolation == .read_committed) "last stable offset" else "high watermark";
             if (range.first != null) {
                 progress.* = true;
-                c.vlog("fetch partition {d}: offsets {d}..{d}, high watermark {d}, records bytes {d}", .{
-                    pidx, range.first.?, range.last.?, high_watermark, if (records) |blob| blob.len else 0,
+                c.vlog("fetch partition {d}: offsets {d}..{d}, {s} {d}, records bytes {d}", .{
+                    pidx, range.first.?, range.last.?, boundary, end_offset, if (records) |blob| blob.len else 0,
                 });
             } else {
-                c.vlog("fetch partition {d}: offsets empty..empty, high watermark {d}, records bytes {d}", .{
-                    pidx, high_watermark, if (records) |blob| blob.len else 0,
+                c.vlog("fetch partition {d}: offsets empty..empty, {s} {d}, records bytes {d}", .{
+                    pidx, boundary, end_offset, if (records) |blob| blob.len else 0,
                 });
             }
         }
@@ -1708,7 +1723,7 @@ fn onRecord(ctx: *RecordSink, offset: i64, timestamp_ms: i64, rec: protocol.Reco
 fn resetOffset(c: *client.Client, alloc: std.mem.Allocator, opts: Options, cursor: *Cursor) !void {
     const start: Options.Start = if (opts.start == .offset) .earliest else opts.start;
     const part = [_]ListPart{.{ .pidx = cursor.pidx, .cursor = cursor }};
-    try listOffsetsLeader(c, alloc, opts.topic, &part, start);
+    try listOffsetsLeader(c, alloc, opts.topic, &part, start, opts.isolation);
     c.vlog("partition {d}: offset out of range; reset to {d}", .{ cursor.pidx, cursor.offset });
 }
 
@@ -1718,12 +1733,12 @@ fn reportOffsetRange(c: *client.Client, alloc: std.mem.Allocator, opts: Options,
     const requested = cursor.offset;
     var probe = cursor.*;
     const part = [_]ListPart{.{ .pidx = probe.pidx, .cursor = &probe }};
-    listOffsetsLeader(c, alloc, opts.topic, &part, .earliest) catch {
+    listOffsetsLeader(c, alloc, opts.topic, &part, .earliest, opts.isolation) catch {
         c.setErr("offset {d} is out of range for partition {d}", .{ requested, cursor.pidx });
         return;
     };
     const earliest = probe.offset;
-    listOffsetsLeader(c, alloc, opts.topic, &part, .latest) catch {
+    listOffsetsLeader(c, alloc, opts.topic, &part, .latest, opts.isolation) catch {
         c.setErr("offset {d} is out of range for partition {d}", .{ requested, cursor.pidx });
         return;
     };

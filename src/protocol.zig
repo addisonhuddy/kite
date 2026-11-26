@@ -1035,19 +1035,39 @@ pub const Record = struct {
     headers: []const Header = &.{},
 };
 
+pub const Isolation = enum(i8) { read_uncommitted = 0, read_committed = 1 };
+
+pub const AbortedTransaction = struct {
+    producer_id: i64,
+    first_offset: i64,
+
+    fn lessThan(_: void, a: AbortedTransaction, b: AbortedTransaction) bool {
+        return a.first_offset < b.first_offset;
+    }
+};
+
 /// Walk Kafka record batch v2 data from a Fetch partition response. The
 /// callback is invoked as records are decoded, so its slices remain valid only
 /// for the duration of the call.
 pub fn decodeBatches(
     alloc: std.mem.Allocator,
     records: []const u8,
+    visibility: struct {
+        end_offset: ?i64 = null,
+        aborted: []AbortedTransaction = &.{},
+    },
     ctx: anytype,
     comptime on_record: fn (@TypeOf(ctx), offset: i64, timestamp_ms: i64, rec: Record) anyerror!void,
 ) !?i64 {
     var pos: usize = 0;
     var next_offset: ?i64 = null;
+    std.mem.sort(AbortedTransaction, visibility.aborted, {}, AbortedTransaction.lessThan);
+    var pending = visibility.aborted;
+    var active: std.AutoHashMapUnmanaged(i64, void) = .empty;
+    defer active.deinit(alloc);
     while (records.len -| pos >= 12) {
         const base_offset = std.mem.readInt(i64, records[pos..][0..8], .big);
+        if (visibility.end_offset) |end| if (base_offset >= end) break;
         const batch_length = std.mem.readInt(i32, records[pos + 8 ..][0..4], .big);
         pos += 12;
         if (batch_length < 0 or @as(usize, @intCast(batch_length)) > records.len -| pos) break;
@@ -1069,14 +1089,22 @@ pub fn decodeBatches(
         const last_offset_delta = try d.i32v();
         const base_timestamp = try d.i64v();
         _ = try d.i64v(); // max timestamp
-        _ = try d.i64v(); // producer id
+        const producer_id = try d.i64v();
         _ = try d.i16v(); // producer epoch
         _ = try d.i32v(); // base sequence
         const records_count = try d.i32v();
         if (records_count < 0) return error.Truncated;
         const compressed_records = records[pos + d.pos .. batch_end];
 
-        if (attributes & (@as(i16, 1) << 5) == 0) {
+        const last_offset = base_offset + @as(i64, last_offset_delta);
+        while (pending.len > 0 and pending[0].first_offset <= last_offset) {
+            try active.put(alloc, pending[0].producer_id, {});
+            pending = pending[1..];
+        }
+        const transactional = attributes & (1 << 4) != 0;
+        const control = attributes & (1 << 5) != 0;
+        const aborted = active.contains(producer_id);
+        if (if (control) aborted else !transactional or !aborted) {
             const codec: u3 = @intCast(@as(u16, @bitCast(attributes)) & 7);
             const decoded = try decompress.decompress(alloc, codec, compressed_records);
             defer alloc.free(decoded);
@@ -1102,6 +1130,14 @@ pub fn decodeBatches(
                     try b.skip(n);
                     break :blk body[b.pos - n .. b.pos];
                 };
+                if (control) {
+                    if (key) |marker| {
+                        // Control key: version (int16), then type (0 = abort).
+                        if (marker.len >= 4 and std.mem.readInt(i16, marker[2..4], .big) == 0)
+                            _ = active.remove(producer_id);
+                    }
+                    break;
+                }
                 const value_len = try b.varint();
                 const value: []const u8 = if (value_len < 0)
                     ""
@@ -1131,7 +1167,9 @@ pub fn decodeBatches(
                     };
                     try headers.append(alloc, .{ .key = hk, .value = hv });
                 }
-                try on_record(ctx, base_offset + offset_delta, base_timestamp + timestamp_delta, .{
+                const offset = base_offset + offset_delta;
+                if (visibility.end_offset) |end| if (offset >= end) break;
+                try on_record(ctx, offset, base_timestamp + timestamp_delta, .{
                     .key = key,
                     .value = value,
                     .headers = headers.items,
@@ -1139,7 +1177,7 @@ pub fn decodeBatches(
                 rpos = record_end;
             }
         }
-        const batch_next = base_offset + @as(i64, last_offset_delta) + 1;
+        const batch_next = @min(last_offset + 1, visibility.end_offset orelse std.math.maxInt(i64));
         if (next_offset == null or batch_next > next_offset.?) next_offset = batch_next;
         pos = batch_end;
     }
@@ -1270,7 +1308,7 @@ test "decodes record batch v2" {
     try encodeRecordBatch(&e, &input, 1000, -1, -1, -1);
 
     var sink = DecodeTestSink{};
-    try std.testing.expectEqual(@as(?i64, 2), try decodeBatches(std.testing.allocator, e.written(), &sink, decodeTestRecord));
+    try std.testing.expectEqual(@as(?i64, 2), try decodeBatches(std.testing.allocator, e.written(), .{}, &sink, decodeTestRecord));
     try std.testing.expectEqual(@as(usize, 2), sink.count);
     try std.testing.expectEqual(@as(i64, 1), sink.offset);
     try std.testing.expectEqual(@as(i64, 1000), sink.timestamp);
@@ -1302,10 +1340,61 @@ test "skips control batches and returns next complete offset" {
     var sink = DecodeTestSink{};
     try std.testing.expectEqual(
         @as(?i64, 2),
-        try decodeBatches(std.testing.allocator, records.items, &sink, decodeTestRecord),
+        try decodeBatches(std.testing.allocator, records.items, .{}, &sink, decodeTestRecord),
     );
     try std.testing.expectEqual(@as(usize, 1), sink.count);
     try std.testing.expectEqual(@as(i64, 1), sink.offset);
+}
+
+test "filters aborted batches by producer and bounds progress by the last stable offset" {
+    const alloc = std.testing.allocator;
+    const Batch = struct { producer: i64, attributes: i16, key: ?[]const u8 = null };
+    const abort = "\x00\x00\x00\x00";
+    const commit = "\x00\x00\x00\x01";
+    const batches = [_]Batch{
+        .{ .producer = 17, .attributes = 0x10 },
+        .{ .producer = 23, .attributes = 0x10 },
+        .{ .producer = 17, .attributes = 0x30, .key = abort },
+        .{ .producer = 17, .attributes = 0x10 },
+        .{ .producer = 23, .attributes = 0x30, .key = abort },
+        .{ .producer = 17, .attributes = 0x30, .key = commit },
+        .{ .producer = 17, .attributes = 0x10 },
+        .{ .producer = 17, .attributes = 0x30, .key = abort },
+        .{ .producer = 23, .attributes = 0x10 },
+        .{ .producer = 23, .attributes = 0x30, .key = commit },
+        .{ .producer = -1, .attributes = 0 },
+    };
+    var e = Encoder.init(alloc);
+    defer e.deinit();
+    for (batches, 1..) |batch, offset| {
+        const pos = e.written().len;
+        try encodeRecordBatch(&e, &.{.{ .key = batch.key, .value = "" }}, 0, batch.producer, 0, 0);
+        const encoded = e.written()[pos..];
+        std.mem.writeInt(i64, encoded[0..8], @intCast(offset), .big);
+        std.mem.writeInt(i16, encoded[21..23], batch.attributes, .big);
+        std.mem.writeInt(u32, encoded[17..21], crc32c(encoded[21..]), .big);
+    }
+    const Sink = struct {
+        offsets: [batches.len]i64 = undefined,
+        count: usize = 0,
+
+        fn record(s: *@This(), offset: i64, _: i64, _: Record) !void {
+            s.offsets[s.count] = offset;
+            s.count += 1;
+        }
+    };
+    var aborted = [_]AbortedTransaction{
+        .{ .producer_id = 23, .first_offset = 2 },
+        .{ .producer_id = 17, .first_offset = 0 },
+        .{ .producer_id = 17, .first_offset = 7 },
+    };
+    var sink: Sink = .{};
+    try std.testing.expectEqual(@as(?i64, 11), try decodeBatches(alloc, e.written(), .{ .end_offset = 11, .aborted = &aborted }, &sink, Sink.record));
+    try std.testing.expectEqualSlices(i64, &.{ 4, 9 }, sink.offsets[0..sink.count]);
+
+    sink = .{};
+    try std.testing.expectEqual(@as(?i64, 12), try decodeBatches(alloc, e.written(), .{}, &sink, Sink.record));
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 4, 7, 9, 11 }, sink.offsets[0..sink.count]);
 }
 
 test "varint byte-exact fixtures" {

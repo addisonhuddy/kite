@@ -64,6 +64,67 @@ def stop(item):
     assert item[0].wait(timeout=40) == 130, item[2].read_text()
 
 
+def check_transaction_isolation():
+    topic = "kite-transaction-isolation"
+    run("topic", "create", "-p", "1", topic)
+    docker = ["docker", "exec", "kite-e2e-kafka"]
+    jar_path = subprocess.check_output(
+        [*docker, "sh", "-c", "echo /opt/kafka/libs/kafka-clients-*.jar"], text=True
+    ).strip()
+    jar = root / Path(jar_path).name
+    subprocess.run(["docker", "cp", f"kite-e2e-kafka:{jar_path}", jar], check=True)
+    source = Path(__file__).with_name("TransactionFixture.java")
+    subprocess.run(["javac", "--release", "17", "-cp", jar, "-d", root, source], check=True)
+    jar.unlink()
+    subprocess.run(["docker", "cp", root / "TransactionFixture.class", "kite-e2e-kafka:/tmp/"], check=True)
+    fixture_log = root / "transactions.out"
+    fixture_errors = root / "transactions.err"
+    latest_log = root / "transactions-latest.err"
+    with fixture_log.open("w") as out, fixture_errors.open("w") as errors:
+        fixture = subprocess.Popen(
+            ["docker", "exec", "-i", "kite-e2e-kafka", "java",
+             "-cp", "/tmp:/opt/kafka/libs/*", "TransactionFixture", topic],
+            stdin=subprocess.PIPE, stdout=out, stderr=errors, text=True
+        )
+    latest = None
+    try:
+        def ready():
+            assert fixture.poll() is None, fixture_errors.read_text()
+            return "READY" in fixture_log.read_text()
+
+        wait_for(ready, "open transaction")
+        committed = ["committed"]
+        uncommitted = ["aborted-first", "committed", "aborted-last", "open", "after-open"]
+        for flags, expected, end in [((), committed, 6), (("--read-uncommitted",), uncommitted, 8)]:
+            output = run("consume", "-B", "--format", "value", "--idle", "1s", *flags, topic)
+            assert output.splitlines() == expected, (flags, output)
+            group = f"kite-isolation-{end}"
+            records = consume(group, topic, "-B", "--idle", "2s", *flags)
+            assert [r["value"] for r in records] == expected, (flags, records)
+            description = rows(run("group", "describe", group, "--json"))
+            assert len(description) == 1 and description[0]["committed"] == end, description
+            assert description[0]["end"] == 8, description
+
+        with latest_log.open("w") as errors:
+            latest = subprocess.Popen(
+                [kite, "consume", "-v", "--format", "value", "-n", "1", "--idle", "15s", topic],
+                stdout=subprocess.PIPE, stderr=errors, text=True
+            )
+        wait_for(lambda: "offsets empty..empty" in latest_log.read_text(), "first fetch at latest", seconds=10)
+        fixture.communicate("\n", timeout=30)
+        assert fixture.returncode == 0, fixture_errors.read_text()
+        output, _ = latest.communicate(timeout=20)
+        assert latest.returncode == 0 and output == "open\n", (output, latest_log.read_text())
+    finally:
+        if latest is not None and latest.poll() is None:
+            latest.kill()
+            latest.wait()
+        if fixture.poll() is None:
+            fixture.kill()
+            fixture.wait()
+    print("PASS Kafka transaction isolation, stable latest and group commits", flush=True)
+
+
 try:
     topic = "kite-group-resume"
     run("topic", "create", "-p", "1", topic)
@@ -145,6 +206,8 @@ try:
     assert len(description) == 1 and description[0]["lag"] == 0, description
     assert description[0]["end"] > 20, description
     print("PASS groups transactional control markers commit fetch position and lag zero", flush=True)
+
+    check_transaction_isolation()
 
     result = subprocess.run([
         "docker", "exec", "kite-e2e-kafka", "/opt/kafka/bin/kafka-console-consumer.sh",

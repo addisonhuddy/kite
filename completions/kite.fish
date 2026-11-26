@@ -40,6 +40,7 @@ complete -c kite -n '__fish_seen_subcommand_from consume c' -l partition -d 'Rea
 complete -c kite -n '__fish_seen_subcommand_from consume c' -s n -l max -d 'Stop after MAX records' -x
 complete -c kite -n '__fish_seen_subcommand_from consume c' -s t -l idle -d 'Stop after idle duration' -x
 complete -c kite -n '__fish_seen_subcommand_from consume c' -s f -l follow -d 'Never stop on idle'
+complete -c kite -n '__fish_seen_subcommand_from consume c' -l read-uncommitted -d 'Include open and aborted transactions'
 
 # cluster.
 complete -c kite -n '__fish_seen_subcommand_from cluster; and test (count (commandline -opc)[2..-1]) -eq 0' -f -a 'list set init'

@@ -32,6 +32,7 @@ pub const ProduceArgs = struct {
 pub const ConsumeArgs = struct {
     topic: []const u8,
     group: ?[]const u8 = null,
+    isolation: protocol.Isolation = .read_committed,
     common: Common = .{},
     start: consumer.Options.Start = .latest,
     offset: i64 = 0,
@@ -385,6 +386,7 @@ pub const consume_help =
     "  --idle DUR            Stop after DUR without a record (3s, 500ms, 1m;\n" ++
     "                        a bare number is milliseconds). Also -t.\n" ++
     "  -f, --follow          Never stop on idle; wait for new records.\n" ++
+    "  --read-uncommitted    Include open and aborted transactions.\n" ++
     "  --format FMT          Record shape: value, tsv, json (default: auto; see\n" ++
     "                        below). --json is short for --format json.\n" ++
     "  -q, --quiet           Suppress the summary and progress lines on stderr.\n" ++
@@ -399,9 +401,10 @@ pub const consume_help =
     "                        sibling *_b64 fields (standard padded base64),\n" ++
     "                        making output safe for jq.\n" ++
     "\n" ++
-    "By default, start at the latest offset. When stdout is a terminal the read\n" ++
-    "follows new records until Ctrl-C; when stdout is a pipe or file and none of\n" ++
-    "--max, --idle, or --follow is given, the read stops after 5s idle.\n" ++
+    "By default, skip aborted transactions and read only up to the last stable\n" ++
+    "offset, including with --group. Without a start offset, start at latest.\n" ++
+    "When stdout is a terminal, follow until Ctrl-C. For a pipe or file, stop\n" ++
+    "after 5s idle unless --max, --idle, or --follow is given.\n" ++
     "With --group, resume committed offsets; -B applies only without a commit.\n" ++
     "Group idle time starts with the first assignment heartbeat, including an\n" ++
     "empty assignment; a member with zero partitions exits after that window.\n" ++
@@ -626,10 +629,10 @@ pub fn parseHeaderArg(s: []const u8) !protocol.Header {
 }
 
 const produce_only = [_][]const u8{ "-H", "--csv", "--key" };
-const consume_only = [_][]const u8{ "-g", "--group", "-B", "--from-beginning", "--offset", "--partition", "-n", "--max", "-t", "--idle", "-f", "--follow" };
+const consume_only = [_][]const u8{ "-g", "--group", "-B", "--from-beginning", "--offset", "--partition", "-n", "--max", "-t", "--idle", "-f", "--follow", "--read-uncommitted" };
 
 const produce_options = [_][]const u8{ "--bootstrap", "--config", "--format", "--json", "--csv", "--key", "--quiet", "--verbose", "--help" };
-const consume_options = [_][]const u8{ "--bootstrap", "--config", "--group", "--from-beginning", "--offset", "--partition", "--max", "--idle", "--follow", "--format", "--json", "--quiet", "--verbose", "--help" };
+const consume_options = [_][]const u8{ "--bootstrap", "--config", "--group", "--from-beginning", "--offset", "--partition", "--max", "--idle", "--follow", "--read-uncommitted", "--format", "--json", "--quiet", "--verbose", "--help" };
 const cluster_options = [_][]const u8{ "--config", "--json", "--format", "--quiet", "--verbose", "--help" };
 const update_options = [_][]const u8{"--help"};
 const topic_options = [_][]const u8{ "--bootstrap", "--config", "--format", "--json", "--all", "--partitions", "--replication-factor", "--set", "--unset", "--yes", "--if-exists", "--if-not-exists", "--quiet", "--verbose", "--help" };
@@ -1008,6 +1011,8 @@ pub fn parseConsume(alloc: std.mem.Allocator, args: []const []const u8) Result(C
             }
         } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--follow")) {
             parsed.follow = true;
+        } else if (std.mem.eql(u8, arg, "--read-uncommitted")) {
+            parsed.isolation = .read_uncommitted;
         } else if (arg.len > 0 and arg[0] == '-') {
             return .{ .err = unknownOption(alloc, .consume, arg) };
         } else if (topic == null) {
@@ -1634,6 +1639,14 @@ test "consume parser accepts long spellings, durations, -B and --follow" {
     try std.testing.expectEqual(@as(?u64, null), parseDurationMs("3x"));
     try std.testing.expectEqual(@as(?u64, null), parseDurationMs("s"));
     try std.testing.expectEqual(@as(?u64, null), parseDurationMs("-5"));
+}
+
+test "consuming defaults to committed isolation with an opt-out for groups" {
+    const alloc = std.heap.page_allocator;
+    const default = parseConsume(alloc, &.{"events"});
+    try std.testing.expectEqual(protocol.Isolation.read_committed, default.ok.isolation);
+    const opt_out = parseConsume(alloc, &.{ "-g", "g", "--read-uncommitted", "events" });
+    try std.testing.expectEqual(protocol.Isolation.read_uncommitted, opt_out.ok.isolation);
 }
 
 test "parser reports exact argument errors" {

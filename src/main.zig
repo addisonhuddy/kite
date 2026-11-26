@@ -711,6 +711,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     const consumed = consumer.run(&cli, .{
         .topic = topic_name,
         .group = consume.group,
+        .isolation = consume.isolation,
         .follow = consume.follow,
         .start = consume.start,
         .offset = consume.offset,
@@ -1054,7 +1055,7 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
         };
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
-        if (available) consumer.listOffsets(&c, &arena, topic, cursors, .latest) catch fatalErr(&c, "could not fetch end offsets");
+        if (available) consumer.listOffsets(&c, &arena, topic, cursors, .latest, .read_uncommitted) catch fatalErr(&c, "could not fetch end offsets");
         while (i < rows.items.len and std.mem.eql(u8, topic, rows.items[i].topic)) : (i += 1) {
             const r = rows.items[i];
             var end: ?i64 = null;

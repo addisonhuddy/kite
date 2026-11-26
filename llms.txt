@@ -59,13 +59,15 @@ kite topic delete [-y] [--if-exists] TOPIC...   -y required when stderr is not a
 ## Consume
 
 kite consume [OPTIONS] [@CLUSTER] TOPIC   records on stdout
--B, --from-beginning            earliest offset (default: latest)
+-B, --from-beginning            earliest offset (default: latest for the isolation level)
 --offset N  --partition P       start offset / single partition
 -n, --max N                     stop after N records
 -t, --idle DUR                  stop after DUR without records (3s, 500ms, 1m)
 -f, --follow                    never stop on idle
+--read-uncommitted              include open and aborted transactional records
 --json                          UTF-8 JSON per record; invalid UTF-8 key/value/header bytes use sibling *_b64 fields (standard padded base64), safe for jq
 Default when stdout is a pipe or file: stop after 5 s idle, so scripts never hang.
+Default isolation, also with -g: read committed (stop at the last stable offset and skip aborted transactions). --read-uncommitted reads to the high watermark. Neither mode prints transaction markers.
 
 ## Contract
 

@@ -341,6 +341,7 @@ kite --version                            Print the version.
 | consume | `-n`, `--max MAX` | Stop after MAX records. |
 | consume | `-t`, `--idle DUR` | Stop after DUR without a record (`3s`, `500ms`, `1m`; bare number = ms). |
 | consume | `-f`, `--follow` | Never stop on idle, even when stdout is a pipe. |
+| consume | `--read-uncommitted` | Include open and aborted transactional records. |
 | all | `-q`, `--quiet` | Suppress the summary and progress lines on stderr. |
 | produce, consume | `-v`, `--verbose` | Connection, retry, and fetch diagnostics on stderr. |
 | all | `-h`, `--help` | Plain-text help for the selected mode. |
@@ -553,7 +554,15 @@ See the full walkthrough in [examples/wing/](examples/wing).
 
 ## Consuming
 
-By default, `kite consume` starts at the latest offset and selects all partitions.
+By default, `kite consume` (including `consume -g`) uses read-committed
+isolation: it skips aborted transactional records and reads only up to the
+last stable offset, holding back records at or after the first open
+transaction in each partition until it completes. Use `--read-uncommitted`
+to read up to the high watermark instead, including open and aborted
+transactional records. Transaction markers never appear on stdout.
+
+By default, `kite consume` starts at the latest offset for its isolation
+level and selects all partitions.
 `-B`/`--from-beginning` starts at the earliest available offset; `--offset N`
 starts at offset N in every selected partition and fails with the valid range
 (`valid offsets are 0..334 (next offset 335)`) if N is outside it, rather

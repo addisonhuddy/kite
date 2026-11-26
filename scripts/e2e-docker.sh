@@ -2,7 +2,7 @@
 # End-to-end test against a real Kafka in Docker: single-node KRaft broker,
 # then scripts/smoke.sh plus a few broker-dependent edge cases.
 #
-# Needs: docker, a built zig-out/bin/kite (built here if missing).
+# Needs: docker, JDK 17+, a built zig-out/bin/kite (built here if missing).
 # Env: KITE_KAFKA_IMAGE (default apache/kafka:4.0.0),
 #      KITE_E2E_TIMEOUT (broker readiness deadline, seconds; default 120),
 #      KITE_E2E_KEEP=1 to keep the container running for debugging.
