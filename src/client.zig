@@ -64,6 +64,7 @@ pub const Retry = struct {
 
 pub const Client = struct {
     group_deadline: ?std.Io.Timestamp = null,
+    wait_hook: ?transport.WaitHook = null,
     alloc: std.mem.Allocator,
     io: std.Io,
     env: *std.process.Environ.Map,
@@ -379,7 +380,8 @@ pub const Client = struct {
             protocol.api_key.create_topics, protocol.api_key.delete_topics, protocol.api_key.create_partitions => 30000,
             else => if (comptime @typeInfo(@TypeOf(ctx)) == .@"struct" and @hasField(@TypeOf(ctx), "max_wait_ms")) ctx.max_wait_ms else 0,
         };
-        transport.setTimeout(conn, try c.requestTimeoutMs(server_wait));
+        const timeout = try c.requestTimeoutMs(server_wait);
+        transport.setTimeout(conn, timeout);
         var e = Encoder.init(alloc);
         defer e.deinit();
         // ApiVersions and SaslHandshake are the non-/semi-flexible oddballs:
@@ -389,6 +391,15 @@ pub const Client = struct {
         const resp_tags = key != protocol.api_key.api_versions and key != protocol.api_key.sasl_handshake;
         try protocol.encodeRequest(&e, key, ver, flexible, "kite", ctx, body_fn);
         try transport.send(conn, e.written());
+        const use_hook = c.wait_hook != null and key != protocol.api_key.consumer_group_heartbeat and key != protocol.api_key.find_coordinator;
+        if (use_hook) {
+            conn.net_reader.wait_hook = c.wait_hook;
+            conn.setReadDeadline(c.group_deadline orelse std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(@intCast(timeout))));
+        }
+        defer if (use_hook) {
+            conn.net_reader.wait_hook = null;
+            conn.setReadDeadline(null);
+        };
         return try transport.recv(conn, alloc, protocol.lastCorrelationId(), resp_tags);
     }
 
@@ -654,25 +665,34 @@ pub const Client = struct {
     }
 
     pub fn invalidateCoordinator(c: *Client) void {
-        if (c.coordinator_node >= 0) c.dropConn(connKey(c.coordinator_node, 0xFFFF_FFFE));
+        if (c.coordinator_node >= 0) {
+            c.dropConn(connKey(c.coordinator_node, 0xFFFF_FFFE));
+            c.dropConn(connKey(c.coordinator_node, 0xFFFF_FFFD));
+        }
+        c.coordinator_node = -1;
+    }
+
+    fn invalidateCoordinatorSlot(c: *Client, slot: u32) void {
+        if (c.coordinator_node >= 0) c.dropConn(connKey(c.coordinator_node, slot));
         c.coordinator_node = -1;
     }
 
     pub fn groupRequest(c: *Client, alloc: std.mem.Allocator, group: []const u8, key: i16, ver: i16, api: []const u8, ctx: anytype, comptime encode: fn (*Encoder, @TypeOf(ctx)) protocol.ProtoError!void) !Resp {
         try c.requireVersion(key, ver, api);
+        const slot: u32 = if (key == protocol.api_key.consumer_group_heartbeat) 0xFFFF_FFFD else 0xFFFF_FFFE;
         var retry: Retry = .{};
         var request = ctx;
         while (true) {
             const node = try c.findCoordinator(group);
-            const conn = c.connFor(node, connKey(node, 0xFFFF_FFFE)) catch |err| {
-                c.invalidateCoordinator();
+            const conn = c.connFor(node, connKey(node, slot)) catch |err| {
+                c.invalidateCoordinatorSlot(slot);
                 if (comptime @TypeOf(ctx) == protocol.Heartbeat) request = request.forRetry();
                 if (retry.pause(c)) continue;
                 _ = try c.groupRemainingMs();
                 return err;
             };
             return c.sendRequestAlloc(alloc, conn, key, ver, request, encode) catch |err| {
-                c.invalidateCoordinator();
+                c.invalidateCoordinatorSlot(slot);
                 if (comptime @TypeOf(ctx) == protocol.Heartbeat) request = request.forRetry();
                 if (retry.pause(c)) continue;
                 _ = try c.groupRemainingMs();
@@ -2056,7 +2076,33 @@ pub const Client = struct {
     }
 
     pub fn sleep(c: *Client, ms: u64) void {
-        std.Io.sleep(c.io, .fromMilliseconds(@intCast(ms)), .awake) catch {};
+        if (c.wait_hook == null or ms == 0) {
+            std.Io.sleep(c.io, .fromMilliseconds(@intCast(ms)), .awake) catch {};
+            return;
+        }
+        const end = std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(@intCast(ms)));
+        while (true) {
+            const now = std.Io.Timestamp.now(c.io, .awake);
+            const left = now.durationTo(end).toMilliseconds();
+            if (left <= 0) return;
+            var step: u64 = @intCast(left);
+            var hook_due = false;
+            if (c.wait_hook) |hook| {
+                if (hook.next_due(hook.ctx)) |due| {
+                    const until = now.durationTo(due).toMilliseconds();
+                    if (until <= 0) {
+                        hook.tick(hook.ctx);
+                        continue;
+                    }
+                    if (@as(u64, @intCast(until)) <= step) {
+                        step = @intCast(until);
+                        hook_due = true;
+                    }
+                }
+            }
+            std.Io.sleep(c.io, .fromMilliseconds(@intCast(step)), .awake) catch {};
+            if (hook_due) if (c.wait_hook) |hook| hook.tick(hook.ctx);
+        }
     }
 
     pub fn connFor(c: *Client, node: i32, key: u64) !*Conn {

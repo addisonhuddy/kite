@@ -28,6 +28,13 @@ const tls_plain_len = 32 * 1024;
 /// send (metadata for one topic, produce acks).
 const max_response_len = 16 << 20;
 
+pub const WaitHook = struct {
+    ctx: *anyopaque,
+    io: std.Io,
+    next_due: *const fn (*anyopaque) ?std.Io.Timestamp,
+    tick: *const fn (*anyopaque) void,
+};
+
 const SocketReader = struct {
     interface: std.Io.Reader,
     fd: std.posix.socket_t,
@@ -37,6 +44,7 @@ const SocketReader = struct {
         deadline: std.Io.Timestamp,
         io: std.Io,
     } = null,
+    wait_hook: ?WaitHook = null,
 
     fn readVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
         const self: *SocketReader = @alignCast(@fieldParentPtr("interface", r));
@@ -44,16 +52,45 @@ const SocketReader = struct {
         const nbufs, const data_size = try r.writableVector(&buffers, data);
         std.debug.assert(nbufs != 0 and buffers[0].len != 0);
         while (true) {
+            var poll_limit: ?u64 = null;
+            var hook_due = false;
+            var ready = false;
             if (self.cancellation) |cancel| {
                 if (cancel.stop) |flag| if (flag.load(.acquire)) return error.ReadFailed;
                 const remaining = std.Io.Timestamp.now(cancel.io, .awake).durationTo(cancel.deadline).toMilliseconds();
                 if (remaining <= 0) {
-                    self.err = error.IoTimedOut;
-                    return error.ReadFailed;
+                    if (self.wait_hook != null) {
+                        var fds = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+                        if ((std.posix.poll(&fds, 0) catch 0) > 0) ready = true;
+                    }
+                    if (!ready) {
+                        self.err = error.IoTimedOut;
+                        return error.ReadFailed;
+                    }
+                } else {
+                    poll_limit = @intCast(if (cancel.stop != null) @min(remaining, 50) else remaining);
                 }
-                const poll_ms = if (cancel.stop != null) @min(remaining, 50) else remaining;
-                var fds = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
-                if ((std.posix.poll(&fds, @intCast(@min(poll_ms, std.math.maxInt(i32)))) catch return error.ReadFailed) == 0) continue;
+            }
+            if (!ready) {
+                if (self.wait_hook) |hook| {
+                    if (hook.next_due(hook.ctx)) |due| {
+                        const until = std.Io.Timestamp.now(hook.io, .awake).durationTo(due).toMilliseconds();
+                        if (until <= 0) {
+                            hook_due = true;
+                            poll_limit = 0;
+                        } else {
+                            const cap: u64 = @intCast(until);
+                            poll_limit = if (poll_limit) |p| @min(p, cap) else cap;
+                        }
+                    }
+                }
+                if (poll_limit) |ms| {
+                    var fds = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+                    if ((std.posix.poll(&fds, @intCast(@min(ms, std.math.maxInt(i32)))) catch return error.ReadFailed) == 0) {
+                        if (hook_due) self.wait_hook.?.tick(self.wait_hook.?.ctx);
+                        continue;
+                    }
+                }
             }
             const n = std.posix.system.read(self.fd, buffers[0].ptr, buffers[0].len);
             switch (std.posix.errno(n)) {

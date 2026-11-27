@@ -4,6 +4,7 @@ const config = @import("config.zig");
 const protocol = @import("protocol.zig");
 const stats = @import("stats.zig");
 const term = @import("term.zig");
+const transport = @import("transport.zig");
 const json = @import("json.zig");
 const format_mod = @import("format.zig");
 
@@ -169,10 +170,16 @@ const group_rebalance_timeout_ms = 30000;
 const group_session_assumed_ms = 45000;
 const group_commit_floor_ms = 1000;
 const group_rpc_min_timeout_ms = 1000;
+const heartbeat_min_timeout_ms = 50;
 const heartbeat_slack_ms = 100;
 
 fn heartbeatSlack(interval: u64) u64 {
     return @min(heartbeat_slack_ms, interval / 4);
+}
+
+fn heartbeatTimeoutMs(interval: u64) u64 {
+    if (interval >= group_rpc_min_timeout_ms) return interval -| heartbeatSlack(interval);
+    return @max(heartbeat_min_timeout_ms, interval +| @min(20, interval / 5));
 }
 
 const GroupSession = struct {
@@ -188,7 +195,10 @@ const GroupSession = struct {
     position_fetch_due: bool = false,
     joined_once: bool = false,
     heartbeat_due: bool = true,
-    fetched_since_beat: bool = false,
+    hook_paused: bool = false,
+    hook_timeouts: u32 = 0,
+    pending_beat: ?PendingHeartbeat = null,
+    pending_error: ?anyerror = null,
     last_heartbeat: std.Io.Timestamp,
     last_record: std.Io.Timestamp,
     last_commit: ?std.Io.Timestamp = null,
@@ -204,11 +214,13 @@ const GroupSession = struct {
         s.c.group_deadline = s.attempt_started.addDuration(.fromMilliseconds(@intCast(timeout)));
     }
 
+    fn beginHeartbeatAttempt(s: *GroupSession) void {
+        s.attempt_started = std.Io.Timestamp.now(s.c.io, .awake);
+        s.c.group_deadline = s.attempt_started.addDuration(.fromMilliseconds(@intCast(heartbeatTimeoutMs(s.interval))));
+    }
+
     fn beginRound(s: *GroupSession) void {
         s.beginAttempt();
-        if (s.interval >= group_rpc_min_timeout_ms) {
-            s.capDeadline(s.last_heartbeat.addDuration(.fromMilliseconds(@intCast(s.interval))));
-        }
         if (!s.opts.follow) if (s.recoveryDeadline()) |deadline| s.capDeadline(deadline);
         if (s.assignment_seen and s.idleReady()) if (s.opts.idle_ms) |idle| {
             const io_slack: u64 = if (s.recoveryDeadline() == null) 1000 else 0;
@@ -364,8 +376,151 @@ const GroupSession = struct {
         s.c.vlog("committed {d} offsets for group {s}", .{ parts.items.len, s.opts.group.? });
     }
 
+    fn deinitPending(s: *GroupSession) void {
+        if (s.pending_beat) |pb| {
+            for (pb.assignment) |t| s.c.alloc.free(t.partitions);
+            s.c.alloc.free(pb.assignment);
+            s.pending_beat = null;
+        }
+        s.pending_error = null;
+    }
+
+    fn waitHook(s: *GroupSession) transport.WaitHook {
+        return .{
+            .ctx = s,
+            .io = s.c.io,
+            .next_due = nextHeartbeatDue,
+            .tick = heartbeatTick,
+        };
+    }
+
+    fn nextHeartbeatDue(ctx: *anyopaque) ?std.Io.Timestamp {
+        const s: *GroupSession = @ptrCast(@alignCast(ctx));
+        if (s.epoch <= 0 or s.heartbeat_due or s.hook_paused or s.pending_beat != null or s.pending_error != null) return null;
+        return s.last_heartbeat.addDuration(.fromMilliseconds(@intCast(s.interval)));
+    }
+
+    fn assignmentUnchanged(s: *const GroupSession, assignment: ?[]const protocol.TopicAssignment) bool {
+        const list = assignment orelse return true;
+        if (!s.assignment_seen) return false;
+        var assigned: []const i32 = &.{};
+        for (list) |t| {
+            if (!std.mem.eql(u8, &t.topic_id, &s.c.topic_id)) return false;
+            assigned = t.partitions;
+        }
+        return !assignmentChanged(s.owned.items, assigned);
+    }
+
+    fn heartbeatTick(ctx: *anyopaque) void {
+        const s: *GroupSession = @ptrCast(@alignCast(ctx));
+        const prev_hook = s.c.wait_hook;
+        const prev_deadline = s.c.group_deadline;
+        const prev_attempt = s.attempt_started;
+        s.c.wait_hook = null;
+        defer {
+            s.c.wait_hook = prev_hook;
+            s.c.group_deadline = prev_deadline;
+            s.attempt_started = prev_attempt;
+        }
+        var arena = std.heap.ArenaAllocator.init(s.c.alloc);
+        defer arena.deinit();
+        var attempts: u8 = 0;
+        while (attempts < 2) : (attempts += 1) {
+            _ = arena.reset(.retain_capacity);
+            const sent = std.Io.Timestamp.now(s.c.io, .awake);
+            s.attempt_started = sent;
+            s.c.group_deadline = sent.addDuration(.fromMilliseconds(@intCast(heartbeatTimeoutMs(s.interval))));
+            const alloc = arena.allocator();
+            const parts = alloc.alloc(i32, s.owned.items.len) catch {
+                s.pending_error = error.OutOfMemory;
+                s.hook_paused = true;
+                return;
+            };
+            for (s.owned.items, parts) |cursor, *p| p.* = cursor.pidx;
+            const full = attempts > 0 or s.hook_timeouts > 0;
+            const res = s.c.heartbeat(alloc, .{
+                .group = s.opts.group.?,
+                .member_id = &s.member,
+                .member_epoch = s.epoch,
+                .rebalance_timeout_ms = if (full) group_rebalance_timeout_ms else -1,
+                .topics = if (full) &.{s.opts.topic} else null,
+                .assignment = if (full) (if (parts.len == 0) &.{} else &.{.{ .topic_id = s.c.topic_id, .partitions = parts }}) else null,
+                .retry_fields = .{
+                    .rebalance_timeout_ms = group_rebalance_timeout_ms,
+                    .topics = &.{s.opts.topic},
+                    .assignment = if (parts.len == 0) &.{} else &.{.{ .topic_id = s.c.topic_id, .partitions = parts }},
+                },
+            });
+            if (res) |hb| {
+                s.hook_timeouts = 0;
+                if (hb.code == .none and s.assignmentUnchanged(hb.assignment)) {
+                    s.epoch = hb.member_epoch;
+                    s.interval = @intCast(@max(1, hb.heartbeat_interval_ms));
+                    s.last_heartbeat = sent;
+                    s.heartbeatSucceeded();
+                    return;
+                }
+                const cloned = cloneAssignment(s.c.alloc, hb.assignment) catch |err| {
+                    s.pending_error = err;
+                    s.hook_paused = true;
+                    return;
+                };
+                s.deinitPending();
+                s.pending_beat = .{
+                    .sent = sent,
+                    .code = hb.code,
+                    .member_epoch = hb.member_epoch,
+                    .heartbeat_interval_ms = hb.heartbeat_interval_ms,
+                    .has_assignment = hb.assignment != null,
+                    .assignment = cloned,
+                };
+                s.hook_paused = true;
+                return;
+            } else |err| {
+                if (err != error.GroupDeadlineExceeded) {
+                    s.pending_error = err;
+                    s.hook_paused = true;
+                    return;
+                }
+                s.hook_timeouts +|= 1;
+                s.startRecovery();
+                if (s.hook_timeouts == 1) continue;
+                s.heartbeat_due = true;
+                s.hook_paused = true;
+                return;
+            }
+        }
+    }
+
+    fn drainPending(s: *GroupSession, arena: *std.heap.ArenaAllocator) !void {
+        if (s.pending_error) |err| {
+            s.pending_error = null;
+            s.hook_paused = false;
+            return err;
+        }
+        if (s.pending_beat) |pb| {
+            s.pending_beat = null;
+            defer {
+                for (pb.assignment) |t| s.c.alloc.free(t.partitions);
+                s.c.alloc.free(pb.assignment);
+            }
+            s.hook_paused = false;
+            s.attempt_started = pb.sent;
+            try s.applyHeartbeat(arena, .{
+                .code = pb.code,
+                .message = null,
+                .member_id = &s.member,
+                .member_epoch = pb.member_epoch,
+                .heartbeat_interval_ms = pb.heartbeat_interval_ms,
+                .assignment = if (pb.has_assignment) pb.assignment else null,
+            });
+        } else {
+            s.hook_paused = false;
+        }
+    }
+
     fn beat(s: *GroupSession, arena: *std.heap.ArenaAllocator) !void {
-        s.beginAttempt();
+        s.beginHeartbeatAttempt();
         const alloc = arena.allocator();
         const parts = try alloc.alloc(i32, s.owned.items.len);
         for (s.owned.items, parts) |cursor, *p| p.* = cursor.pidx;
@@ -399,7 +554,6 @@ const GroupSession = struct {
         s.interval = @intCast(@max(1, result.heartbeat_interval_ms));
         s.last_heartbeat = if (s.attempt_started.nanoseconds > 0) s.attempt_started else std.Io.Timestamp.now(s.c.io, .awake);
         s.heartbeat_due = false;
-        s.fetched_since_beat = false;
         s.beginRound();
         if (joining) s.c.vlog("joined group '{s}', member {s}, epoch {d}", .{ s.opts.group.?, s.member, s.epoch });
         if (result.assignment) |assignment| try s.initializeAssignment(arena, assignment);
@@ -890,9 +1044,9 @@ test "unfinished assignments yield to heartbeats without losing resolved offsets
     try std.testing.expect(session.recoveryDeadline() == null);
     try std.testing.expectEqual(@as(i64, 12), session.owned.items[0].offset);
     try std.testing.expectEqual(@as(i64, 20), session.owned.items[1].offset);
-    session.last_heartbeat = now.addDuration(.fromMilliseconds(-950));
+    session.last_heartbeat = now.addDuration(.fromMilliseconds(-750));
     session.beginRound();
-    try std.testing.expect(try c.groupRemainingMs() <= 50);
+    try std.testing.expect(try c.groupRemainingMs() >= group_rpc_min_timeout_ms - 100);
 }
 
 test "follow ignores expired recovery budgets without renewing them" {
@@ -959,13 +1113,19 @@ test "failed final commits preserve pending progress and report replay" {
     }
 }
 
-test "short heartbeat intervals keep rpc budgets open and schedule from send time" {
+test "short heartbeat intervals separate liveness and data budgets and schedule from send time" {
     try std.testing.expectEqual(@as(u64, 100), heartbeatSlack(5000));
     try std.testing.expectEqual(@as(u64, 100), heartbeatSlack(400));
     try std.testing.expectEqual(@as(u64, 25), heartbeatSlack(100));
     try std.testing.expectEqual(@as(u64, 12), heartbeatSlack(50));
     try std.testing.expectEqual(@as(u64, 0), heartbeatSlack(2));
     try std.testing.expectEqual(@as(u64, 0), heartbeatSlack(1));
+
+    try std.testing.expectEqual(@as(u64, 4900), heartbeatTimeoutMs(5000));
+    try std.testing.expectEqual(@as(u64, 900), heartbeatTimeoutMs(1000));
+    try std.testing.expectEqual(@as(u64, 120), heartbeatTimeoutMs(100));
+    try std.testing.expectEqual(@as(u64, 50), heartbeatTimeoutMs(2));
+    try std.testing.expectEqual(@as(u64, 50), heartbeatTimeoutMs(1));
 
     const alloc = std.testing.allocator;
     var env: std.process.Environ.Map = .init(alloc);
@@ -977,20 +1137,43 @@ test "short heartbeat intervals keep rpc budgets open and schedule from send tim
     defer arena.deinit();
     const now = std.Io.Timestamp.now(c.io, .awake);
 
-    for ([_]u64{ 100, 2, 1 }) |interval| {
-        var session: GroupSession = .{ .c = &c, .opts = .{ .topic = "t", .group = "g" }, .member = @splat('m'), .interval = interval, .last_heartbeat = now, .last_record = now };
-        session.beginAttempt();
-        try std.testing.expect(try c.groupRemainingMs() >= group_rpc_min_timeout_ms - 100);
+    for ([_]u64{ 1000, 999, 100, 2, 1 }) |interval| {
+        var session: GroupSession = .{ .c = &c, .opts = .{ .topic = "t", .group = "g" }, .member = @splat('m'), .interval = interval, .last_heartbeat = now.addDuration(.fromMilliseconds(-750)), .last_record = now };
         session.beginRound();
         try std.testing.expect(try c.groupRemainingMs() >= group_rpc_min_timeout_ms - 100);
+        session.beginHeartbeatAttempt();
+        try std.testing.expect(try c.groupRemainingMs() <= heartbeatTimeoutMs(interval));
     }
 
     const sent = now.addDuration(.fromMilliseconds(-60));
-    var session: GroupSession = .{ .c = &c, .opts = .{ .topic = "t", .group = "g" }, .member = @splat('m'), .epoch = 1, .interval = 100, .last_heartbeat = sent, .last_record = now, .attempt_started = sent, .fetched_since_beat = true };
+    var session: GroupSession = .{ .c = &c, .opts = .{ .topic = "t", .group = "g" }, .member = @splat('m'), .epoch = 1, .interval = 100, .last_heartbeat = sent, .last_record = now, .attempt_started = sent };
     const result: protocol.HeartbeatResult = .{ .code = .none, .message = null, .member_id = "m", .member_epoch = 1, .heartbeat_interval_ms = 100, .assignment = null };
     try session.applyHeartbeat(&arena, result);
     try std.testing.expectEqual(sent, session.last_heartbeat);
-    try std.testing.expect(!session.fetched_since_beat);
+}
+
+const PendingHeartbeat = struct {
+    sent: std.Io.Timestamp,
+    code: protocol.ErrorCode,
+    member_epoch: i32,
+    heartbeat_interval_ms: i32,
+    has_assignment: bool,
+    assignment: []protocol.TopicAssignment,
+};
+
+fn cloneAssignment(alloc: std.mem.Allocator, assignment: ?[]const protocol.TopicAssignment) ![]protocol.TopicAssignment {
+    const src = assignment orelse return &.{};
+    const out = try alloc.alloc(protocol.TopicAssignment, src.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |t| alloc.free(t.partitions);
+        alloc.free(out);
+    }
+    for (src, out) |t, *dst| {
+        dst.* = .{ .topic_id = t.topic_id, .partitions = try alloc.dupe(i32, t.partitions) };
+        built += 1;
+    }
+    return out;
 }
 
 fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
@@ -1000,7 +1183,10 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
     const now = std.Io.Timestamp.now(c.io, .awake);
     var session: GroupSession = .{ .c = c, .opts = opts, .member = std.fmt.bytesToHex(random, .lower), .last_heartbeat = now, .last_record = now };
     defer session.owned.deinit(c.alloc);
+    defer session.deinitPending();
     defer session.leave();
+    c.wait_hook = session.waitHook();
+    defer c.wait_hook = null;
     var arena = std.heap.ArenaAllocator.init(c.alloc);
     defer arena.deinit();
     var scratch: std.Io.Writer.Allocating = .init(c.alloc);
@@ -1009,8 +1195,17 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
     var leader_index: usize = 0;
     var retry: client.Retry = .{};
     var commit_retry: client.Retry = .{};
+    var beat_timeouts: u32 = 0;
     var exit_error: ?anyerror = null;
     while (true) {
+        _ = arena.reset(.retain_capacity);
+        session.drainPending(&arena) catch |err| {
+            if (!session.recoverEpoch(err)) {
+                exit_error = err;
+                break;
+            }
+            session.startRecovery();
+        };
         if (opts.stop) |flag| if (flag.load(.acquire)) break;
         if (opts.max_records) |max| if (count >= max) break;
         if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
@@ -1021,20 +1216,23 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             break;
         };
         if (session.idleExpired(std.Io.Timestamp.now(c.io, .awake))) break;
-        _ = arena.reset(.retain_capacity);
         session.beginRound();
         const elapsed = session.last_heartbeat.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds();
-        if (session.heartbeat_due or elapsed >= session.interval) {
+        if (session.heartbeat_due or session.epoch == 0 or elapsed >= session.interval) {
             session.beat(&arena) catch |err| {
                 if (!session.recoverEpoch(err)) {
                     exit_error = err;
                     break;
                 }
                 session.startRecovery();
-                session.beginRound();
-                _ = retry.pause(c);
+                beat_timeouts +|= 1;
+                if (beat_timeouts > 1) {
+                    session.beginRound();
+                    _ = retry.pause(c);
+                }
             };
-            if (session.heartbeat_due) continue;
+            if (!session.heartbeat_due and session.epoch > 0) beat_timeouts = 0;
+            if (session.heartbeat_due or session.epoch == 0) continue;
         }
         if (session.idleExpired(std.Io.Timestamp.now(c.io, .awake))) break;
         if (opts.follow and session.commit_recovery_deadline != null) {
@@ -1064,15 +1262,6 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             }
         };
         session.beginRound();
-        const slack = heartbeatSlack(session.interval);
-        if (session.fetched_since_beat) {
-            const since_beat = session.last_heartbeat.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds();
-            const until_beat = session.interval -| @as(u64, @intCast(@max(0, since_beat)));
-            if (until_beat <= slack) {
-                c.sleep(until_beat);
-                continue;
-            }
-        }
         const selected = for (0..session.owned.items.len) |offset| {
             const idx = (leader_index +% offset) % session.owned.items.len;
             if (session.fetchReady(session.owned.items[idx])) break idx;
@@ -1109,9 +1298,7 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             c.sleep(remaining);
             continue;
         }
-        const since_beat = session.last_heartbeat.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds();
-        const until_beat = session.interval -| @as(u64, @intCast(@max(0, since_beat)));
-        fetch_opts.fetch_wait_ms = @min(c.cfg.fetch_max_wait_ms, @min(until_beat -| slack, remaining - @min(1000, remaining / 2)));
+        fetch_opts.fetch_wait_ms = @min(c.cfg.fetch_max_wait_ms, @min(@max(50, session.interval), remaining - @min(1000, remaining / 2)));
         if (session.idleReady()) if (opts.idle_ms) |idle| {
             const idle_remaining = idle -| @as(u64, @intCast(@max(0, session.last_record.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds())));
             if (idle_remaining <= 1) {
@@ -1125,7 +1312,6 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             exit_error = err;
             break;
         };
-        session.fetched_since_beat = true;
         const failed = session.applyFetchOutcomes(parts.items, outcomes);
         session.position_fetch_due = false;
         try out.flush();
@@ -1149,6 +1335,8 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             }
         } else retry = .{};
     }
+    c.wait_hook = null;
+    session.drainPending(&arena) catch {};
     try out.flush();
     if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
     session.beginAttempt();
@@ -1361,6 +1549,7 @@ test "mixed fetch replies update only each partition's recovery" {
     const alloc = std.testing.allocator;
     var c: client.Client = undefined;
     c.io = std.testing.io;
+    c.wait_hook = null;
     const cfg: config.Config = .{ .bootstrap_servers = &.{} };
     c.cfg = &cfg;
     const now = std.Io.Timestamp.now(c.io, .awake);
@@ -1428,6 +1617,7 @@ test "throttled empty fetches retain outage state and yield at the heartbeat dea
     const alloc = std.testing.allocator;
     var c: client.Client = undefined;
     c.io = std.testing.io;
+    c.wait_hook = null;
     const cfg: config.Config = .{ .bootstrap_servers = &.{} };
     c.cfg = &cfg;
     const now = std.Io.Timestamp.now(c.io, .awake);
