@@ -331,12 +331,18 @@ set -e
 wait_complete_abort() {
     local tid=$1
     local desc=""
-    for _ in $(seq 1 75); do
-        desc=$(docker exec "$NAME" /opt/kafka/bin/kafka-transactions.sh --bootstrap-server localhost:9092 describe --transactional-id "$tid" 2>/dev/null || true)
+    local deadline=$(( $(date +%s%3N) + 15000 ))
+    local remaining duration
+    while (( (remaining = deadline - $(date +%s%3N)) > 0 )); do
+        printf -v duration '%d.%03ds' "$((remaining / 1000))" "$((remaining % 1000))"
+        desc=$(timeout -s KILL "$duration" docker exec "$NAME" /opt/kafka/bin/kafka-transactions.sh --bootstrap-server localhost:9092 describe --transactional-id "$tid" 2>/dev/null || true)
         if echo "$desc" | grep -q "CompleteAbort"; then
             return 0
         fi
-        sleep 0.2
+        (( (remaining = deadline - $(date +%s%3N)) > 0 )) || break
+        (( remaining <= 200 )) || remaining=200
+        printf -v duration '0.%03ds' "$remaining"
+        sleep "$duration"
     done
     fail "txn: $tid did not reach CompleteAbort: [$desc]"
 }

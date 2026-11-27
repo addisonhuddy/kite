@@ -74,8 +74,9 @@ def parse_end_txn_committed(req):
 
 
 class KafkaFaultProxy:
-    def __init__(self, handler):
+    def __init__(self, handler, before_forward=None):
         self.handler = handler
+        self.before_forward = before_forward
         self.lock = threading.Lock()
         self.commit_requests = 0
         self.abort_requests = 0
@@ -114,6 +115,8 @@ class KafkaFaultProxy:
                             self.commit_requests += 1
                         else:
                             self.abort_requests += 1
+                if self.before_forward:
+                    self.before_forward(api_key, req)
                 write_frame(upstream, req)
                 resp = read_frame(upstream)
                 if resp is None:
@@ -161,20 +164,23 @@ def run_kite(*args, data=None, check=True):
 def wait_complete_abort(txn_id, timeout=15.0):
     deadline = time.monotonic() + timeout
     last = ""
-    while time.monotonic() < deadline:
-        res = subprocess.run(
-            [
-                "docker", "exec", container,
-                "/opt/kafka/bin/kafka-transactions.sh",
-                "--bootstrap-server", "localhost:9092",
-                "describe", "--transactional-id", txn_id,
-            ],
-            text=True, capture_output=True, timeout=30,
-        )
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            res = subprocess.run(
+                [
+                    "docker", "exec", container,
+                    "/opt/kafka/bin/kafka-transactions.sh",
+                    "--bootstrap-server", "localhost:9092",
+                    "describe", "--transactional-id", txn_id,
+                ],
+                text=True, capture_output=True, timeout=remaining,
+            )
+        except subprocess.TimeoutExpired:
+            break
         last = res.stdout + res.stderr
         if res.returncode == 0 and "CompleteAbort" in res.stdout:
             return
-        time.sleep(0.2)
+        time.sleep(max(0, min(0.2, deadline - time.monotonic())))
     raise AssertionError(f"{txn_id} did not reach CompleteAbort within {timeout}s:\n{last}")
 
 
@@ -411,4 +417,105 @@ out5 = run_kite("consume", "-B", "-n", "1", "--idle", "3s", "--format", "value",
 assert out5 == "sentinel-after-abort", f"expected sentinel under read_committed, got: {out5!r}"
 print("PASS txn-fault: lost AddPartitionsToTxn reply aborts cleanly and unblocks LSO")
 
-run_kite("topic", "delete", "-y", t1, t2, t3, t4, t5, check=False)
+# Hold an already-dispatched Produce on the wire while a parse failure aborts.
+t6 = "kite-txn-fault-produce-held"
+txn6 = "kite-e2e-fault-produce-held"
+run_kite("topic", "delete", "-y", "--if-exists", t6, check=False)
+run_kite("topic", "create", "-p", "1", "-r", "1", t6)
+produce_held = threading.Event()
+release_produce = threading.Event()
+produce_replied = threading.Event()
+abort_before_reply = threading.Event()
+
+
+def before_forward6(api_key, req):
+    if api_key == API_PRODUCE:
+        produce_held.set()
+        release_produce.wait(10)
+    elif api_key == API_END_TXN and not parse_end_txn_committed(req) and not produce_replied.is_set():
+        abort_before_reply.set()
+
+
+def fault6(api_key, corr_id, req, resp):
+    if api_key == API_PRODUCE:
+        produce_replied.set()
+
+
+proxy6 = KafkaFaultProxy(fault6, before_forward6)
+try:
+    with subprocess.Popen(
+        [kite, "produce", "--bootstrap", f"{BROKER_HOST}:{proxy6.port}", "--txn", txn6, "--json", t6],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    ) as p:
+        try:
+            p.stdin.write('{"value":"aborted-after-drain"}\n')
+            p.stdin.flush()
+            assert produce_held.wait(5), "expected linger to dispatch Produce"
+            p.stdin.write("invalid-json\n")
+            p.stdin.flush()
+            assert not abort_before_reply.wait(1), "abort overtook outstanding Produce"
+            release_produce.set()
+            _, err = p.communicate(timeout=10)
+            assert p.returncode == 1 and "json" in err.lower(), (p.returncode, err)
+            assert produce_replied.is_set() and proxy6.abort_requests == 1, err
+            assert not abort_before_reply.is_set(), "abort arrived before Produce settled"
+        finally:
+            release_produce.set()
+            if p.poll() is None:
+                p.kill()
+finally:
+    proxy6.close()
+
+wait_complete_abort(txn6)
+run_kite("produce", t6, data="sentinel-after-drain\n")
+assert run_kite("consume", "-B", "-n", "1", "--idle", "3s", "--format", "value", t6).stdout == "sentinel-after-drain\n"
+assert run_kite("consume", "-B", "--read-uncommitted", "-n", "2", "--idle", "3s", "--format", "value", t6).stdout == "aborted-after-drain\nsentinel-after-drain\n"
+print("PASS txn-fault: abort waits for in-flight Produce and leaves LSO unblocked")
+
+
+# Lose an accepted commit reply, then stall FindCoordinator during recovery.
+t7 = "kite-txn-fault-sigint-discovery"
+txn7 = "kite-e2e-fault-sigint-discovery"
+run_kite("topic", "delete", "-y", "--if-exists", t7, check=False)
+run_kite("topic", "create", "-p", "1", "-r", "1", t7)
+commit_reply_lost = threading.Event()
+discovery_held = threading.Event()
+release_discovery = threading.Event()
+
+
+def fault7(api_key, corr_id, req, resp):
+    if api_key == API_END_TXN and parse_end_txn_committed(req):
+        commit_reply_lost.set()
+        return "drop"
+    if api_key == API_FIND_COORDINATOR and commit_reply_lost.is_set():
+        discovery_held.set()
+        release_discovery.wait(10)
+        return "drop"
+
+
+proxy7 = KafkaFaultProxy(fault7)
+try:
+    with subprocess.Popen(
+        [kite, "produce", "--bootstrap", f"{BROKER_HOST}:{proxy7.port}", "--txn", txn7, t7],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    ) as p:
+        try:
+            p.stdin.write("k1\tcommitted-before-rediscovery\n")
+            p.stdin.close()
+            p.stdin = None
+            assert discovery_held.wait(5), "expected coordinator rediscovery after commit reply loss"
+            p.send_signal(signal.SIGINT)
+            _, err = p.communicate(timeout=3)
+            assert p.returncode == 130 and "outcome unknown" in err, (p.returncode, err)
+            assert proxy7.commit_requests == 1 and proxy7.abort_requests == 0, err
+        finally:
+            release_discovery.set()
+            if p.poll() is None:
+                p.kill()
+finally:
+    proxy7.close()
+
+assert run_kite("consume", "-B", "-n", "1", "--idle", "3s", "--format", "value", t7).stdout == "committed-before-rediscovery\n"
+print("PASS txn-fault: SIGINT during stalled coordinator rediscovery exits promptly without abort")
+
+run_kite("topic", "delete", "-y", t1, t2, t3, t4, t5, t6, t7, check=False)

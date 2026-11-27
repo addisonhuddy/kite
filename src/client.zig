@@ -36,13 +36,26 @@ pub const Retry = struct {
     backoff_ms: u64 = 100,
 
     pub fn pause(r: *Retry, c: *Client) bool {
+        return r.pauseUnlessStopped(c, null);
+    }
+
+    fn pauseUnlessStopped(r: *Retry, c: *Client, stop: ?*const std.atomic.Value(bool)) bool {
         const now = std.Io.Timestamp.now(c.io, .awake);
         const start = r.started orelse now;
         r.started = start;
         const elapsed = start.durationTo(now).toMilliseconds();
         if (c.group_deadline == null and elapsed >= 30000) return false;
         const remaining = if (c.group_deadline != null) c.groupRemainingMs() catch return false else @as(u64, @intCast(30000 - elapsed));
-        c.sleep(@min(remaining, r.backoff_ms));
+        const delay = @min(remaining, r.backoff_ms);
+        if (stop) |flag| {
+            const until = now.addDuration(.fromMilliseconds(@intCast(delay)));
+            while (!flag.load(.acquire)) {
+                const left = std.Io.Timestamp.now(c.io, .awake).durationTo(until).toMilliseconds();
+                if (left <= 0) break;
+                c.sleep(@intCast(@min(left, 50)));
+            }
+            if (flag.load(.acquire)) return false;
+        } else c.sleep(delay);
         r.backoff_ms = @min(r.backoff_ms * 2, 3000);
         _ = c.groupRemainingMs() catch return false;
         return c.group_deadline != null or start.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds() < 30000;
@@ -97,6 +110,7 @@ pub const Client = struct {
     /// Set once an AddPartitionsToTxn request has been sent on a coordinator
     /// connection, so error cleanup still aborts if the reply is lost.
     txn_add_attempted: bool = false,
+    txn_produce_unsettled_until: ?std.Io.Timestamp = null,
     last_offset: ?i64 = null,
     /// Highest acked offset per partition (sorted by pidx), for the summary.
     last_offsets: std.ArrayListUnmanaged(PartOffset) = .empty,
@@ -1267,32 +1281,41 @@ pub const Client = struct {
         c.txn_coordinator_node = -1;
     }
 
-    fn findTxnCoordinator(c: *Client) !i32 {
+    fn findTxnCoordinator(c: *Client, stop: ?*const std.atomic.Value(bool)) !i32 {
         if (c.txn_coordinator_node >= 0) return c.txn_coordinator_node;
         const txn_id = c.txn_id orelse return error.ProduceFailed;
         var retry: Retry = .{};
         while (true) {
+            if (stop) |flag| if (flag.load(.acquire)) return error.Interrupted;
+            _ = try c.groupRemainingMs();
             if (c.control == null) c.reconnectControl() catch {
-                if (retry.pause(c)) continue;
+                if (retry.pauseUnlessStopped(c, stop)) continue;
                 c.setErr("FindCoordinator (txn '{s}'): control broker unreachable", .{txn_id});
                 return error.ProduceFailed;
             };
+            const conn = c.control.?;
+            if (stop != null) {
+                const wait_ms = try c.requestTimeoutMs(0);
+                const until = std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(@intCast(wait_ms)));
+                conn.setReadCancellation(stop, until);
+            }
             const resp = c.sendRequest(
-                c.control.?,
+                conn,
                 protocol.api_key.find_coordinator,
                 protocol.version.find_coordinator,
                 txn_id,
                 protocol.findTxnCoordinatorRequest,
             ) catch {
                 c.dropControl();
-                if (retry.pause(c)) continue;
+                if (retry.pauseUnlessStopped(c, stop)) continue;
                 c.setErr("FindCoordinator (txn '{s}'): request failed", .{txn_id});
                 return error.ProduceFailed;
             };
+            conn.setReadCancellation(null, null);
             defer c.alloc.free(resp.frame);
             var d = Decoder.init(resp.body);
             const coord = try protocol.coordinatorResponse(&d);
-            if ((isCoordinatorError(coord.code) or coord.code.retriable()) and retry.pause(c)) continue;
+            if ((isCoordinatorError(coord.code) or coord.code.retriable()) and retry.pauseUnlessStopped(c, stop)) continue;
             if (coord.code != .none) {
                 c.setErr("FindCoordinator (txn '{s}'): {s}", .{ txn_id, coord.code.name() });
                 return error.ProduceFailed;
@@ -1331,7 +1354,7 @@ pub const Client = struct {
         const init_args: InitArgs = .{ .id = txn_id, .timeout_ms = c.cfg.transaction_timeout_ms };
         var retry: Retry = .{};
         while (true) {
-            const node = try c.findTxnCoordinator();
+            const node = try c.findTxnCoordinator(null);
             const conn = c.connFor(node, connKey(node, txn_coord_slot)) catch {
                 c.invalidateTxnCoordinator();
                 if (retry.pause(c)) continue;
@@ -1373,7 +1396,7 @@ pub const Client = struct {
 
         var retry: Retry = .{};
         while (remaining.items.len > 0) {
-            const node = try c.findTxnCoordinator();
+            const node = try c.findTxnCoordinator(null);
             const conn = c.connFor(node, connKey(node, txn_coord_slot)) catch {
                 c.invalidateTxnCoordinator();
                 if (retry.pause(c)) continue;
@@ -1455,15 +1478,21 @@ pub const Client = struct {
     /// it returns `error.CommitOutcomeUnknown` instead of switching to abort.
     pub fn endTransaction(c: *Client, commit: bool, stop: ?*const std.atomic.Value(bool)) !void {
         if (!c.hasActiveTxn()) return;
+        if (!commit) c.settleProduceBeforeAbort();
         const txn_id = c.txn_id.?;
         const verb = if (commit) "commit" else "abort";
+        const previous_deadline = c.group_deadline;
+        defer c.group_deadline = previous_deadline;
+        const deadline = std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(30000));
+        c.group_deadline = if (previous_deadline) |prev| .{ .nanoseconds = @min(prev.nanoseconds, deadline.nanoseconds) } else deadline;
+        const commit_stop = if (commit) stop else null;
         var retry: Retry = .{};
         var commit_ambiguous = false;
         while (true) {
             if (commit) if (stop) |s| if (s.load(.acquire)) {
                 return if (commit_ambiguous) error.CommitOutcomeUnknown else error.Interrupted;
             };
-            const node = c.findTxnCoordinator() catch |err| {
+            const node = c.findTxnCoordinator(commit_stop) catch |err| {
                 if (commit) if (stop) |s| if (s.load(.acquire)) {
                     return if (commit_ambiguous) error.CommitOutcomeUnknown else error.Interrupted;
                 };
@@ -1481,7 +1510,8 @@ pub const Client = struct {
                 if (commit) if (stop) |s| if (s.load(.acquire)) {
                     return if (commit_ambiguous) error.CommitOutcomeUnknown else error.Interrupted;
                 };
-                if (retry.pause(c)) continue;
+                if (retry.pauseUnlessStopped(c, commit_stop)) continue;
+                if (commit_stop) |s| if (s.load(.acquire)) continue;
                 if (commit_ambiguous)
                     c.setErr("EndTxn (commit '{s}'): coordinator unreachable (outcome unknown; broker may have committed)", .{txn_id})
                 else
@@ -1508,7 +1538,8 @@ pub const Client = struct {
                 c.invalidateTxnCoordinator();
                 if (commit) commit_ambiguous = true;
                 if (commit) if (stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
-                if (retry.pause(c)) continue;
+                if (retry.pauseUnlessStopped(c, commit_stop)) continue;
+                if (commit_stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
                 if (commit_ambiguous)
                     c.setErr("EndTxn (commit '{s}'): request failed (outcome unknown; broker may have committed)", .{txn_id})
                 else
@@ -1521,7 +1552,8 @@ pub const Client = struct {
                 c.invalidateTxnCoordinator();
                 if (commit) commit_ambiguous = true;
                 if (commit) if (stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
-                if (retry.pause(c)) continue;
+                if (retry.pauseUnlessStopped(c, commit_stop)) continue;
+                if (commit_stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
                 if (commit_ambiguous)
                     c.setErr("EndTxn (commit '{s}'): malformed response (outcome unknown; broker may have committed)", .{txn_id})
                 else
@@ -1531,6 +1563,7 @@ pub const Client = struct {
             if (code == .none) {
                 c.txn_added_parts.clearRetainingCapacity();
                 c.txn_add_attempted = false;
+                c.txn_produce_unsettled_until = null;
                 c.vlog("transaction '{s}' {s}", .{ txn_id, if (commit) "committed" else "aborted" });
                 return;
             }
@@ -1543,7 +1576,8 @@ pub const Client = struct {
             if (isCoordinatorError(code) or code.retriable()) {
                 if (commit) commit_ambiguous = true;
                 if (commit) if (stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
-                if (retry.pause(c)) continue;
+                if (retry.pauseUnlessStopped(c, commit_stop)) continue;
+                if (commit_stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
             } else if (commit and code == .transaction_abortable) {
                 _ = c.abortTransactionBestEffort();
             }
@@ -1575,6 +1609,38 @@ pub const Client = struct {
     }
 
     // -- Produce -------------------------------------------------------------
+
+    const produce_timeout_ms = 15000;
+
+    fn markProduceUnsettled(c: *Client) void {
+        if (c.txn_id != null)
+            c.txn_produce_unsettled_until = std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(produce_timeout_ms));
+    }
+
+    fn settleProduceBeforeAbort(c: *Client) void {
+        for (c.outstanding.items) |*o| {
+            if (o.corr < 0) continue;
+            const conn = c.conns.get(o.ckey) orelse continue;
+            var codes: std.AutoHashMapUnmanaged(i32, protocol.ErrorCode) = .empty;
+            defer codes.deinit(c.alloc);
+            c.produceRecv(conn, o.corr, &codes, null, null) catch {
+                c.dropConn(o.ckey);
+                continue;
+            };
+            if (!codes.contains(o.pidx[0])) {
+                c.dropConn(o.ckey);
+                continue;
+            }
+            o.corr = -1;
+        }
+        if (c.txn_produce_unsettled_until) |deadline| {
+            while (true) {
+                const remaining = std.Io.Timestamp.now(c.io, .awake).durationTo(deadline);
+                if (remaining.nanoseconds <= 0) break;
+                std.Io.sleep(c.io, remaining, .awake) catch {};
+            }
+        }
+    }
 
     /// A sent ProduceRequest awaiting its response. Batches stay alive in the
     /// encoders so retriable partitions can be resent verbatim.
@@ -1697,18 +1763,22 @@ pub const Client = struct {
             o.batches[0] = be.written();
             o.counts[0] = @intCast(sets[i].len);
             o.bytes = be.written().len;
+            try c.outstanding.ensureUnusedCapacity(c.alloc, 1);
             c.outstanding_bytes += o.bytes;
             if (c.claimConn(pidx)) |claim| {
                 o.ckey = claim.key;
                 if (c.connFor(claim.node, claim.key)) |conn| {
-                    o.corr = c.produceSend(conn, topic, o.pidx, o.batches) catch -1;
+                    o.corr = c.produceSend(conn, topic, o.pidx, o.batches) catch blk: {
+                        c.markProduceUnsettled();
+                        break :blk -1;
+                    };
                     if (o.corr < 0)
                         c.dropConn(claim.key)
                     else
                         o.sent = std.Io.Timestamp.now(c.io, .awake);
                 } else |_| {}
             } else |_| {}
-            try c.outstanding.append(c.alloc, o);
+            c.outstanding.appendAssumeCapacity(o);
             // Do not send a higher sequence on a new socket before retrying
             // requests lost with the old socket (or a batch with no leader).
             if (o.corr < 0) {
@@ -1776,6 +1846,7 @@ pub const Client = struct {
                 var codes = std.AutoHashMapUnmanaged(i32, protocol.ErrorCode).empty;
                 defer codes.deinit(c.alloc);
                 if (c.produceRecv(c.conns.get(o.ckey).?, o.corr, &codes, o, null)) |_| {
+                    o.corr = -1;
                     c.recordAck(o.sent);
                     for (o.pidx, o.batches, o.counts) |pi, b, count| {
                         const code = codes.get(pi) orelse .none;
@@ -1834,6 +1905,7 @@ pub const Client = struct {
                     continue;
                 };
                 const corr = c.produceSend(conn, topic, &.{pp.pidx}, &.{pp.batch}) catch {
+                    c.markProduceUnsettled();
                     c.dropConn(claim.key);
                     c.releaseConn(pp.pidx);
                     try retry.append(c.alloc, pp);
@@ -1843,6 +1915,7 @@ pub const Client = struct {
                 var codes = std.AutoHashMapUnmanaged(i32, protocol.ErrorCode).empty;
                 defer codes.deinit(c.alloc);
                 c.produceRecv(conn, corr, &codes, null, pp.count) catch {
+                    c.markProduceUnsettled();
                     c.dropConn(claim.key);
                     c.releaseConn(pp.pidx);
                     try retry.append(c.alloc, pp);
@@ -1937,7 +2010,10 @@ pub const Client = struct {
     pub fn dropConn(c: *Client, key: u64) void {
         if (c.conns.fetchRemove(key)) |kv| {
             for (c.outstanding.items) |*o| {
-                if (o.ckey == key) o.corr = -1;
+                if (o.ckey == key and o.corr >= 0) {
+                    c.markProduceUnsettled();
+                    o.corr = -1;
+                }
             }
             c.vlog("dropping connection to broker {d}", .{key >> 32});
             kv.value.close();
@@ -1971,7 +2047,7 @@ pub const Client = struct {
         pidx: []const i32,
         batches: []const []const u8,
     ) !i32 {
-        transport.setTimeout(conn, 16000);
+        transport.setTimeout(conn, produce_timeout_ms + 1000);
         c.produce_requests += 1;
         var parts: std.ArrayListUnmanaged([]const u8) = .empty;
         defer parts.deinit(c.alloc);
@@ -1987,7 +2063,7 @@ pub const Client = struct {
         try protocol.encodeRequestHeader(&head, protocol.api_key.produce, protocol.version.produce, true, "kite");
         try head.compactString(c.txn_id); // transactional_id
         try head.i16v(-1); // acks=all
-        try head.i32v(15000); // timeout_ms
+        try head.i32v(produce_timeout_ms);
         try head.compactArrayLen(1); // one topic
         try head.compactString(topic);
         try head.compactArrayLen(pidx.len);
