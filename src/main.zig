@@ -1170,24 +1170,42 @@ fn groupNumber(alloc: std.mem.Allocator, value: ?i64) []const u8 {
 }
 
 fn groupText(alloc: std.mem.Allocator, value: []const u8) []const u8 {
-    var len = value.len;
-    for (value) |byte| {
-        if (std.ascii.isControl(byte)) len += 3 else if (byte == '\\') len += 1;
-    }
-    if (len == value.len) return value;
-    const escaped = alloc.alloc(u8, len) catch oom();
-    var writer = std.Io.Writer.fixed(escaped);
-    for (value) |byte| {
-        if (std.ascii.isControl(byte)) {
-            writer.writeAll("\\x") catch unreachable;
-            writer.writeAll(&std.fmt.hex(byte)) catch unreachable;
-        } else if (byte == '\\') {
-            writer.writeAll("\\\\") catch unreachable;
-        } else {
-            writer.writeByte(byte) catch unreachable;
+    var escaped: std.Io.Writer.Allocating = .init(alloc);
+    defer escaped.deinit();
+    const writer = &escaped.writer;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < value.len) {
+        const byte = value[i];
+        const len = std.unicode.utf8ByteSequenceLength(byte) catch 0;
+        const cp = if (len != 0 and len <= value.len - i)
+            std.unicode.utf8Decode(value[i..][0..len]) catch null
+        else
+            null;
+        const unicode_control = switch (cp orelse 0) {
+            0x0080...0x009f, 0x061c, 0x200e, 0x200f, 0x2028...0x202e, 0x2066...0x2069 => true,
+            else => false,
+        };
+        const next = i + if (cp != null) @as(usize, len) else 1;
+        if (!unicode_control and cp != null and !std.ascii.isControl(byte) and byte != '\\') {
+            i = next;
+            continue;
         }
+        writer.writeAll(value[start..i]) catch oom();
+        if (unicode_control) {
+            writer.print("\\u{{{x:0>4}}}", .{cp.?}) catch oom();
+        } else if (byte == '\\') {
+            writer.writeAll("\\\\") catch oom();
+        } else {
+            writer.writeAll("\\x") catch oom();
+            writer.writeAll(&std.fmt.hex(byte)) catch oom();
+        }
+        i = next;
+        start = next;
     }
-    return escaped;
+    if (start == 0) return value;
+    writer.writeAll(value[start..]) catch oom();
+    return escaped.toOwnedSlice() catch oom();
 }
 
 test "group text escapes row separators and terminal controls but preserves UTF-8" {
@@ -1196,6 +1214,12 @@ test "group text escapes row separators and terminal controls but preserves UTF-
     const alloc = arena.allocator();
     try std.testing.expectEqualStrings("café", groupText(alloc, "café"));
     try std.testing.expectEqualStrings("member\\x09cell\\x0aforged\\x0d\\x1b[2J\\x7f\\\\", groupText(alloc, "member\tcell\nforged\r\x1b[2J\x7f\\"));
+    try std.testing.expectEqualStrings("café\\u{0085}\\u{2028}\\u{2029}雪", groupText(alloc, "café\u{85}\u{2028}\u{2029}雪"));
+    try std.testing.expectEqualStrings(
+        "\\u{061c}\\u{200e}\\u{200f}\\u{202a}\\u{202b}\\u{202c}\\u{202d}\\u{202e}\\u{2066}\\u{2067}\\u{2068}\\u{2069}",
+        groupText(alloc, "\u{61c}\u{200e}\u{200f}\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}\u{2066}\u{2067}\u{2068}\u{2069}"),
+    );
+    try std.testing.expectEqualStrings("\\xe2(\\xa1\\xff猫\\xe2\\x80", groupText(alloc, "\xe2(\xa1\xff猫\xe2\x80"));
 }
 
 fn writeGroupTable(comptime columns: usize, writer: *std.Io.Writer, headers: [columns][]const u8, rows: []const [columns][]const u8, tty: bool) !void {
