@@ -817,21 +817,33 @@ pub const Client = struct {
             }
         };
         var watch: Watch = .{ .io = c.io, .conn = conn };
-        const prev_watch = c.hedge_watch_hook;
-        c.hedge_watch_hook = .{ .io = c.io, .ctx = &watch, .next_due = Watch.nextDue, .tick = Watch.tick };
+        var conn_alive = true;
         const hedge = blk: {
+            const prev_watch = c.hedge_watch_hook;
+            c.hedge_watch_hook = .{ .io = c.io, .ctx = &watch, .next_due = Watch.nextDue, .tick = Watch.tick };
             defer c.hedge_watch_hook = prev_watch;
-            break :blk c.connectOne(addr.host, addr.port) catch {
+            if (c.connectOne(addr.host, addr.port)) |h| break :blk h else |err| {
+                if (err == error.WaitHookAborted) {
+                    if (transport.recv(conn, alloc, corr1, true)) |resp| return resp else |rerr| {
+                        if (rerr == error.OutOfMemory) return rerr;
+                        conn_alive = false;
+                    }
+                    c.hedge_watch_hook = prev_watch;
+                    break :blk c.connectOne(addr.host, addr.port) catch return error.IoFailed;
+                }
                 return transport.recv(conn, alloc, corr1, true);
-            };
+            }
         };
         var keep_hedge = false;
         defer if (!keep_hedge) {
             hedge.close();
             c.alloc.destroy(hedge);
         };
-        if (transport.waitReadable(conn, 0)) {
-            return transport.recv(conn, alloc, corr1, true);
+        if (conn_alive and transport.waitReadable(conn, 0)) {
+            if (transport.recv(conn, alloc, corr1, true)) |resp| return resp else |rerr| {
+                if (rerr == error.OutOfMemory) return rerr;
+                conn_alive = false;
+            }
         }
         const rem = try c.requestTimeoutMs(0);
         transport.setTimeout(hedge, rem);
@@ -839,11 +851,11 @@ pub const Client = struct {
         defer e2.deinit();
         try protocol.encodeRequest(&e2, protocol.api_key.consumer_group_heartbeat, protocol.version.consumer_group_heartbeat, true, "kite", req.forRetry(), protocol.heartbeatRequest);
         const corr2 = protocol.lastCorrelationId();
-        transport.send(hedge, e2.written()) catch {
+        transport.send(hedge, e2.written()) catch |err| {
+            if (!conn_alive) return err;
             return transport.recv(conn, alloc, corr1, true);
         };
 
-        var conn_alive = true;
         var hedge_alive = true;
         while (conn_alive or hedge_alive) {
             const pick: u1 = if (conn_alive and hedge_alive)
