@@ -318,7 +318,29 @@ try:
     description = rows(run("group", "describe", "kite-classic", "--json"))
     assert len(description) == 1 and description[0]["lag"] == 0, description
     assert not description[0]["member_id"] and not description[0]["client_id"], description
-    print("PASS groups classic describe falls back to committed offsets", flush=True)
+    print("PASS groups inactive classic describe still shows committed offsets", flush=True)
+
+    classic = "kite-classic-no-commits"
+    with subprocess.Popen([
+        "docker", "exec", "kite-e2e-kafka", "/opt/kafka/bin/kafka-console-consumer.sh",
+        "--bootstrap-server", "localhost:9092", "--topic", topic,
+        "--group", classic, "--consumer-property", "group.protocol=classic",
+        "--consumer-property", "enable.auto.commit=false", "--timeout-ms", "60000",
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as member:
+        try:
+            wait_for(lambda: any(g["group"] == classic and g["state"] == "Stable"
+                                 for g in rows(run("group", "list", "--all", "--json"))),
+                     "classic group stable")
+            description = rows(run("group", "describe", classic, "--json"))
+            assert len(description) == 1, description
+            partition = description[0]
+            assert partition["topic"] == topic and partition["partition"] == 0, description
+            assert partition["committed"] is None and partition["lag"] is None, description
+            assert partition["end"] > 0 and partition["member_id"] and partition["client_id"], description
+        finally:
+            if member.poll() is None:
+                member.terminate()
+    print("PASS groups active classic describe shows partitions without commits", flush=True)
 finally:
     for process, _, _ in workers:
         if process.poll() is None:

@@ -750,12 +750,6 @@ pub const Client = struct {
         return groups.toOwnedSlice(alloc);
     }
 
-    pub fn listCoordinatorGroups(c: *Client, alloc: std.mem.Allocator, group: []const u8) ![]protocol.ListedGroup {
-        try c.requireVersion(protocol.api_key.list_groups, protocol.version.list_groups, "ListGroups");
-        const node = try c.findCoordinator(group);
-        return c.listGroupsOnNode(alloc, node, true);
-    }
-
     fn listGroupsOnNode(c: *Client, alloc: std.mem.Allocator, node: i32, all: bool) ![]protocol.ListedGroup {
         const conn = try c.connFor(node, connKey(node, 0xFFFF_FFFE));
         var retry: Retry = .{};
@@ -770,11 +764,23 @@ pub const Client = struct {
     }
 
     pub fn describeGroup(c: *Client, alloc: std.mem.Allocator, group: []const u8) !protocol.DescribedGroup {
+        return c.describeGroupOnCoordinator(alloc, group, false);
+    }
+
+    pub fn describeClassicGroup(c: *Client, alloc: std.mem.Allocator, group: []const u8) !protocol.DescribedGroup {
+        return c.describeGroupOnCoordinator(alloc, group, true);
+    }
+
+    fn describeGroupOnCoordinator(c: *Client, alloc: std.mem.Allocator, group: []const u8, comptime classic: bool) !protocol.DescribedGroup {
+        const key = if (classic) protocol.api_key.describe_groups else protocol.api_key.consumer_group_describe;
+        const ver = if (classic) protocol.version.describe_groups else protocol.version.consumer_group_describe;
+        const api = if (classic) "DescribeGroups" else "ConsumerGroupDescribe";
+        const decode = if (classic) protocol.describeClassicGroupResponse else protocol.describeGroupResponse;
         var retry: Retry = .{};
         while (true) {
-            const resp = try c.groupRequest(alloc, group, protocol.api_key.consumer_group_describe, protocol.version.consumer_group_describe, "ConsumerGroupDescribe", group, protocol.describeGroupRequest);
+            const resp = try c.groupRequest(alloc, group, key, ver, api, group, protocol.describeGroupRequest);
             var d = Decoder.init(resp.body);
-            const result = try protocol.describeGroupResponse(&d, alloc);
+            const result = try decode(&d, alloc);
             if (isCoordinatorError(result.code)) {
                 c.invalidateCoordinator();
                 if (retry.pause(c)) continue;
@@ -2225,7 +2231,7 @@ pub const Client = struct {
     }
 };
 
-test "classic fallback lists only the cached coordinator for results empty and errors" {
+test "classic describe uses only the cached coordinator for empty groups and errors" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     var env: std.process.Environ.Map = .init(alloc);
@@ -2235,7 +2241,7 @@ test "classic fallback lists only the cached coordinator for results empty and e
     defer c.deinit();
     c.coordinator_group = try alloc.dupe(u8, "g");
     c.coordinator_node = 2;
-    try c.api_ranges.put(alloc, protocol.api_key.list_groups, .{ .min = 0, .max = 5 });
+    try c.api_ranges.put(alloc, protocol.api_key.describe_groups, .{ .min = 0, .max = 6 });
     try c.brokers.put(alloc, 3, .{ .host = try alloc.dupe(u8, "unreachable.invalid"), .port = 1 });
     const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try addr.listen(io, .{});
@@ -2252,12 +2258,17 @@ test "classic fallback lists only the cached coordinator for results empty and e
         try response.i32v(protocol.lastCorrelationId() + 1);
         try response.tagBuffer();
         try response.i32v(0);
-        try response.i16v(if (case == 2) 30 else 0);
-        try response.compactArrayLen(if (case == 0) 1 else 0);
-        if (case == 0) {
-            for ([_][]const u8{ "g", "consumer", "Empty", "classic" }) |field| try response.compactString(field);
-            try response.tagBuffer();
-        }
+        try response.compactArrayLen(1);
+        try response.i16v(switch (case) {
+            0 => 0,
+            1 => @intFromEnum(protocol.ErrorCode.group_id_not_found),
+            else => @intFromEnum(protocol.ErrorCode.group_authorization_failed),
+        });
+        try response.compactString(null);
+        for ([_][]const u8{ "g", if (case == 0) "Empty" else "", "", "" }) |field| try response.compactString(field);
+        try response.compactArrayLen(0);
+        try response.i32v(std.math.minInt(i32));
+        try response.tagBuffer();
         try response.tagBuffer();
         var buffer: [128]u8 = undefined;
         var writer = peer.writer(io, &buffer);
@@ -2266,12 +2277,14 @@ test "classic fallback lists only the cached coordinator for results empty and e
         try writer.interface.writeAll(&length);
         try writer.interface.writeAll(response.written());
         try writer.interface.flush();
-        if (case == 2) {
-            try std.testing.expectError(error.GroupFailed, c.listCoordinatorGroups(arena.allocator(), "g"));
-        } else {
-            const groups = try c.listCoordinatorGroups(arena.allocator(), "g");
-            try std.testing.expectEqual(@as(usize, if (case == 0) 1 else 0), groups.len);
-            if (case == 0) try std.testing.expectEqualStrings("classic", groups[0].group_type);
+        switch (case) {
+            0 => {
+                const group = try c.describeClassicGroup(arena.allocator(), "g");
+                try std.testing.expectEqualStrings("Empty", group.state);
+                try std.testing.expectEqual(@as(usize, 0), group.partitions.len);
+            },
+            1 => try std.testing.expectError(error.GroupNotFound, c.describeClassicGroup(arena.allocator(), "g")),
+            else => try std.testing.expectError(error.GroupFailed, c.describeClassicGroup(arena.allocator(), "g")),
         }
         try std.testing.expect(c.control == null);
         try std.testing.expectEqual(@as(u32, 1), c.conns.count());
