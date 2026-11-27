@@ -1500,6 +1500,12 @@ pub const Client = struct {
         return c.txn_id != null and c.producer_inited and (c.txn_added_parts.count() > 0 or c.txn_add_attempted);
     }
 
+    fn clearTxnState(c: *Client) void {
+        c.txn_added_parts.clearRetainingCapacity();
+        c.txn_add_attempted = false;
+        c.txn_produce_unsettled_until = null;
+    }
+
     /// Commit (`commit=true`) or abort (`commit=false`) the active transaction.
     /// No-op when no partitions were registered (or attempted) in the transaction.
     /// When `commit` is true and `stop` becomes set before the first commit
@@ -1508,6 +1514,9 @@ pub const Client = struct {
     /// malformed reply or coordinator-movement error means the broker may have
     /// appended `PrepareCommit`: retries send only commit, and if `stop` is set
     /// it returns `error.CommitOutcomeUnknown` instead of switching to abort.
+    /// When `commit` is false and the producer has been fenced (broker timeout
+    /// or replacement producer), Kafka has already aborted the transaction, so
+    /// local state is cleared and the abort succeeds.
     pub fn endTransaction(c: *Client, commit: bool, stop: ?*const std.atomic.Value(bool)) !void {
         if (!c.hasActiveTxn()) return;
         const txn_id = c.txn_id.?;
@@ -1520,13 +1529,16 @@ pub const Client = struct {
         const previous_stop = c.txn_stop;
         c.txn_stop = commit_stop;
         defer c.txn_stop = previous_stop;
+        if (!commit and c.txn_fenced) {
+            c.clearTxnState();
+            c.vlog("transaction '{s}' already aborted by broker (producer fenced)", .{txn_id});
+            return;
+        }
         const unsettled = if (!commit) c.settleProduceBeforeAbort() else false;
         if (!commit and c.txn_fenced) {
-            c.txn_added_parts.clearRetainingCapacity();
-            c.txn_add_attempted = false;
-            c.txn_produce_unsettled_until = null;
-            c.setErr("EndTxn (abort '{s}'): producer already fenced", .{txn_id});
-            return error.ProduceFailed;
+            c.clearTxnState();
+            c.vlog("transaction '{s}' already aborted by broker (producer fenced)", .{txn_id});
+            return;
         }
         var retry: Retry = .{};
         var commit_ambiguous = false;
@@ -1603,16 +1615,21 @@ pub const Client = struct {
                 return error.ProduceFailed;
             };
             if (code == .none) {
-                c.txn_added_parts.clearRetainingCapacity();
-                c.txn_add_attempted = false;
-                c.txn_produce_unsettled_until = null;
+                c.clearTxnState();
                 if (!commit and unsettled) {
                     std.debug.print("kite: warning: in-flight produce was unconfirmed before abort; if broker partition verification is disabled, check for hanging transactions with: kafka-transactions.sh --bootstrap-server <host:port> find-hanging --topic <topic> --partition <p> --max-transaction-timeout 0 (then abort --topic <topic> --partition <p> --start-offset <n>)\n", .{});
                 }
                 c.vlog("transaction '{s}' {s}", .{ txn_id, if (commit) "committed" else "aborted" });
                 return;
             }
-            if (isFencedError(code)) c.txn_fenced = true;
+            if (isFencedError(code)) {
+                c.txn_fenced = true;
+                if (!commit) {
+                    c.clearTxnState();
+                    c.vlog("transaction '{s}' already aborted by broker ({s})", .{ txn_id, code.name() });
+                    return;
+                }
+            }
             if (!commit and c.txn_added_parts.count() == 0 and code == .invalid_txn_state) {
                 // AddPartitionsToTxn was attempted but never opened a transaction on the broker.
                 c.txn_add_attempted = false;
@@ -1636,7 +1653,8 @@ pub const Client = struct {
     }
 
     /// Best-effort abort for fatal/interrupt paths; preserves any prior err_ctx.
-    /// Returns true if no transaction was active or the abort succeeded.
+    /// Returns true if no transaction was active or the abort is confirmed
+    /// (including when the broker already fenced the producer and aborted it).
     pub fn abortTransactionBestEffort(c: *Client) bool {
         if (!c.hasActiveTxn()) return true;
         const saved_err = c.err_ctx;
@@ -1648,9 +1666,7 @@ pub const Client = struct {
                 std.debug.print("kite: warning: transaction abort outcome unknown ({s}); verify with: kafka-transactions.sh --bootstrap-server <host:port> describe --transactional-id '{s}'\n", .{ detail, txn_id })
             else
                 std.debug.print("kite: warning: transaction abort outcome unknown; verify with: kafka-transactions.sh --bootstrap-server <host:port> describe --transactional-id '{s}'\n", .{txn_id});
-            c.txn_added_parts.clearRetainingCapacity();
-            c.txn_add_attempted = false;
-            c.txn_produce_unsettled_until = null;
+            c.clearTxnState();
             return false;
         };
         return true;
@@ -2459,4 +2475,89 @@ test "group APIs check versions lazily and coordinator cache is group scoped" {
     try std.testing.expect(Client.isCoordinatorError(.not_coordinator));
     try std.testing.expect(Client.isCoordinatorError(.coordinator_not_available));
     try std.testing.expect(!Client.isCoordinatorError(.group_authorization_failed));
+}
+
+test "abort treats fenced producer as already aborted by broker while commit still fails" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var env: std.process.Environ.Map = .init(alloc);
+    defer env.deinit();
+    const cfg: config.Config = .{ .bootstrap_servers = &.{} };
+    var c = Client.init(alloc, io, &env, &cfg);
+    defer c.deinit();
+
+    // Case 1: already fenced (e.g. Produce returned INVALID_PRODUCER_EPOCH after broker timeout).
+    c.txn_id = "tx-fenced";
+    c.producer_inited = true;
+    c.producer_id = 42;
+    c.producer_epoch = 0;
+    c.txn_add_attempted = true;
+    try c.txn_added_parts.put(alloc, 0, {});
+    c.txn_fenced = true;
+    try std.testing.expect(c.abortTransactionBestEffort());
+    try std.testing.expect(!c.hasActiveTxn());
+    try std.testing.expectEqual(@as(u32, 0), c.txn_added_parts.count());
+
+    // Set up a mock transaction coordinator socket for EndTxn responses.
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+    const conn = try transport.connect(io, alloc, &env, "127.0.0.1", server.socket.address.getPort(), null, null);
+    try c.conns.put(alloc, Client.connKey(1, Client.txn_coord_slot), conn);
+    c.txn_coordinator_node = 1;
+    const peer = try server.accept(io);
+    defer peer.close(io);
+
+    const writeEndTxnResp = struct {
+        fn send(p: std.Io.net.Stream, a: std.mem.Allocator, code: protocol.ErrorCode) !void {
+            var body = Encoder.init(a);
+            defer body.deinit();
+            try body.i32v(protocol.lastCorrelationId() + 1);
+            try body.tagBuffer();
+            try body.i32v(0); // throttle_time_ms
+            try body.i16v(@intFromEnum(code));
+            try body.tagBuffer();
+            var frame = Encoder.init(a);
+            defer frame.deinit();
+            try frame.i32v(@intCast(body.written().len));
+            try frame.raw(body.written());
+            var wbuf: [128]u8 = undefined;
+            var w = p.writer(std.testing.io, &wbuf);
+            try w.interface.writeAll(frame.written());
+            try w.interface.flush();
+        }
+    }.send;
+
+    // Case 2: EndTxn(abort) returns PRODUCER_FENCED -> known aborted, no error.
+    c.txn_fenced = false;
+    c.txn_add_attempted = true;
+    try c.txn_added_parts.put(alloc, 0, {});
+    try writeEndTxnResp(peer, alloc, .producer_fenced);
+    try std.testing.expect(c.abortTransactionBestEffort());
+    try std.testing.expect(c.txn_fenced);
+    try std.testing.expect(!c.hasActiveTxn());
+
+    // Case 3: EndTxn(abort) returns INVALID_PRODUCER_EPOCH -> known aborted, no error.
+    c.txn_fenced = false;
+    c.txn_add_attempted = true;
+    try c.txn_added_parts.put(alloc, 0, {});
+    try writeEndTxnResp(peer, alloc, .invalid_producer_epoch);
+    try std.testing.expect(c.abortTransactionBestEffort());
+    try std.testing.expect(c.txn_fenced);
+    try std.testing.expect(!c.hasActiveTxn());
+
+    // Case 4: EndTxn(commit) returns PRODUCER_FENCED -> must still fail.
+    c.txn_fenced = false;
+    c.txn_add_attempted = true;
+    try c.txn_added_parts.put(alloc, 0, {});
+    try writeEndTxnResp(peer, alloc, .producer_fenced);
+    try std.testing.expectError(error.ProduceFailed, c.endTransaction(true, null));
+    try std.testing.expect(c.txn_fenced);
+
+    // Case 5: EndTxn(abort) returns a non-fenced fatal error -> still reports failure.
+    c.txn_fenced = false;
+    c.txn_add_attempted = true;
+    try c.txn_added_parts.put(alloc, 0, {});
+    try writeEndTxnResp(peer, alloc, .transactional_id_authorization_failed);
+    try std.testing.expectError(error.ProduceFailed, c.endTransaction(false, null));
 }
