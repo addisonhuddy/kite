@@ -559,7 +559,8 @@ pub const FrameAccumulator = struct {
     }
 
     fn readAvailable(c: *Conn, dst: []u8) TransportError!usize {
-        if (c.input.buffered().len == 0) {
+        while (c.input.buffered().len == 0) {
+            const before = c.net_reader.interface.seek;
             c.net_reader.err = null;
             c.net_reader.poll_nonblock = true;
             defer c.net_reader.poll_nonblock = false;
@@ -571,6 +572,7 @@ pub const FrameAccumulator = struct {
                 c.close();
                 return if (err == error.EndOfStream) error.IoFailed else c.ioError();
             };
+            if (c.input.buffered().len == 0 and c.net_reader.interface.seek == before) return 0;
         }
         const avail = c.input.buffered();
         const n = @min(avail.len, dst.len);
