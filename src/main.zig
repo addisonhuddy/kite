@@ -270,6 +270,8 @@ pub fn main(init: std.process.Init) !void {
         // skipped JSON whitespace), and each partition has its own batch.
         if (pending_bytes >= pending_budget or batch_arena.queryCapacity() >= pending_budget) {
             flushAll(&cli, topic, pend, &batch_arena) catch |err| produceFatal(&cli, err);
+            if (produce.txn != null and interrupted.load(.acquire))
+                abortInterrupted();
             pending_bytes = 0;
             t_flush += timer.lap();
         }

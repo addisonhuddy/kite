@@ -6,11 +6,14 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 kite = sys.argv[1]
 count = 5000
 tail = b"x" * (32768 - 5)
 sentinel = b"sentinel\n"
+run_id = uuid.uuid4().hex
+topics = []
 
 
 def value(i):
@@ -40,8 +43,9 @@ def last_record_visible(topic):
 
 
 def check(mode, expected_rc, diagnostic):
-    topic = f"kite-txn-stream-{mode}"
+    topic = f"kite-txn-stream-{mode}-{run_id}"
     subprocess.run([kite, "topic", "create", "-p", "1", "-r", "1", topic], check=True, timeout=30)
+    topics.append(topic)
     with tempfile.TemporaryFile() as log, subprocess.Popen(
         [kite, "produce", "-v", "--json", "--txn", topic, topic],
         stdin=subprocess.PIPE, stderr=log, preexec_fn=cap_memory,
@@ -88,6 +92,10 @@ def check(mode, expected_rc, diagnostic):
     print(f"PASS txn-stream: {mode} after mid-stream drain under 128 MiB", flush=True)
 
 
-check("commit", 0, b"5001 record(s) produced")
-check("invalid", 1, b"line 5001:")
-check("sigint", 130, b"transaction aborted (interrupted)")
+try:
+    check("commit", 0, b"5001 record(s) produced")
+    check("invalid", 1, b"line 5001:")
+    check("sigint", 130, b"transaction aborted (interrupted)")
+finally:
+    if topics:
+        subprocess.run([kite, "topic", "delete", "-y", "--if-exists", *topics], timeout=30)
