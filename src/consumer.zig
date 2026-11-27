@@ -1320,7 +1320,11 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         };
         var progress = false;
         const outcomes = fetchLeader(c, arena.allocator(), fetch_opts, parts.items, out, &scratch, &count, &progress) catch |err| {
-            if (err == error.WaitHookAborted) continue;
+            if (err == error.WaitHookAborted) {
+                try out.flush();
+                if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
+                continue;
+            }
             exit_error = err;
             break;
         };
