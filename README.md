@@ -217,7 +217,7 @@ supported OS (it uses `sudo` only if that directory is not writable). Pass
 options after `sh -s --`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh -s -- --bin-dir ~/.local/bin --version v0.4.1
+curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh -s -- --bin-dir ~/.local/bin --version v0.5.0
 ```
 
 | Option | Env | Meaning |
@@ -319,6 +319,7 @@ kite.yaml and may appear anywhere among a command's arguments; `p` and
 kite produce [OPTIONS] [@CLUSTER] TOPIC   Write stdin lines to TOPIC.
 kite consume [OPTIONS] [@CLUSTER] TOPIC   Read TOPIC to stdout.
 kite topic [ACTION] [OPTIONS] [@CLUSTER] [TOPIC...]   List, create, delete, or update topics.
+kite group [list|describe GROUP] [OPTIONS] [@CLUSTER]   List groups or show committed offsets and lag.
 kite cluster [list|set NAME|init]         Pick, list, or set the current cluster.
 kite update [VERSION]                     Install the latest (or VERSION) release in place.
 kite --version                            Print the version.
@@ -326,30 +327,32 @@ kite --version                            Print the version.
 
 | Mode | Option | Meaning |
 | --- | --- | --- |
-| produce, consume | `-b`, `--bootstrap HOSTS` | Comma-separated `host:port` brokers (overrides env and file). |
+| produce, consume, group | `-b`, `--bootstrap HOSTS` | Comma-separated `host:port` brokers (overrides env and file). |
 | all | `--config FILE` | Read this properties file instead of searching. |
-| produce, consume | `@NAME` | Use cluster `NAME` from kite.yaml for this run only (also `$KITE_TARGET`). |
+| produce, consume, group | `@NAME` | Use cluster `NAME` from kite.yaml for this run only (also `$KITE_TARGET`). |
 | produce, consume | `--format FMT` | Record shape: `value`, `tsv`, `json` (default `auto`). |
 | produce | `--format csv` | RFC 4180 CSV input (produce only); same as `--csv`. |
-| produce, consume | `--json` | Alias for `--format json`. |
+| produce, consume, group | `--json` | Alias for `--format json` in produce and consume; one JSON object per group or partition in group. |
 | produce | `-H 'name: value'` | Add a header to every record (repeatable). |
 | produce | `--csv` | Read RFC 4180 CSV; each row becomes a JSON object value. |
 | produce | `--key COL` | Use CSV column `COL` as the record key (requires `--csv`). |
-| produce | `--txn ID` | Produce all of stdin atomically under transactional `ID` (commits on EOF, aborts on error or interrupt before commit; if interrupted after commit is sent, exits 130 reporting unknown outcome instead of aborting; requires `enable.idempotence=true`). |
-| consume | `-B`, `--from-beginning` | Start at the earliest offset. |
+| produce | `--txn ID` | Produce all of stdin atomically under transactional `ID` (commits on EOF, aborts on error or interrupt before commit; if interrupted after commit is sent, exits 130 reporting unknown outcome instead of aborting). Requires `enable.idempotence=true` and broker-side `transaction.partition.verification.enable=true` (enabled by default in Apache Kafka 3.6+). |
+| consume | `-g`, `--group GROUP` | Join a Kafka 4.0 consumer group and resume committed offsets. |
+| consume | `-B`, `--from-beginning` | Start at the earliest offset (with a group, only where no offset is committed). |
 | consume | `--offset N` | Start at offset N in every selected partition; errors if N is out of range. |
 | consume | `--partition P` | Read one partition only. |
 | consume | `-n`, `--max MAX` | Stop after MAX records. |
 | consume | `-t`, `--idle DUR` | Stop after DUR without a record (`3s`, `500ms`, `1m`; bare number = ms). |
 | consume | `-f`, `--follow` | Never stop on idle, even when stdout is a pipe. |
 | consume | `--read-uncommitted` | Include open and aborted transactional records. |
+| group | `-a`, `--all` | Include classic groups (list only). |
 | all | `-q`, `--quiet` | Suppress the summary and progress lines on stderr. |
-| produce, consume | `-v`, `--verbose` | Connection, retry, and fetch diagnostics on stderr. |
+| produce, consume, group | `-v`, `--verbose` | Verbose diagnostics on stderr. |
 | all | `-h`, `--help` | Plain-text help for the selected mode. |
 
 `kite --help` prints the command overview; `kite produce --help`,
-`kite consume --help`, `kite topic --help`, and `kite cluster --help`
-print the full pages.
+`kite consume --help`, `kite topic --help`, `kite group --help`, and
+`kite cluster --help` print the full pages.
 
 For transactional produce, kite requires broker-side transaction partition
 verification (`transaction.partition.verification.enable=true`, enabled by
@@ -476,6 +479,8 @@ The files in [`examples/data/`](examples/data) are ready-to-use inputs.
 ```sh
 # plain values, one per line
 kite produce events < examples/data/lines.txt
+# publish a file's records in one transaction, committed at EOF
+kite produce --txn import-1 events < examples/data/lines.txt
 # key<TAB>value
 kite produce events < examples/data/keyed.tsv
 # key<TAB>headers<TAB>value
@@ -574,12 +579,13 @@ See the full walkthrough in [examples/wing/](examples/wing).
 
 ## Consuming
 
-By default, `kite consume` (including `consume -g`) uses read-committed
-isolation: it skips aborted transactional records and reads only up to the
-last stable offset, holding back records at or after the first open
-transaction in each partition until it completes. Use `--read-uncommitted`
-to read up to the high watermark instead, including open and aborted
-transactional records. Transaction markers never appear on stdout.
+Starting in v0.5.0, `kite consume` (including `consume -g`) defaults to
+read-committed isolation: it skips aborted transactional records and reads
+only up to the last stable offset, holding back records at or after the
+first open transaction in each partition until it completes. Use
+`--read-uncommitted` to read up to the high watermark instead, including
+open and aborted transactional records. Transaction markers never appear
+on stdout.
 
 By default, `kite consume` starts at the latest offset for its isolation
 level and selects all partitions.
