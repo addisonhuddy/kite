@@ -6,6 +6,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -749,7 +750,9 @@ try:
                     assert stale_p.returncode == 1, (stale_p.returncode, stale_err)
                     assert state10_a["init_count"] == 1, f"stale producer must not send KIP-360 InitProducerId after fencing, got init_count={state10_a['init_count']} err={stale_err!r}"
                     assert state10_a["end_txn_aborts"] == 1, f"expected epoch-checked EndTxn(abort) from stale producer, got {state10_a['end_txn_aborts']}"
-                    assert "outcome unknown" in stale_err and "kafka-transactions.sh --bootstrap-server" in stale_err and "describe --transactional-id" in stale_err, stale_err
+                    assert "aborted by Kafka" in stale_err, stale_err
+                    assert "PRODUCER_FENCED" in stale_err or "INVALID_PRODUCER_EPOCH" in stale_err, stale_err
+                    assert "outcome unknown" not in stale_err, stale_err
 
                     # Replacement producer must still commit cleanly.
                     _, repl_err = repl_p.communicate(timeout=15)
@@ -767,4 +770,74 @@ finally:
 assert run_kite("consume", "-B", "-n", "1", "--idle", "3s", "--format", "value", t10).stdout == "replacement-committed\n"
 print("PASS txn-fault: stale fenced producer cannot abort replacement transaction")
 
-run_kite("topic", "delete", "-y", t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, check=False)
+# Fault 11 (#107): Broker-timed-out --txn transaction is already aborted by Kafka;
+# neither a subsequent fenced Produce, SIGINT, nor EOF commit reports "outcome unknown".
+t11 = "kite-txn-fault-broker-timeout"
+txn11_produce = "kite-e2e-fault-timeout-produce"
+txn11_sigint = "kite-e2e-fault-timeout-sigint"
+txn11_commit = "kite-e2e-fault-timeout-commit"
+run_kite("topic", "delete", "-y", "--if-exists", t11, check=False)
+run_kite("topic", "create", "-p", "1", "-r", "1", t11)
+
+with tempfile.NamedTemporaryFile("w", suffix=".properties", delete=False) as tf:
+    tf.write(f"bootstrap.servers={BROKER_HOST}:{BROKER_PORT}\ntransaction.timeout.ms=1000\n")
+    timeout_cfg = tf.name
+
+try:
+    with (
+        subprocess.Popen(
+            [kite, "produce", "--config", timeout_cfg, "--txn", txn11_produce, t11],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ) as p_prod,
+        subprocess.Popen(
+            [kite, "produce", "--config", timeout_cfg, "--txn", txn11_sigint, t11],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ) as p_int,
+        subprocess.Popen(
+            [kite, "produce", "--config", timeout_cfg, "--txn", txn11_commit, t11],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ) as p_commit,
+    ):
+        try:
+            p_prod.stdin.write("k1\ttimed-out-produce\n")
+            p_prod.stdin.flush()
+            p_int.stdin.write("k1\ttimed-out-sigint\n")
+            p_int.stdin.flush()
+            p_commit.stdin.write("k1\ttimed-out-commit\n")
+            p_commit.stdin.flush()
+
+            wait_complete_abort(txn11_produce, timeout=25.0)
+            wait_complete_abort(txn11_sigint, timeout=25.0)
+            wait_complete_abort(txn11_commit, timeout=25.0)
+
+            _, err_prod = p_prod.communicate("k1\tafter-timeout\n", timeout=15)
+            assert p_prod.returncode == 1, (p_prod.returncode, err_prod)
+            assert "aborted by Kafka" in err_prod, err_prod
+            assert "INVALID_PRODUCER_EPOCH" in err_prod or "PRODUCER_FENCED" in err_prod, err_prod
+            assert "abort outcome unknown" not in err_prod, err_prod
+
+            p_int.send_signal(signal.SIGINT)
+            _, err_int = p_int.communicate(timeout=15)
+            assert p_int.returncode == 130, (p_int.returncode, err_int)
+            assert "aborted by Kafka" in err_int, err_int
+            assert "INVALID_PRODUCER_EPOCH" in err_int or "PRODUCER_FENCED" in err_int, err_int
+            assert "transaction aborted (interrupted)" in err_int, err_int
+            assert "abort outcome unknown" not in err_int, err_int
+
+            _, err_commit = p_commit.communicate(timeout=15)
+            assert p_commit.returncode == 1, (p_commit.returncode, err_commit)
+            assert "aborted by Kafka" in err_commit, err_commit
+            assert "INVALID_PRODUCER_EPOCH" in err_commit or "PRODUCER_FENCED" in err_commit, err_commit
+            assert "outcome unknown" not in err_commit, err_commit
+        finally:
+            for proc in (p_prod, p_int, p_commit):
+                if proc.poll() is None:
+                    proc.kill()
+finally:
+    os.unlink(timeout_cfg)
+
+run_kite("produce", "--txn", "kite-e2e-fault11-sentinel", t11, data="k1\tsentinel-after-timeout\n")
+assert run_kite("consume", "-B", "-n", "1", "--idle", "3s", "--format", "value", t11).stdout == "sentinel-after-timeout\n"
+print("PASS txn-fault: broker-timed-out --txn reports abort cleanly without unknown-outcome warning")
+
+run_kite("topic", "delete", "-y", t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, check=False)
