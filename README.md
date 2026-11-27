@@ -410,7 +410,9 @@ groups. Without `-g`, consuming remains independent and does not commit.
 
 Use the same isolation mode for every member of a consumer group. Mixing
 the default with `--read-uncommitted` can commit past records still hidden
-from read-committed members and make lag misleading.
+from read-committed members and make lag misleading. If you need to replay
+after switching isolation modes, use a fresh group with `-B`; an existing
+group resumes its committed offsets.
 
 Offsets are committed after successful stdout flushes, at most once per second
 (and always on revoke or exit), using the fetch position or the last emitted
@@ -569,11 +571,11 @@ By default, `kite consume` starts at the latest offset for its isolation
 level and selects all partitions.
 `-B`/`--from-beginning` starts at the earliest available offset; `--offset N`
 starts at offset N in every selected partition. If the broker rejects N as
-out of range, kite reports the seek range, which includes the high watermark,
-rather than silently replaying from the beginning. With read-committed
-isolation, the message also shows the last stable offset: a seek beyond it can
-succeed but returns no records until the transaction resolves. `--partition P`
-selects one partition.
+out of range, kite reports the log start offset, the high watermark, and (in
+read-committed mode) the last stable offset. The high watermark is a valid
+start position, not necessarily the log end. A read-committed seek past the
+last stable offset can succeed without returning records until the transaction
+resolves. `--partition P` selects one partition.
 
 When the read stops depends on stdout:
 
@@ -1046,8 +1048,8 @@ General:
   operation on the topic.
 - **`batch of N exceeds the broker's max.message.bytes`:** split the input or
   raise the topic/broker limit.
-- **`offset N is out of range`:** the message shows the seek range and high
-  watermark, plus the last stable offset in read-committed mode. Use `-B`
+- **`offset N is out of range`:** the message shows the log start offset and
+  high watermark, plus the last stable offset in read-committed mode. Use `-B`
   for the earliest or omit `--offset` for the latest.
 - **Consumer shows `waiting for records`:** the default starts at latest. Use
   `-B`, `--offset`, or a bounded `--idle` as appropriate.

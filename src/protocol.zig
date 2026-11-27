@@ -91,6 +91,7 @@ pub const ErrorCode = enum(i16) {
     fenced_leader_epoch = 74,
     unknown_leader_epoch = 75,
     unsupported_compression_type = 76,
+    offset_not_available = 78,
     unknown_topic_id = 100,
     unknown_member_id = 25,
     group_authorization_failed = 30,
@@ -155,6 +156,7 @@ pub const ErrorCode = enum(i16) {
             .fenced_leader_epoch => "FENCED_LEADER_EPOCH",
             .unknown_leader_epoch => "UNKNOWN_LEADER_EPOCH",
             .unsupported_compression_type => "UNSUPPORTED_COMPRESSION_TYPE",
+            .offset_not_available => "OFFSET_NOT_AVAILABLE",
             _ => "UNKNOWN_ERROR",
         };
     }
@@ -172,6 +174,7 @@ pub const ErrorCode = enum(i16) {
             .unknown_topic_or_partition,
             .fenced_leader_epoch,
             .unknown_leader_epoch,
+            .offset_not_available,
             .stale_metadata,
             .group_load_in_progress,
             .coordinator_not_available,
@@ -1442,6 +1445,12 @@ test "election and coordinator errors are retriable" {
     try std.testing.expect(!ErrorCode.topic_authorization_failed.retriable());
     try std.testing.expect(!ErrorCode.out_of_order_sequence_number.retriable());
     try std.testing.expectEqualStrings("COORDINATOR_NOT_AVAILABLE", ErrorCode.coordinator_not_available.name());
+}
+
+test "Kafka OFFSET_NOT_AVAILABLE is retriable" {
+    const code: ErrorCode = @enumFromInt(78);
+    try std.testing.expectEqualStrings("OFFSET_NOT_AVAILABLE", code.name());
+    try std.testing.expect(code.retriable());
 }
 
 test "heartbeat retries restore all fields after lost responses" {

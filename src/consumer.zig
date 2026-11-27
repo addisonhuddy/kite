@@ -1258,6 +1258,55 @@ fn listOffsetsLeader(
 
 const FetchOutcome = enum { success, retry, throttled, offset_reset };
 
+test "read-committed fetch with records and no last stable offset fails closed" {
+    const alloc = std.testing.allocator;
+    var c: client.Client = undefined;
+    const cfg: config.Config = .{ .bootstrap_servers = &.{} };
+    c.cfg = &cfg;
+    var cursor: Cursor = .{ .pidx = 0, .leader = 1, .offset = 0 };
+    const parts = [_]FetchPart{.{ .pidx = 0, .cursor = &cursor }};
+    var batches = Encoder.init(alloc);
+    defer batches.deinit();
+    try protocol.encodeRecordBatch(&batches, &.{.{ .value = "record" }}, 0, -1, -1, -1);
+    var e = Encoder.init(alloc);
+    defer e.deinit();
+    try e.i32v(0);
+    try e.i16v(0);
+    try e.i32v(0);
+    try e.compactArrayLen(1);
+    try e.compactString("t");
+    try e.compactArrayLen(1);
+    try e.i32v(0);
+    try e.i16v(0);
+    try e.i64v(1);
+    try e.i64v(-1);
+    try e.i64v(0);
+    try e.compactArrayLen(0);
+    try e.i32v(-1);
+    try e.compactBytes(batches.written());
+    try e.tagBuffer();
+    try e.tagBuffer();
+    try e.tagBuffer();
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    var scratch: std.Io.Writer.Allocating = .init(alloc);
+    defer scratch.deinit();
+    var count: u64 = 0;
+    var progress = false;
+    var outcomes = [_]FetchOutcome{.retry};
+    var opts: Options = .{ .topic = "t", .group = "g" };
+    try std.testing.expectError(error.FetchFailed, decodeFetch(&c, alloc, opts, &parts, e.written(), &outcomes, &out.writer, &scratch, &count, &progress));
+    try std.testing.expectEqualStrings("fetch partition 0: read-committed response with records has invalid last stable offset -1", c.errDetail());
+    try std.testing.expectEqualStrings("", out.written());
+    try std.testing.expectEqual(@as(i64, 0), cursor.offset);
+    try std.testing.expectEqual(@as(?i64, null), pendingCommit(cursor));
+
+    opts.isolation = .read_uncommitted;
+    _ = try decodeFetch(&c, alloc, opts, &parts, e.written(), &outcomes, &out.writer, &scratch, &count, &progress);
+    try std.testing.expectEqualStrings("record\n", out.written());
+    try std.testing.expectEqual(@as(?i64, 1), pendingCommit(cursor));
+}
+
 test "mixed fetch replies update only each partition's recovery" {
     const alloc = std.testing.allocator;
     var c: client.Client = undefined;
@@ -1504,7 +1553,8 @@ fn decodeFetch(
             _ = try d.i32v();
             const records = try d.compactBytes();
             try d.tagBuffer();
-            has_records = has_records or (if (records) |blob| blob.len > 0 else false);
+            const partition_has_records = if (records) |blob| blob.len > 0 else false;
+            has_records = has_records or partition_has_records;
             has_partition_error = has_partition_error or code != .none;
             const part_idx = for (parts, 0..) |part, idx| {
                 if (part.pidx == pidx) break idx;
@@ -1527,6 +1577,10 @@ fn decodeFetch(
                     continue;
                 }
                 c.setErr("fetch partition {d}: {s}", .{ pidx, code.name() });
+                return error.FetchFailed;
+            }
+            if (opts.isolation == .read_committed and last_stable_offset < 0 and partition_has_records) {
+                c.setErr("fetch partition {d}: read-committed response with records has invalid last stable offset {d}", .{ pidx, last_stable_offset });
                 return error.FetchFailed;
             }
             var range = Range{};
@@ -1727,8 +1781,6 @@ fn resetOffset(c: *client.Client, alloc: std.mem.Allocator, opts: Options, curso
     c.vlog("partition {d}: offset out of range; reset to {d}", .{ cursor.pidx, cursor.offset });
 }
 
-/// Fill `Client.errDetail()` with the seek range and, for read-committed
-/// consumers, the current boundary for visible records.
 fn reportOffsetRange(c: *client.Client, alloc: std.mem.Allocator, opts: Options, cursor: *Cursor) !void {
     const requested = cursor.offset;
     var probe = cursor.*;
@@ -1737,7 +1789,7 @@ fn reportOffsetRange(c: *client.Client, alloc: std.mem.Allocator, opts: Options,
         c.setErr("offset {d} is out of range for partition {d}", .{ requested, cursor.pidx });
         return;
     };
-    const earliest = probe.offset;
+    const log_start = probe.offset;
     listOffsetsLeader(c, alloc, opts.topic, &part, .latest, .read_uncommitted) catch {
         c.setErr("offset {d} is out of range for partition {d}", .{ requested, cursor.pidx });
         return;
@@ -1746,16 +1798,11 @@ fn reportOffsetRange(c: *client.Client, alloc: std.mem.Allocator, opts: Options,
     var boundary_buf: [96]u8 = undefined;
     const boundary = if (opts.isolation == .read_committed) blk: {
         listOffsetsLeader(c, alloc, opts.topic, &part, .latest, .read_committed) catch break :blk "";
-        break :blk std.fmt.bufPrint(&boundary_buf, "; read-committed records available up to last stable offset {d}", .{probe.offset}) catch unreachable;
+        break :blk std.fmt.bufPrint(&boundary_buf, "; last stable offset {d}", .{probe.offset}) catch unreachable;
     } else "";
-    if (earliest == high_watermark)
-        c.setErr("offset {d} is out of range for partition {d}: partition is empty; valid offset is {d} (high watermark {d}{s})", .{
-            requested, cursor.pidx, high_watermark, high_watermark, boundary,
-        })
-    else
-        c.setErr("offset {d} is out of range for partition {d}: valid offsets are {d}..{d} (high watermark {d}{s})", .{
-            requested, cursor.pidx, earliest, high_watermark, high_watermark, boundary,
-        });
+    c.setErr("offset {d} is out of range for partition {d}: log start offset {d}; high watermark {d}{s}", .{
+        requested, cursor.pidx, log_start, high_watermark, boundary,
+    });
 }
 
 test "json record output escapes and includes metadata" {

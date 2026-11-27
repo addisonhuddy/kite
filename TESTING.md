@@ -68,7 +68,7 @@ creates topics). `smoke.sh` produces
 marked plain and keyed records, consumes them from the beginning with an idle
 timeout, compares the roundtrip, checks a `--json` produce/consume roundtrip
 (key, nested value, headers), and asserts that an out-of-range `--offset`
-fails with the valid range instead of replaying the partition.
+fails with offset diagnostics instead of replaying the partition.
 
 ### Docker harness
 

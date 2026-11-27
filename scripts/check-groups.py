@@ -76,8 +76,7 @@ def check_transaction_isolation():
     )
     assert empty_out_of_range.returncode == 1 and not empty_out_of_range.stdout, empty_out_of_range
     assert (
-        "partition is empty; valid offset is 0 "
-        "(high watermark 0; read-committed records available up to last stable offset 0)"
+        "offset 1 is out of range for partition 0: log start offset 0; high watermark 0; last stable offset 0"
     ) in empty_out_of_range.stderr, empty_out_of_range
     docker = ["docker", "exec", "kite-e2e-kafka"]
     jar_path = subprocess.check_output(
@@ -108,7 +107,7 @@ def check_transaction_isolation():
         committed = ["committed"]
         uncommitted = ["aborted-first", "committed", "aborted-last", "open", "after-open"]
         for flags, expected, end, boundary_suffix in [
-            ((), committed, 6, "; read-committed records available up to last stable offset 6"),
+            ((), committed, 6, "; last stable offset 6"),
             (("--read-uncommitted",), uncommitted, 8, ""),
         ]:
             output = run("consume", "-B", "--format", "value", "--idle", "1s", *flags, topic)
@@ -126,7 +125,7 @@ def check_transaction_isolation():
             assert out_of_range.returncode == 1 and not out_of_range.stdout, out_of_range
             assert (
                 "kite: cannot start consuming: offset 9 is out of range for partition 0: "
-                f"valid offsets are 0..8 (high watermark 8{boundary_suffix})"
+                f"log start offset 0; high watermark 8{boundary_suffix}"
             ) in out_of_range.stderr.splitlines(), out_of_range
             assert run("consume", "--offset", "8", "--idle", "1s", *flags, topic) == ""
 
