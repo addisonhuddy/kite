@@ -732,7 +732,16 @@ pub const Client = struct {
                 c.group_deadline = c.candidateDeadline(rem_candidates);
                 const attempt: anyerror!Resp = inner: {
                     defer c.group_deadline = prev_deadline;
-                    if (c.control == null) c.reconnectControlAt(c.coordinator_discovery_cursor) catch |err| break :inner err;
+                    if (c.control == null) {
+                        const skipped = c.reconnectControlAt(c.coordinator_discovery_cursor) catch |err| break :inner err;
+                        if (skipped > 0) {
+                            tried_control += skipped;
+                            c.coordinator_discovery_cursor +%= skipped;
+                            c.group_deadline = prev_deadline;
+                            const send_rem = if (count > tried_control) count - tried_control else 1;
+                            c.group_deadline = c.candidateDeadline(send_rem);
+                        }
+                    }
                     break :inner c.sendRequest(c.control.?, protocol.api_key.find_coordinator, protocol.version.find_coordinator, group, protocol.findCoordinatorRequest);
                 };
                 break :blk attempt catch |err| {
@@ -2458,10 +2467,10 @@ pub const Client = struct {
     /// Rebuild control through discovered brokers, then configured bootstrap
     /// servers, with the full handshake.
     fn reconnectControl(c: *Client) !void {
-        return c.reconnectControlAt(0);
+        _ = try c.reconnectControlAt(0);
     }
 
-    fn reconnectControlAt(c: *Client, start: usize) !void {
+    fn reconnectControlAt(c: *Client, start: usize) !usize {
         c.dropControl();
         const count = c.brokers.count();
         var tried: usize = 0;
@@ -2472,10 +2481,11 @@ pub const Client = struct {
             const conn = c.connectOne(addr.host, addr.port) catch continue;
             c.control = conn;
             c.vlog("control connected {s}:{d}", .{ addr.host, addr.port });
-            return;
+            return tried;
         }
         if (c.txn_stop) |flag| if (flag.load(.acquire)) return error.Interrupted;
         try c.bootstrap();
+        return count;
     }
 
     pub fn sleep(c: *Client, ms: u64) void {
