@@ -359,9 +359,9 @@ requests up to their request deadline and then sends an epoch-checked
 in-flight Produce cannot be confirmed within its deadline, kite closes that
 connection, aborts the transaction, and warns on stderr with the partition-level
 recovery commands (`kafka-transactions.sh --bootstrap-server <host:port>
-find-hanging --topic <topic> --partition <p>` followed by `abort --topic <topic>
---partition <p> --start-offset <n>`) in case partition verification is disabled
-on the broker.
+find-hanging --topic <topic> --partition <p> --max-transaction-timeout 0`
+followed by `abort --topic <topic> --partition <p> --start-offset <n>`) in case
+partition verification is disabled on the broker.
 
 ## Topics
 

@@ -590,7 +590,7 @@ try:
         assert p.returncode == 1, (p.returncode, err)
         assert state8["init_count"] == 1, f"cleanup must not send InitProducerId, got init_count={state8['init_count']} err={err!r}"
         assert state8["end_txn_aborts"] == 1, f"expected epoch-checked EndTxn(abort), got {state8['end_txn_aborts']}"
-        assert "kafka-transactions.sh --bootstrap-server" in err and "find-hanging" in err and "PRODUCER_FENCED" not in err, f"expected unsettled-produce find-hanging warning without PRODUCER_FENCED: {err!r}"
+        assert "kafka-transactions.sh --bootstrap-server" in err and "find-hanging" in err and "--max-transaction-timeout 0" in err and "PRODUCER_FENCED" not in err, f"expected unsettled-produce find-hanging warning without PRODUCER_FENCED: {err!r}"
 finally:
     proxy8.close()
 

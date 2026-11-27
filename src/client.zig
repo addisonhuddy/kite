@@ -1607,7 +1607,7 @@ pub const Client = struct {
                 c.txn_add_attempted = false;
                 c.txn_produce_unsettled_until = null;
                 if (!commit and unsettled) {
-                    std.debug.print("kite: warning: in-flight produce was unconfirmed before abort; if broker partition verification is disabled, check for hanging transactions with: kafka-transactions.sh --bootstrap-server <host:port> find-hanging --topic <topic> --partition <p> (then abort --topic <topic> --partition <p> --start-offset <n>)\n", .{});
+                    std.debug.print("kite: warning: in-flight produce was unconfirmed before abort; if broker partition verification is disabled, check for hanging transactions with: kafka-transactions.sh --bootstrap-server <host:port> find-hanging --topic <topic> --partition <p> --max-transaction-timeout 0 (then abort --topic <topic> --partition <p> --start-offset <n>)\n", .{});
                 }
                 c.vlog("transaction '{s}' {s}", .{ txn_id, if (commit) "committed" else "aborted" });
                 return;
