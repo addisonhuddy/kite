@@ -709,7 +709,7 @@ pub const Client = struct {
             var d = Decoder.init(resp.body);
             const result = try protocol.heartbeatResponse(&d, alloc);
             if (isCoordinatorError(result.code)) {
-                c.invalidateCoordinator();
+                c.invalidateCoordinatorSlot(0xFFFF_FFFD);
                 request = request.forRetry();
                 if (retry.pause(c)) continue;
                 _ = try c.groupRemainingMs();
