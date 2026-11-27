@@ -445,6 +445,33 @@ test "connectWithHook aborts stalled TLS handshake when wait hook fires" {
     try std.testing.expect(started.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds() < 200);
 }
 
+test "connectWithHook honors timeout when TLS handshake and wait hook both stall" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var env: std.process.Environ.Map = .init(alloc);
+    defer env.deinit();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+    var ca: std.crypto.Certificate.Bundle = .empty;
+    defer ca.deinit(alloc);
+    const HookState = struct {
+        io: std.Io,
+        fn nextDue(ctx: *anyopaque) ?std.Io.Timestamp {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            return std.Io.Timestamp.now(s.io, .awake).addDuration(.fromMilliseconds(5));
+        }
+        fn tick(_: *anyopaque) bool {
+            return false;
+        }
+    };
+    var state: HookState = .{ .io = io };
+    const hook: WaitHook = .{ .io = io, .ctx = &state, .next_due = HookState.nextDue, .tick = HookState.tick };
+    const started = std.Io.Timestamp.now(io, .awake);
+    try std.testing.expectError(error.ConnectTimedOut, connectWithHook(io, alloc, &env, "127.0.0.1", server.socket.address.getPort(), &ca, 50, hook));
+    try std.testing.expect(started.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds() < 300);
+}
+
 /// Establish a connection: TCP, then TLS if `ca` is set (SNI + verification on).
 pub fn connect(
     io: std.Io,
@@ -504,7 +531,17 @@ pub fn connectWithHook(
 
     if (ca) |bundle| {
         c.net_reader.wait_hook = wait_hook;
-        defer c.net_reader.wait_hook = null;
+        if (timeout_ms) |ms| {
+            c.net_reader.cancellation = .{
+                .io = io,
+                .deadline = std.Io.Timestamp.now(io, .awake).addDuration(.fromMilliseconds(@intCast(ms))),
+                .stop = null,
+            };
+        }
+        defer {
+            c.net_reader.wait_hook = null;
+            c.net_reader.cancellation = null;
+        }
         var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
         io.randomSecure(&entropy) catch io.random(&entropy);
         const client = std.crypto.tls.Client.init(c.input, c.output, .{
@@ -515,7 +552,10 @@ pub fn connectWithHook(
             .entropy = &entropy,
             .realtime_now = .now(io, .real),
         }) catch |err| {
-            if (c.net_reader.err != null and c.net_reader.err.? == error.WaitHookAborted) return error.WaitHookAborted;
+            if (c.net_reader.err) |rerr| {
+                if (rerr == error.WaitHookAborted) return error.WaitHookAborted;
+                if (rerr == error.IoTimedOut) return error.ConnectTimedOut;
+            }
             // errdefers above close the stream and free `c`.
             if (c.debug)
                 std.debug.print("tls init: {s}\n", .{@errorName(err)});
