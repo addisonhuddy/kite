@@ -147,7 +147,7 @@ test "TSV record parsing returns malformed header diagnostics" {
     const alloc = arena.allocator();
     const valid = parseLine(alloc, "k\th: v\tdata", &.{});
     try std.testing.expectEqualStrings("h", valid.record.headers[0].key);
-    try std.testing.expectEqualStrings("data", valid.record.value);
+    try std.testing.expectEqualStrings("data", valid.record.value.?);
     const invalid = parseLine(alloc, "k\tbad\tdata", &.{});
     try std.testing.expectEqualStrings("malformed header 'bad' (want 'name: value')", invalid.invalid);
 }
@@ -475,14 +475,14 @@ fn jsonRecord(
         seen.insert(field);
         if (field == .value) {
             if (seen.contains(.value_b64)) return .{ .invalid = "use \"value\" or \"value_b64\", not both" };
-            value = m.value.bytes() orelse return .{ .invalid = "\"value\" must not be null" };
+            value = m.value.bytes();
         } else if (field == .value_b64) {
             if (seen.contains(.value)) return .{ .invalid = "use \"value\" or \"value_b64\", not both" };
-            const encoded = switch (m.value) {
-                .string => |v| v,
-                else => return .{ .invalid = "\"value_b64\" must be a string" },
+            value = switch (m.value) {
+                .null => null,
+                .string => |v| decodeJsonBase64(alloc, v) orelse return .{ .invalid = "\"value_b64\" is not valid base64" },
+                else => return .{ .invalid = "\"value_b64\" must be a string or null" },
             };
-            value = decodeJsonBase64(alloc, encoded) orelse return .{ .invalid = "\"value_b64\" is not valid base64" };
         } else if (field == .key) {
             if (seen.contains(.key_b64)) return .{ .invalid = "use \"key\" or \"key_b64\", not both" };
             key = switch (m.value) {
@@ -492,11 +492,11 @@ fn jsonRecord(
             };
         } else if (field == .key_b64) {
             if (seen.contains(.key)) return .{ .invalid = "use \"key\" or \"key_b64\", not both" };
-            const encoded = switch (m.value) {
-                .string => |v| v,
-                else => return .{ .invalid = "\"key_b64\" must be a string" },
+            key = switch (m.value) {
+                .null => null,
+                .string => |v| decodeJsonBase64(alloc, v) orelse return .{ .invalid = "\"key_b64\" is not valid base64" },
+                else => return .{ .invalid = "\"key_b64\" must be a string or null" },
             };
-            key = decodeJsonBase64(alloc, encoded) orelse return .{ .invalid = "\"key_b64\" is not valid base64" };
         } else if (field == .headers) {
             switch (m.value) {
                 .null => {},
@@ -550,11 +550,11 @@ fn jsonRecord(
                                 if (hv_b64_seen) return .{ .invalid = "duplicate \"value_b64\" field in header entry" };
                                 if (hv_seen) return .{ .invalid = "use \"value\" or \"value_b64\", not both" };
                                 hv_b64_seen = true;
-                                const encoded = switch (e.value) {
-                                    .string => |v| v,
-                                    else => return .{ .invalid = "header \"value_b64\" must be a string" },
+                                hv = switch (e.value) {
+                                    .null => null,
+                                    .string => |v| decodeJsonBase64(alloc, v) orelse return .{ .invalid = "\"value_b64\" is not valid base64" },
+                                    else => return .{ .invalid = "header \"value_b64\" must be a string or null" },
                                 };
-                                hv = decodeJsonBase64(alloc, encoded) orelse return .{ .invalid = "\"value_b64\" is not valid base64" };
                             }
                         }
                         headers.append(alloc, .{
@@ -568,9 +568,11 @@ fn jsonRecord(
         }
     }
     if (!sc.atEnd()) return jsonScanError(error.Malformed);
+    if (!seen.contains(.value) and !seen.contains(.value_b64))
+        return .{ .invalid = "JSON object has no \"value\" or \"value_b64\" field" };
     return .{ .record = .{
         .key = key,
-        .value = value orelse return .{ .invalid = "JSON object has no \"value\" or \"value_b64\" field" },
+        .value = value,
         .headers = headers.items,
     } };
 }
@@ -580,6 +582,31 @@ fn decodeJsonBase64(alloc: std.mem.Allocator, encoded: []const u8) ?[]const u8 {
         error.OutOfMemory => oom(),
         error.InvalidBase64 => null,
     };
+}
+
+test "JSON produce distinguishes tombstones from empty values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const tombstone = jsonRecord(alloc, "{\"key\":\"k\",\"value\":null}", &.{}).record;
+    try std.testing.expectEqualStrings("k", tombstone.key.?);
+    try std.testing.expect(tombstone.value == null);
+    try std.testing.expect(jsonRecord(alloc, "{\"value_b64\":null}", &.{}).record.value == null);
+    try std.testing.expectEqualStrings("", jsonRecord(alloc, "{\"value\":\"\"}", &.{}).record.value.?);
+    try std.testing.expectEqualStrings("", jsonRecord(alloc, "{\"value_b64\":\"\"}", &.{}).record.value.?);
+}
+
+test "JSON produce distinguishes null and empty Base64 keys and header values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const rec = jsonRecord(arena.allocator(),
+        \\{"key_b64":null,"value":"x","headers":[{"key":"null","value_b64":null},{"key":"empty","value_b64":""}]}
+    , &.{}).record;
+    try std.testing.expect(rec.key == null);
+    try std.testing.expectEqual(@as(usize, 2), rec.headers.len);
+    try std.testing.expect(rec.headers[0].value == null);
+    try std.testing.expectEqualStrings("", rec.headers[1].value.?);
+    try std.testing.expectEqualStrings("", jsonRecord(arena.allocator(), "{\"key_b64\":\"\",\"value\":\"x\"}", &.{}).record.key.?);
 }
 
 fn jsonScanError(err: json.Error) RecordParseResult {
@@ -600,7 +627,7 @@ fn jsonHeaderValue(v: json.Value) error{InvalidHeaderValue}!?[]const u8 {
 test "JSON record parsing returns a diagnostic without exiting" {
     const alloc = std.testing.allocator;
     const valid = jsonRecord(alloc, "{\"value\":42}", &.{});
-    try std.testing.expectEqualStrings("42", valid.record.value);
+    try std.testing.expectEqualStrings("42", valid.record.value.?);
     const invalid = jsonRecord(alloc, "{\"value\":tru}", &.{});
     try std.testing.expect(std.mem.startsWith(u8, invalid.invalid, "invalid JSON"));
     const invalid_header = jsonRecord(alloc, "{\"value\":42,\"headers\":{\"x\":false}}", &.{});
@@ -626,6 +653,8 @@ test "JSON records reject duplicate envelope fields but preserve repeated Kafka 
     const alloc = arena.allocator();
     const probes = [_]struct { line: []const u8, message: []const u8 }{
         .{ .line = "{\"value\":1,\"value\":2}", .message = "duplicate \"value\" field" },
+        .{ .line = "{\"value\":null,\"value\":2}", .message = "duplicate \"value\" field" },
+        .{ .line = "{\"value_b64\":null,\"value\":2}", .message = "use \"value\" or \"value_b64\", not both" },
         .{ .line = "{\"value_b64\":\"eA==\",\"value_b64\":\"eQ==\"}", .message = "duplicate \"value_b64\" field" },
         .{ .line = "{\"value\":0,\"key\":null,\"\\u006bey\":\"k\"}", .message = "duplicate \"key\" field" },
         .{ .line = "{\"value\":0,\"key_b64\":\"eA==\",\"key_b64\":\"eQ==\"}", .message = "duplicate \"key_b64\" field" },
@@ -641,7 +670,7 @@ test "JSON records reject duplicate envelope fields but preserve repeated Kafka 
         try std.testing.expectEqualStrings(probe.message, result.invalid);
     }
     const valid = jsonRecord(alloc, "{\"unknown\":1,\"unknown\":2,\"value\":{\"x\":1,\"x\":2},\"headers\":[{\"key\":\"h\"},{\"key\":\"h\"}]}", &.{});
-    try std.testing.expectEqualStrings("{\"x\":1,\"x\":2}", valid.record.value);
+    try std.testing.expectEqualStrings("{\"x\":1,\"x\":2}", valid.record.value.?);
     try std.testing.expectEqual(@as(usize, 2), valid.record.headers.len);
 }
 
@@ -1980,7 +2009,7 @@ test "CSV record parsing returns quote and field-count diagnostics" {
     var good = "a,1".*;
     const valid = csvRecord(alloc, &good, cols, 0, &.{});
     try std.testing.expectEqualStrings("a", valid.record.key.?);
-    try std.testing.expectEqualStrings("{\"k\":\"a\",\"v\":\"1\"}", valid.record.value);
+    try std.testing.expectEqualStrings("{\"k\":\"a\",\"v\":\"1\"}", valid.record.value.?);
     var bad_quote = "\"c,3".*;
     const invalid_quote = csvRecord(alloc, &bad_quote, cols, null, &.{});
     try std.testing.expectEqualStrings("unterminated quoted field", invalid_quote.invalid);
@@ -1999,7 +2028,7 @@ fn pendingBytes(pend: []Pending) usize {
 /// varint framing (~16B/record, ~8B/header). Charged against batch_size so
 /// encoded batches stay under the broker's ~1MiB message.max.bytes.
 fn recordSize(rec: protocol.Record) usize {
-    var n: usize = 16 + rec.value.len;
+    var n: usize = 16 + if (rec.value) |v| v.len else 0;
     if (rec.key) |k| n += k.len;
     for (rec.headers) |h| {
         n += h.key.len + 8;

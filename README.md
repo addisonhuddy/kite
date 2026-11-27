@@ -651,8 +651,8 @@ key<TAB>name: value<TAB>...<TAB>value
 
 The TAB and newline delimiters are not escaped. Binary data or records
 containing delimiters are therefore not generally safe to roundtrip. Null and
-empty keys, values, and header values may not remain distinct: a null key is
-printed as an empty field, and a null header value as `name: `. Compatible
+empty keys, values, and header values may not remain distinct: a null key or
+value is printed as an empty field, and a null header value as `name: `. Compatible
 textual keys and headers can roundtrip: `kite consume --format tsv src |
 kite produce --format tsv dst` preserves keys and headers, while `--format json`
 preserves key, headers, and value exactly and `value` drops keys and
@@ -689,12 +689,14 @@ UTF-8 JSON and safe to pass through `jq`:
 {"key_b64":"AP+A","value_b64":"AYD+/w==","headers":[{"key":"trace","value_b64":"gA=="}]}
 ```
 
-A string `value` is sent as its decoded bytes; any other JSON value (object,
-array, number, boolean) is sent verbatim, so JSON payloads can be embedded
-without double encoding. The `_b64` fields must be strings containing standard
-RFC 4648 Base64 with padding; they are decoded as record bytes. `headers` may
-be an object or an array of `{"key","value"}`; array entries accept
-`key_b64` and `value_b64` instead of the corresponding plain fields.
+A null `value` (or `value_b64`) produces a Kafka tombstone. Consume emits
+tombstones as `"value":null` and empty values as `"value":""`. A string `value`
+is sent as its decoded bytes; objects, arrays, numbers, and booleans are sent
+verbatim, so JSON payloads can be embedded without double encoding. Base64
+fields accept JSON `null` for a Kafka null key, record value, or header value.
+For bytes, use a string containing standard padded RFC 4648 Base64.
+`headers` may be an object or an array of `{"key","value"}`; array entries
+also accept `key_b64` and `value_b64` instead of the corresponding plain fields.
 `kite consume --json` uses `key_b64` for header names that are not valid UTF-8.
 `-H` headers are added to every record. Malformed lines fail with
 `kite: line N: ...`. Without `--txn`, kite sends the valid records before the
