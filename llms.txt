@@ -62,7 +62,8 @@ kite topic delete [-y] [--if-exists] TOPIC...   -y required when stderr is not a
 ## Consume
 
 kite consume [OPTIONS] [@CLUSTER] TOPIC   records on stdout
--B, --from-beginning            earliest offset (default: latest for the isolation level)
+-g, --group GROUP               join a Kafka 4.0 consumer group and resume committed offsets
+-B, --from-beginning            earliest offset (with -g, only where no offset is committed)
 --offset N  --partition P       start offset / single partition
 -n, --max N                     stop after N records
 -t, --idle DUR                  stop after DUR without records (3s, 500ms, 1m)
@@ -70,7 +71,8 @@ kite consume [OPTIONS] [@CLUSTER] TOPIC   records on stdout
 --read-uncommitted              include open and aborted transactional records
 --json                          UTF-8 JSON per record; invalid UTF-8 key/value/header bytes use sibling *_b64 fields (standard padded base64), safe for jq
 Default when stdout is a pipe or file: stop after 5 s idle, so scripts never hang.
-Default isolation, also with -g: read committed (stop at the last stable offset and skip aborted transactions). --read-uncommitted reads to the high watermark. Neither mode prints transaction markers.
+Without a start offset or a group commit, consume starts at the latest offset for the selected isolation level.
+Default isolation since v0.5.0, also with -g: read committed (stop at the last stable offset and skip aborted transactions). --read-uncommitted reads to the high watermark. Neither mode prints transaction markers.
 An open transaction can hold records behind the last stable offset even with -B: consume may exit 0 with no records and an (idle timeout) summary (suppressed by -q). Use --follow instead of --idle to keep waiting for the transaction to resolve.
 
 ## Contract

@@ -51,7 +51,7 @@ pub fn Result(comptime T: type) type {
     };
 }
 
-pub const version = "0.4.1";
+pub const version = "0.5.0";
 
 pub const Command = enum {
     produce,
