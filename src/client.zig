@@ -79,6 +79,7 @@ pub const Retry = struct {
 pub const Client = struct {
     group_deadline: ?std.Io.Timestamp = null,
     wait_hook: ?transport.WaitHook = null,
+    hedge_watch_hook: ?transport.WaitHook = null,
     control_busy: bool = false,
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -338,6 +339,7 @@ pub const Client = struct {
         c.postConnect(conn) catch |err| {
             conn.close();
             c.alloc.destroy(conn);
+            if (err == error.WaitHookAborted) return error.WaitHookAborted;
             if (c.txn_stop) |flag| if (flag.load(.acquire)) return error.Interrupted;
             var prev: [512]u8 = undefined;
             const d = c.errDetail();
@@ -447,12 +449,16 @@ pub const Client = struct {
         defer if (on_control) {
             c.control_busy = prev_control_busy;
         };
-        const use_hook = c.wait_hook != null and key != protocol.api_key.consumer_group_heartbeat and key != protocol.api_key.find_coordinator and key != protocol.api_key.api_versions;
-        if (use_hook) {
-            conn.net_reader.wait_hook = c.wait_hook;
+        const active_hook: ?transport.WaitHook = c.hedge_watch_hook orelse
+            if (c.wait_hook != null and key != protocol.api_key.consumer_group_heartbeat and key != protocol.api_key.find_coordinator and key != protocol.api_key.api_versions)
+                c.wait_hook
+            else
+                null;
+        if (active_hook) |hook| {
+            conn.net_reader.wait_hook = hook;
             conn.setReadDeadline(c.group_deadline orelse std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(@intCast(timeout))));
         }
-        defer if (use_hook) {
+        defer if (active_hook != null) {
             conn.net_reader.wait_hook = null;
             conn.setReadDeadline(null);
         };
@@ -796,14 +802,37 @@ pub const Client = struct {
 
         const deadline = c.group_deadline orelse std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(@intCast(timeout)));
         const addr = c.brokers.get(node) orelse return transport.recv(conn, alloc, corr1, true);
-        const hedge = c.connectOne(addr.host, addr.port) catch {
-            return transport.recv(conn, alloc, corr1, true);
+        const Watch = struct {
+            io: std.Io,
+            conn: *Conn,
+            fn nextDue(ctx: *anyopaque) ?std.Io.Timestamp {
+                const w: *@This() = @ptrCast(@alignCast(ctx));
+                const now = std.Io.Timestamp.now(w.io, .awake);
+                if (transport.waitReadable(w.conn, 0)) return now;
+                return now.addDuration(.fromMilliseconds(5));
+            }
+            fn tick(ctx: *anyopaque) bool {
+                const w: *@This() = @ptrCast(@alignCast(ctx));
+                return transport.waitReadable(w.conn, 0);
+            }
+        };
+        var watch: Watch = .{ .io = c.io, .conn = conn };
+        const prev_watch = c.hedge_watch_hook;
+        c.hedge_watch_hook = .{ .io = c.io, .ctx = &watch, .next_due = Watch.nextDue, .tick = Watch.tick };
+        const hedge = blk: {
+            defer c.hedge_watch_hook = prev_watch;
+            break :blk c.connectOne(addr.host, addr.port) catch {
+                return transport.recv(conn, alloc, corr1, true);
+            };
         };
         var keep_hedge = false;
         defer if (!keep_hedge) {
             hedge.close();
             c.alloc.destroy(hedge);
         };
+        if (transport.waitReadable(conn, 0)) {
+            return transport.recv(conn, alloc, corr1, true);
+        }
         const rem = try c.requestTimeoutMs(0);
         transport.setTimeout(hedge, rem);
         var e2 = Encoder.init(alloc);

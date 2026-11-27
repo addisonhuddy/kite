@@ -68,6 +68,7 @@ class Broker(socketserver.ThreadingTCPServer):
         self.meta_dropped = False
         self.fallback_meta_conn = None
         self.slow_offset_fetch_done = False
+        self.hb_in_flight = False
         self.started = time.monotonic()
         self.reset_started = None
         self.reset_fetches = []
@@ -268,6 +269,8 @@ class Handler(socketserver.StreamRequestHandler):
                 if api == 18:
                     if broker.mode == "position-slow-leaders":
                         time.sleep(0.2)
+                    if broker.mode == "short-heartbeat-slow-107ms" and broker.hb_in_flight:
+                        time.sleep(0.30)
                     tags = b""
                     versions = ((0, 11), (1, 12), (2, 8), (3, 12), (8, 9), (9, 9), (10, 6), (68, 1))
                     response = b"\x00\x00" + bytes([len(versions) + 1]) + b"".join(pack("hhh", k, v, v) + b"\x00" for k, v in versions) + b"\x00" * 5
@@ -361,7 +364,11 @@ class Handler(socketserver.StreamRequestHandler):
                         if broker.mode in ("short-heartbeat-session", "short-heartbeat-session-slow-leader"):
                             time.sleep(0.06)
                     if broker.mode == "short-heartbeat-slow-107ms" and epoch > 0:
-                        time.sleep(0.107)
+                        broker.hb_in_flight = True
+                        try:
+                            time.sleep(0.107)
+                        finally:
+                            broker.hb_in_flight = False
                     if broker.mode == "short-heartbeat-slow-coordinator" and epoch > 0:
                         time.sleep(0.09)
                     if broker.mode == "short-heartbeat-1000ms-slow" and epoch > 0:
