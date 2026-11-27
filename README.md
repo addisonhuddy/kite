@@ -412,9 +412,10 @@ Missing commits and lag appear as `-` (JSON `null`); unassigned partitions have
 empty member/client IDs in JSON. These commands are read-only, accept common
 connection flags and `@CLUSTER`, and do not change consumer offsets. Lag is a
 snapshot: producing or committing concurrently can change it during the query.
-Classic groups show offsets and lag without member/client IDs. Deleted topics
-or partitions retain committed offsets but show unavailable end/lag (`-`, or
-JSON null). Negative lag after truncation is clamped to zero with a warning.
+Active classic groups show member and client IDs for assigned partitions, even
+without commits. Deleted topics or partitions retain committed offsets but show
+unavailable end/lag (`-`, or JSON null). Negative lag after truncation is clamped
+to zero with a warning.
 Lag uses the high watermark (`read_uncommitted`), like the stock tools, not
 the last stable offset used by `read_committed` consumers. Group listing warns
 and returns partial results when some brokers are unreachable.
