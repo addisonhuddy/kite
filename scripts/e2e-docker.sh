@@ -328,9 +328,21 @@ set +e
 ) | zig-out/bin/kite produce --txn kite-e2e-abort --json "$TXN_ABORT" 2>/dev/null
 rc=$?
 set -e
+wait_complete_abort() {
+    local tid=$1
+    local desc=""
+    for _ in $(seq 1 75); do
+        desc=$(docker exec "$NAME" /opt/kafka/bin/kafka-transactions.sh --bootstrap-server localhost:9092 describe --transactional-id "$tid" 2>/dev/null || true)
+        if echo "$desc" | grep -q "CompleteAbort"; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    fail "txn: $tid did not reach CompleteAbort: [$desc]"
+}
+
 [ "$rc" -eq 1 ] || fail "txn: aborted produce exited $rc, want 1"
-txn_desc=$(docker exec "$NAME" /opt/kafka/bin/kafka-transactions.sh --bootstrap-server localhost:9092 describe --transactional-id kite-e2e-abort 2>/dev/null)
-echo "$txn_desc" | grep -q "CompleteAbort" || fail "txn: kite-e2e-abort state not CompleteAbort: [$txn_desc]"
+wait_complete_abort kite-e2e-abort
 printf '{"key":"a","value":"sentinel-a"}\n{"key":"b","value":"sentinel-b"}\n' \
     | zig-out/bin/kite produce --txn kite-e2e-abort-sentinel --json "$TXN_ABORT" >/dev/null 2>&1 \
     || fail "txn: committed sentinel produce to $TXN_ABORT failed"
@@ -363,8 +375,7 @@ set -e
 exec 3>&-
 rm -f "$TXN_FIFO"
 [ "$rc" -eq 130 ] || fail "txn: SIGINT produce exited $rc, want 130"
-txn_int_desc=$(docker exec "$NAME" /opt/kafka/bin/kafka-transactions.sh --bootstrap-server localhost:9092 describe --transactional-id kite-e2e-sigint 2>/dev/null)
-echo "$txn_int_desc" | grep -q "CompleteAbort" || fail "txn: kite-e2e-sigint state not CompleteAbort: [$txn_int_desc]"
+wait_complete_abort kite-e2e-sigint
 printf 'k1\tsentinel-int-1\nk2\tsentinel-int-2\n' \
     | zig-out/bin/kite produce --txn kite-e2e-sigint-sentinel "$TXN_INT" >/dev/null 2>&1 \
     || fail "txn: committed sentinel produce to $TXN_INT failed"

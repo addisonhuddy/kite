@@ -335,7 +335,7 @@ kite --version                            Print the version.
 | produce | `-H 'name: value'` | Add a header to every record (repeatable). |
 | produce | `--csv` | Read RFC 4180 CSV; each row becomes a JSON object value. |
 | produce | `--key COL` | Use CSV column `COL` as the record key (requires `--csv`). |
-| produce | `--txn ID` | Produce all of stdin atomically under transactional `ID` (commits on EOF, aborts on error or interrupt before commit; if interrupted after commit is sent and its reply is lost, exits 130 reporting unknown outcome instead of aborting; requires `enable.idempotence=true`). |
+| produce | `--txn ID` | Produce all of stdin atomically under transactional `ID` (commits on EOF, aborts on error or interrupt before commit; if interrupted after commit is sent, exits 130 reporting unknown outcome instead of aborting; requires `enable.idempotence=true`). |
 | consume | `-B`, `--from-beginning` | Start at the earliest offset. |
 | consume | `--offset N` | Start at offset N in every selected partition; errors if N is out of range. |
 | consume | `--partition P` | Read one partition only. |

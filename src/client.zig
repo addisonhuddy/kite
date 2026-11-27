@@ -1447,47 +1447,53 @@ pub const Client = struct {
 
     /// Commit (`commit=true`) or abort (`commit=false`) the active transaction.
     /// No-op when no partitions were registered (or attempted) in the transaction.
-    /// When `commit` is true and `stop` becomes set before any commit request is
-    /// sent (or after a definitive coordinator rejection), returns
-    /// `error.Interrupted` so the caller can safely abort. Once a commit request
-    /// has been sent and its reply is lost, the broker may have committed; if
-    /// `stop` is set then, returns `error.CommitOutcomeUnknown` instead of
-    /// switching to abort.
+    /// When `commit` is true and `stop` becomes set before the first commit
+    /// request is dispatched, returns `error.Interrupted` so the caller can
+    /// safely abort. Once a commit request has been dispatched, any lost or
+    /// malformed reply or coordinator-movement error means the broker may have
+    /// appended `PrepareCommit`: retries send only commit, and if `stop` is set
+    /// it returns `error.CommitOutcomeUnknown` instead of switching to abort.
     pub fn endTransaction(c: *Client, commit: bool, stop: ?*const std.atomic.Value(bool)) !void {
         if (!c.hasActiveTxn()) return;
         const txn_id = c.txn_id.?;
         const verb = if (commit) "commit" else "abort";
         var retry: Retry = .{};
-        var commit_in_flight = false;
+        var commit_dispatched = false;
         while (true) {
             if (commit) if (stop) |s| if (s.load(.acquire)) {
-                return if (commit_in_flight) error.CommitOutcomeUnknown else error.Interrupted;
+                return if (commit_dispatched) error.CommitOutcomeUnknown else error.Interrupted;
             };
             const node = c.findTxnCoordinator() catch |err| {
                 if (commit) if (stop) |s| if (s.load(.acquire)) {
-                    return if (commit_in_flight) error.CommitOutcomeUnknown else error.Interrupted;
+                    return if (commit_dispatched) error.CommitOutcomeUnknown else error.Interrupted;
                 };
-                if (commit_in_flight) {
+                if (commit_dispatched) {
                     c.setErr("EndTxn (commit '{s}'): coordinator lookup failed (outcome unknown; broker may have committed)", .{txn_id});
                     return error.ProduceFailed;
                 }
                 return err;
             };
             if (commit) if (stop) |s| if (s.load(.acquire)) {
-                return if (commit_in_flight) error.CommitOutcomeUnknown else error.Interrupted;
+                return if (commit_dispatched) error.CommitOutcomeUnknown else error.Interrupted;
             };
             const conn = c.connFor(node, connKey(node, txn_coord_slot)) catch {
                 c.invalidateTxnCoordinator();
                 if (commit) if (stop) |s| if (s.load(.acquire)) {
-                    return if (commit_in_flight) error.CommitOutcomeUnknown else error.Interrupted;
+                    return if (commit_dispatched) error.CommitOutcomeUnknown else error.Interrupted;
                 };
                 if (retry.pause(c)) continue;
-                if (commit_in_flight)
+                if (commit_dispatched)
                     c.setErr("EndTxn (commit '{s}'): coordinator unreachable (outcome unknown; broker may have committed)", .{txn_id})
                 else
                     c.setErr("EndTxn ({s} '{s}'): coordinator unreachable", .{ verb, txn_id });
                 return error.ProduceFailed;
             };
+            // Recheck stop after a fresh connection / ApiVersions handshake,
+            // right before dispatching EndTxn on the wire.
+            if (commit) if (stop) |s| if (s.load(.acquire)) {
+                return if (commit_dispatched) error.CommitOutcomeUnknown else error.Interrupted;
+            };
+            if (commit) commit_dispatched = true;
             const resp = c.sendRequest(
                 conn,
                 protocol.api_key.end_txn,
@@ -1500,11 +1506,10 @@ pub const Client = struct {
                 },
                 protocol.endTxnRequest,
             ) catch {
-                if (commit) commit_in_flight = true;
                 c.invalidateTxnCoordinator();
                 if (commit) if (stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
                 if (retry.pause(c)) continue;
-                if (commit_in_flight)
+                if (commit_dispatched)
                     c.setErr("EndTxn (commit '{s}'): request failed (outcome unknown; broker may have committed)", .{txn_id})
                 else
                     c.setErr("EndTxn ({s} '{s}'): request failed", .{ verb, txn_id });
@@ -1512,7 +1517,16 @@ pub const Client = struct {
             };
             defer c.alloc.free(resp.frame);
             var d = Decoder.init(resp.body);
-            const code = try protocol.endTxnResponse(&d);
+            const code = protocol.endTxnResponse(&d) catch {
+                c.invalidateTxnCoordinator();
+                if (commit) if (stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
+                if (retry.pause(c)) continue;
+                if (commit_dispatched)
+                    c.setErr("EndTxn (commit '{s}'): malformed response (outcome unknown; broker may have committed)", .{txn_id})
+                else
+                    c.setErr("EndTxn ({s} '{s}'): malformed response", .{ verb, txn_id });
+                return error.ProduceFailed;
+            };
             if (code == .none) {
                 c.txn_added_parts.clearRetainingCapacity();
                 c.txn_add_attempted = false;
@@ -1526,13 +1540,13 @@ pub const Client = struct {
             }
             if (isCoordinatorError(code)) c.invalidateTxnCoordinator();
             if (commit) if (stop) |s| if (s.load(.acquire)) {
-                return if (commit_in_flight) error.CommitOutcomeUnknown else error.Interrupted;
+                return if (commit_dispatched) error.CommitOutcomeUnknown else error.Interrupted;
             };
             if ((isCoordinatorError(code) or code.retriable()) and retry.pause(c)) continue;
             if (commit and code == .transaction_abortable) {
                 _ = c.abortTransactionBestEffort();
             }
-            if (commit_in_flight)
+            if (commit_dispatched)
                 c.setErr("EndTxn (commit '{s}'): {s} (outcome unknown; broker may have committed)", .{ txn_id, code.name() })
             else
                 c.setErr("EndTxn ({s} '{s}'): {s}", .{ verb, txn_id, code.name() });
