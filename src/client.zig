@@ -1613,14 +1613,29 @@ pub const Client = struct {
     const produce_timeout_ms = 15000;
 
     fn markProduceUnsettled(c: *Client) void {
-        if (c.txn_id != null)
-            c.txn_produce_unsettled_until = std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(produce_timeout_ms));
+        c.markProduceUnsettledFrom(std.Io.Timestamp.now(c.io, .awake));
+    }
+
+    fn markProduceUnsettledFrom(c: *Client, sent: std.Io.Timestamp) void {
+        if (c.txn_id == null) return;
+        const until = sent.addDuration(.fromMilliseconds(produce_timeout_ms));
+        if (c.txn_produce_unsettled_until) |prev| {
+            if (prev.nanoseconds >= until.nanoseconds) return;
+        }
+        c.txn_produce_unsettled_until = until;
     }
 
     fn settleProduceBeforeAbort(c: *Client) void {
         for (c.outstanding.items) |*o| {
             if (o.corr < 0) continue;
             const conn = c.conns.get(o.ckey) orelse continue;
+            const deadline = o.sent.addDuration(.fromMilliseconds(produce_timeout_ms + 1000));
+            const rem_ms = std.Io.Timestamp.now(c.io, .awake).durationTo(deadline).toMilliseconds();
+            if (rem_ms <= 0) {
+                c.dropConn(o.ckey);
+                continue;
+            }
+            transport.setTimeout(conn, @intCast(rem_ms));
             var codes: std.AutoHashMapUnmanaged(i32, protocol.ErrorCode) = .empty;
             defer codes.deinit(c.alloc);
             c.produceRecv(conn, o.corr, &codes, null, null) catch {
@@ -2011,7 +2026,7 @@ pub const Client = struct {
         if (c.conns.fetchRemove(key)) |kv| {
             for (c.outstanding.items) |*o| {
                 if (o.ckey == key and o.corr >= 0) {
-                    c.markProduceUnsettled();
+                    c.markProduceUnsettledFrom(o.sent);
                     o.corr = -1;
                 }
             }
