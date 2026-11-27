@@ -657,11 +657,10 @@ fn applyKey(cfg: *Config, alloc: std.mem.Allocator, source: *Source, origin: Ori
                 return;
             }
             if (parsed > max_fetch_bytes) {
-                warn("fetch.max.bytes '{s}' exceeds maximum {d}; using default", .{ val, max_fetch_bytes });
-                cfg.fetch_max_bytes = 8 << 20;
-            } else {
-                cfg.fetch_max_bytes = parsed;
+                warn("fetch.max.bytes '{s}' exceeds maximum {d}; ignored", .{ val, max_fetch_bytes });
+                return;
             }
+            cfg.fetch_max_bytes = parsed;
         },
         .fetch_max_wait_ms => {
             cfg.fetch_max_wait_ms = std.fmt.parseInt(u64, val, 10) catch {
@@ -971,12 +970,16 @@ test "fetch.max.bytes honors transport limit and rejects zero" {
     try std.testing.expectEqual(@as(usize, 8 << 20), cfg.fetch_max_bytes);
     try applyKey(&cfg, arena.allocator(), &src, .file, "fetch.max.bytes", "33554432");
     try std.testing.expectEqual(@as(usize, 32 << 20), cfg.fetch_max_bytes);
-    try applyKey(&cfg, arena.allocator(), &src, .file, "fetch.max.bytes", "0");
+    try std.testing.expectEqual(Origin.file, src.origins.get(.fetch_max_bytes));
+    try applyKey(&cfg, arena.allocator(), &src, .env, "fetch.max.bytes", "0");
     try std.testing.expectEqual(@as(usize, 32 << 20), cfg.fetch_max_bytes);
-    const at_limit = try std.fmt.allocPrint(arena.allocator(), "{d}", .{max_fetch_bytes});
-    try applyKey(&cfg, arena.allocator(), &src, .file, "fetch.max.bytes", at_limit);
-    try std.testing.expectEqual(max_fetch_bytes, cfg.fetch_max_bytes);
+    try std.testing.expectEqual(Origin.file, src.origins.get(.fetch_max_bytes));
     const over = try std.fmt.allocPrint(arena.allocator(), "{d}", .{max_fetch_bytes + 1});
-    try applyKey(&cfg, arena.allocator(), &src, .file, "fetch.max.bytes", over);
-    try std.testing.expectEqual(@as(usize, 8 << 20), cfg.fetch_max_bytes);
+    try applyKey(&cfg, arena.allocator(), &src, .env, "fetch.max.bytes", over);
+    try std.testing.expectEqual(@as(usize, 32 << 20), cfg.fetch_max_bytes);
+    try std.testing.expectEqual(Origin.file, src.origins.get(.fetch_max_bytes));
+    const at_limit = try std.fmt.allocPrint(arena.allocator(), "{d}", .{max_fetch_bytes});
+    try applyKey(&cfg, arena.allocator(), &src, .env, "fetch.max.bytes", at_limit);
+    try std.testing.expectEqual(max_fetch_bytes, cfg.fetch_max_bytes);
+    try std.testing.expectEqual(Origin.env, src.origins.get(.fetch_max_bytes));
 }

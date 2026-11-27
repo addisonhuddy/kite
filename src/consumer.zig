@@ -10,6 +10,7 @@ const format_mod = @import("format.zig");
 
 const Encoder = protocol.Encoder;
 const Decoder = protocol.Decoder;
+const round_arena_retain_limit: usize = 16 << 20;
 
 pub const Options = struct {
     pub const Start = enum { earliest, latest, offset };
@@ -117,7 +118,7 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             if (retry.started == null and elapsed.toMilliseconds() >= idle) break;
         }
 
-        _ = round_arena.reset(.retain_capacity);
+        _ = round_arena.reset(.{ .retain_with_limit = round_arena_retain_limit });
         round_alloc = round_arena.allocator();
         var progress = false;
         var failed_leader: ?i32 = null;
@@ -554,6 +555,8 @@ const GroupSession = struct {
 
     fn leave(s: *GroupSession) void {
         if (s.epoch <= 0) return;
+        const saved_err = s.c.err_ctx;
+        defer s.c.err_ctx = saved_err;
         if (s.recoveryDeadline() != null) {
             s.beginRound();
             if (s.c.groupRemainingMs()) |_| {} else |_| return;
@@ -982,7 +985,7 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             break;
         };
         if (session.idleExpired(std.Io.Timestamp.now(c.io, .awake))) break;
-        _ = arena.reset(.retain_capacity);
+        _ = arena.reset(.{ .retain_with_limit = round_arena_retain_limit });
         session.beginRound();
         const elapsed = session.last_heartbeat.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds();
         if (session.heartbeat_due or elapsed >= session.interval) {
@@ -1505,7 +1508,10 @@ fn fetchLeader(
                 c.setErr("fetch from broker {d}: response exceeds {d} byte frame limit", .{ leader, transport.max_response_len });
                 return error.FetchFailed;
             },
-            error.OutOfMemory => return error.OutOfMemory,
+            error.OutOfMemory => {
+                c.setErr("fetch from broker {d}: out of memory", .{leader});
+                return error.OutOfMemory;
+            },
             else => return outcomes,
         }
     };
@@ -1952,4 +1958,28 @@ test "text record output honors value and tsv formats" {
     try onRecord(&sink, 5, 0, .{ .value = "at cursor" });
     try std.testing.expectEqualStrings("at cursor\n", w.buffered());
     try std.testing.expectEqual(@as(u64, 5), count);
+}
+
+test "group leave preserves prior err_ctx when leave heartbeat fails" {
+    const alloc = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(alloc);
+    defer env.deinit();
+    const cfg: config.Config = .{ .bootstrap_servers = &.{} };
+    var c = client.Client.init(alloc, std.testing.io, &env, &cfg);
+    defer c.deinit();
+    const now = std.Io.Timestamp.now(c.io, .awake);
+    var session: GroupSession = .{
+        .c = &c,
+        .opts = .{ .topic = "t", .group = "g" },
+        .member = @splat('m'),
+        .epoch = 1,
+        .last_heartbeat = now,
+        .last_record = now,
+    };
+    c.setErr("fetch from broker 1: response exceeds 134217728 byte frame limit", .{});
+    session.leave();
+    try std.testing.expectEqualStrings(
+        "fetch from broker 1: response exceeds 134217728 byte frame limit",
+        c.errDetail(),
+    );
 }
