@@ -201,7 +201,6 @@ pub const Scanner = struct {
                 '"' => {
                     const raw = s.src[start..s.pos];
                     s.pos += 1;
-                    if (!std.unicode.utf8ValidateSlice(raw)) return error.Malformed;
                     return if (escaped) try unescape(s.alloc, raw, decode) else raw;
                 },
                 '\\' => {
@@ -350,14 +349,13 @@ test "scanner: valid JSON values are preserved verbatim" {
 
 test "scanner: rejects invalid tokens, containers and strings" {
     for ([_][]const u8{
-        "tru",         "truefalse", "False",                 "nul",          "null1",             "undefined",
-        "-",           "+1",        "01",                    "-01",          ".2",                "1.",
-        "1e",          "1e+",       "1e-",                   "0x1",          "1_000",             "NaN",
-        "Infinity",    "{\"x\":}",  "{\"x\" 1}",             "{\"x\":1,}",   "{\"x\":1 \"y\":2}", "{x:1}",
-        "[,1]",        "[1,]",      "[1,,2]",                "[1 2]",        "[}",                "{]",
-        "[",           "[[[]]",     "{\"x\":[{\"y\":tru}]}", "[{\"x\":01}]", "[true\x0c]",        "\x0btrue",
-        "\"a\tb\"",    "\"\xff\"",  "\"\\u+01f\"",           "\"\\u0_01\"",  "\"\\q\"",           "{\"x\":[\"\\ud800\"]}",
-        "{\"\\q\":1}",
+        "tru",      "truefalse",   "False",                 "nul",          "null1",                 "undefined",
+        "-",        "+1",          "01",                    "-01",          ".2",                    "1.",
+        "1e",       "1e+",         "1e-",                   "0x1",          "1_000",                 "NaN",
+        "Infinity", "{\"x\":}",    "{\"x\" 1}",             "{\"x\":1,}",   "{\"x\":1 \"y\":2}",     "{x:1}",
+        "[,1]",     "[1,]",        "[1,,2]",                "[1 2]",        "[}",                    "{]",
+        "[",        "[[[]]",       "{\"x\":[{\"y\":tru}]}", "[{\"x\":01}]", "[true\x0c]",            "\x0btrue",
+        "\"a\tb\"", "\"\\u+01f\"", "\"\\u0_01\"",           "\"\\q\"",      "{\"x\":[\"\\ud800\"]}", "{\"\\q\":1}",
     }) |raw| {
         var s = Scanner{ .src = raw, .alloc = std.testing.allocator };
         try std.testing.expectError(error.Malformed, s.value());

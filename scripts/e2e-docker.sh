@@ -90,6 +90,16 @@ destination_bytes=$(zig-out/bin/kite consume -B -n 1 --idle 3s --json "$B64_DST"
 [ "$destination_bytes" = "$source_bytes" ] || fail "json-base64: bytes changed across consume | jq | produce"
 echo "PASS json-base64 jq roundtrip"
 
+HEADER_SRC="kite-header-src-$(date +%s)-$RANDOM"
+HEADER_DST="kite-header-dst-$(date +%s)-$RANDOM"
+printf 'payload\n' | zig-out/bin/kite produce -H $'h\xff\\name: header-value' "$HEADER_SRC"
+zig-out/bin/kite consume -B -n 1 --idle 3s --json "$HEADER_SRC" \
+    | zig-out/bin/kite produce --json "$HEADER_DST"
+zig-out/bin/kite consume -B -n 1 --idle 3s --json "$HEADER_DST" >"$TMP/binary-header.json"
+grep -aFq $'"headers":[{"key":"h\xff\\\\name","value":"header-value"}]' "$TMP/binary-header.json" \
+    || fail "json-binary-header: header name changed across consume | produce"
+echo "PASS JSON binary header-name roundtrip"
+
 expect_json_produce_error() {
     local input=$1 expected=$2 label=$3 rc
     set +e
