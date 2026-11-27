@@ -399,8 +399,9 @@ kite consume -g orders -B events
 `group list` queries every broker and lists consumer-protocol groups by default.
 `group describe` supports consumer-protocol and classic groups. It prints
 one row per assigned or committed partition with `group`, `topic`, `partition`,
-`committed`, `end`, `lag`, `member_id`, and `client_id`. Output is tab-separated
-(with a header on terminals), or one JSON object per partition with `--json`.
+`committed`, `end`, `lag`, `member_id`, and `client_id`. Both commands align
+columns with a header on terminals, and emit headerless tab-separated rows when
+piped. `--json` emits one JSON object per group or partition.
 Missing commits and lag appear as `-` (JSON `null`); unassigned partitions have
 empty member/client IDs in JSON. These commands are read-only, accept common
 connection flags and `@CLUSTER`, and do not change consumer offsets. Lag is a

@@ -1054,7 +1054,7 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
     const tty = std.Io.File.stdout().isTty(init.io) catch false;
     if (opts.action == .list) {
         const groups = c.listGroups(alloc, opts.all) catch fatalErr(&c, "could not list groups");
-        if (!as_json and tty) outw.writeAll("GROUP\tSTATE\n") catch {};
+        var human_rows: std.ArrayList([2][]const u8) = .empty;
         for (groups) |g| {
             if (as_json) {
                 outw.writeAll("{\"group\":") catch {};
@@ -1064,8 +1064,9 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
                 outw.writeAll(",\"type\":") catch {};
                 json.writeString(outw, g.group_type) catch {};
                 outw.writeAll("}\n") catch {};
-            } else outw.print("{s}\t{s}\n", .{ g.group, g.state }) catch {};
+            } else human_rows.append(alloc, .{ g.group, g.state }) catch oom();
         }
+        if (!as_json) writeGroupTable(2, outw, .{ "GROUP", "STATE" }, human_rows.items, tty) catch {};
         outw.flush() catch {};
         if (!opts.common.quiet) note("{d} group(s)", .{groups.len});
         std.process.exit(0);
@@ -1102,7 +1103,7 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
             return order == .lt or (order == .eq and a.partition < b.partition);
         }
     }.less);
-    if (!as_json and tty) outw.writeAll("GROUP\tTOPIC\tPARTITION\tCOMMITTED\tEND\tLAG\tMEMBER_ID\tCLIENT_ID\n") catch {};
+    var human_rows: std.ArrayList([8][]const u8) = .empty;
     var i: usize = 0;
     while (i < rows.items.len) {
         const topic = rows.items[i].topic;
@@ -1145,19 +1146,85 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
                 json.writeString(outw, r.client_id) catch {};
                 outw.writeAll("}\n") catch {};
             } else {
-                outw.print("{s}\t{s}\t{d}\t", .{ group, topic, r.partition }) catch {};
-                if (r.committed < 0) outw.writeByte('-') catch {} else outw.print("{d}", .{r.committed}) catch {};
-                outw.writeByte('\t') catch {};
-                if (end) |latest| outw.print("{d}", .{latest}) catch {} else outw.writeByte('-') catch {};
-                outw.writeByte('\t') catch {};
-                if (lag) |value| outw.print("{d}", .{value}) catch {} else outw.writeByte('-') catch {};
-                outw.print("\t{s}\t{s}\n", .{ if (r.member.len == 0) "-" else r.member, if (r.client_id.len == 0) "-" else r.client_id }) catch {};
+                human_rows.append(alloc, .{
+                    group,
+                    topic,
+                    groupNumber(alloc, r.partition),
+                    groupNumber(alloc, if (r.committed < 0) null else r.committed),
+                    groupNumber(alloc, end),
+                    groupNumber(alloc, lag),
+                    if (r.member.len == 0) "-" else r.member,
+                    if (r.client_id.len == 0) "-" else r.client_id,
+                }) catch oom();
             }
         }
     }
+    if (!as_json) writeGroupTable(8, outw, .{ "GROUP", "TOPIC", "PARTITION", "COMMITTED", "END", "LAG", "MEMBER_ID", "CLIENT_ID" }, human_rows.items, tty) catch {};
     outw.flush() catch {};
     if (!opts.common.quiet) note("{s}: {s}, {d} partition(s)", .{ group, described.state, rows.items.len });
     std.process.exit(0);
+}
+
+fn groupNumber(alloc: std.mem.Allocator, value: ?i64) []const u8 {
+    return if (value) |number| std.fmt.allocPrint(alloc, "{d}", .{number}) catch oom() else "-";
+}
+
+fn writeGroupTable(comptime columns: usize, writer: *std.Io.Writer, headers: [columns][]const u8, rows: []const [columns][]const u8, tty: bool) !void {
+    var widths: [columns]usize = undefined;
+    for (headers, 0..) |header, i| widths[i] = header.len;
+    if (tty) {
+        for (rows) |row| for (row, 0..) |cell, i| {
+            widths[i] = @max(widths[i], cell.len);
+        };
+    }
+    const header_rows: []const [columns][]const u8 = if (tty) &.{headers} else &.{};
+    for ([_][]const [columns][]const u8{ header_rows, rows }) |section| for (section) |row| {
+        for (row, 0..) |cell, i| {
+            try writer.writeAll(cell);
+            if (i + 1 < columns) {
+                if (tty) try writer.splatByteAll(' ', widths[i] - cell.len + 2) else try writer.writeByte('\t');
+            }
+        }
+        try writer.writeByte('\n');
+    };
+}
+
+test "group tables align terminal headers and rows and preserve piped TSV" {
+    const headers: [8][]const u8 = .{ "GROUP", "TOPIC", "PARTITION", "COMMITTED", "END", "LAG", "MEMBER_ID", "CLIENT_ID" };
+    const rows: []const [8][]const u8 = &.{
+        .{ "orders", "events", "0", "10", "1234567890", "1234567880", "-", "-" },
+        .{ "orders", "longer-topic-name", "123", "-", "-", "-", "member-longer-than-header", "client-longer-than-header" },
+    };
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeGroupTable(8, &output.writer, headers, rows, true);
+    var offset: usize = 0;
+    for (headers, 0..) |header, column| {
+        var width = header.len;
+        for (rows) |row| width = @max(width, row[column].len);
+        var lines = std.mem.tokenizeScalar(u8, output.written(), '\n');
+        const title = lines.next().?;
+        try std.testing.expectEqualStrings(header, title[offset..][0..header.len]);
+        for (rows) |row| {
+            const line = lines.next().?;
+            try std.testing.expectEqualStrings(row[column], line[offset..][0..row[column].len]);
+        }
+        offset += width + 2;
+    }
+    output.clearRetainingCapacity();
+    try writeGroupTable(2, &output.writer, .{ "GROUP", "STATE" }, &.{ .{ "a", "Stable" }, .{ "long-group-name", "Empty" } }, true);
+    try std.testing.expectEqualStrings("GROUP            STATE\na                Stable\nlong-group-name  Empty\n", output.written());
+    output.clearRetainingCapacity();
+    try writeGroupTable(2, &output.writer, .{ "GROUP", "STATE" }, &.{ .{ "a", "Stable" }, .{ "long-group-name", "Empty" } }, false);
+    try std.testing.expectEqualStrings("a\tStable\nlong-group-name\tEmpty\n", output.written());
+    output.clearRetainingCapacity();
+    try writeGroupTable(2, &output.writer, .{ "GROUP", "STATE" }, &.{}, true);
+    try std.testing.expectEqualStrings("GROUP  STATE\n", output.written());
+    output.clearRetainingCapacity();
+    try writeGroupTable(2, &output.writer, .{ "GROUP", "STATE" }, &.{}, false);
+    try std.testing.expectEqualStrings("", output.written());
+    var full = std.Io.Writer.fixed(&.{});
+    try std.testing.expectError(error.WriteFailed, writeGroupTable(2, &full, .{ "GROUP", "STATE" }, &.{}, true));
 }
 
 fn groupLag(committed: i64, end: ?i64) ?i64 {

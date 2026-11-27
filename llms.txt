@@ -2,7 +2,7 @@
 
 > kite is a single-binary, dependency-free Kafka CLI (under 1 MB, written in Zig) that produces stdin lines to a topic and consumes a topic to stdout. It is built for scripts, containers, CI, and AI agents: no JVM, no librdkafka, no daemon, no prompts, and piped reads terminate on idle by default.
 
-Consumer groups (Kafka 4.0): `kite group list [--all] [--json]` lists consumer groups on every broker (`--all` includes classic groups), warning on partial results. `kite group describe GROUP [--json]` shows group/topic/partition/committed/end/lag/member_id/client_id; classic groups show offsets only, with empty member/client IDs. Missing commits or unavailable end/lag are `-` in TSV, null in JSON. Lag is clamped to zero after truncation and measured against the high watermark (read_uncommitted). Both commands accept @CLUSTER and common flags. These commands do not modify group offsets.
+Consumer groups (Kafka 4.0): `kite group list [--all] [--json]` lists consumer groups on every broker (`--all` includes classic groups), warning on partial results. `kite group describe GROUP [--json]` shows group/topic/partition/committed/end/lag/member_id/client_id; classic groups show offsets only, with empty member/client IDs. Both commands print aligned columns with a header on terminals, headerless TSV when piped, or unchanged JSON with `--json`. Missing commits or unavailable end/lag are `-` in human output, null in JSON. Lag is clamped to zero after truncation and measured against the high watermark (read_uncommitted). Both commands accept @CLUSTER and common flags. These commands do not modify group offsets.
 
 Repository: https://github.com/addisonhuddy/kite
 License: Apache-2.0
