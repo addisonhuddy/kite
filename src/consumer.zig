@@ -1267,7 +1267,7 @@ test "read-committed fetch with records and no last stable offset fails closed" 
     const parts = [_]FetchPart{.{ .pidx = 0, .cursor = &cursor }};
     var batches = Encoder.init(alloc);
     defer batches.deinit();
-    try protocol.encodeRecordBatch(&batches, &.{.{ .value = "record" }}, 0, -1, -1, -1);
+    try protocol.encodeRecordBatch(&batches, &.{.{ .value = "record" }}, 0, -1, -1, -1, false);
     var e = Encoder.init(alloc);
     defer e.deinit();
     try e.i32v(0);
