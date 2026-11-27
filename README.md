@@ -691,7 +691,9 @@ without double encoding. The `_b64` fields must be strings containing standard
 RFC 4648 Base64 with padding; they are decoded as record bytes. `headers` may
 be an object or an array of `{"key","value"}`; array entries also accept
 `value_b64`. `-H` headers are added to every record. Malformed lines fail with
-`kite: line N: ...`. `--json` and `--csv` are mutually exclusive.
+`kite: line N: ...`. Without `--txn`, kite sends the valid records before the
+malformed line and reports how many the broker acknowledged. With `--txn`, the
+malformed line aborts the transaction instead. `--json` and `--csv` are mutually exclusive.
 
 ## Configuration
 

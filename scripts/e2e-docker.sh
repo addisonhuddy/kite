@@ -128,6 +128,20 @@ expect_json_produce_error '{"value":01}' 'kite: line 1: invalid JSON' invalid-js
 expect_json_produce_error $'\n\t\n{"value":tru}' 'kite: line 3: invalid JSON' invalid-json-line-number
 echo "PASS malformed JSON input errors"
 
+JSON_PARTIAL="kite-json-partial-$(date +%s)-$RANDOM"
+zig-out/bin/kite topic create "$JSON_PARTIAL" >/dev/null
+set +e
+printf '%s\n' '{"value":1}' '{"value":2}' '{"value":tru}' '{"value":3}' \
+    | zig-out/bin/kite produce --json "$JSON_PARTIAL" 2>"$TMP/json-partial.err"
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "json-partial: malformed produce exited $rc, want 1"
+grep -Eq 'kite: line 3: invalid JSON .*broker acknowledged 2 of 2 earlier record\(s\)' "$TMP/json-partial.err" \
+    || fail "json-partial: missing malformed line or broker acknowledgment count"
+got=$(zig-out/bin/kite consume -B -n 3 --idle 1s --format value "$JSON_PARTIAL")
+[ "$got" = $'1\n2' ] || fail "json-partial: expected only the records before the malformed line, got [$got]"
+echo "PASS malformed JSON preserves prior nontransactional records"
+
 # Stopping bounds: `-n 1` on an empty topic bounds records, not time, so it
 # must still be running after 3s; `-n 1 --idle 500ms` must stop on its own.
 EMPTY_TOPIC="kite-empty-$(date +%s)-$RANDOM"
