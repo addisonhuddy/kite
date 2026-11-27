@@ -206,7 +206,7 @@ pub fn main(init: std.process.Init) !void {
     var cfg = loadConfig(init, alloc, produce.common, &dummy_source);
     if (produce.txn != null and !cfg.enable_idempotence)
         fatal("--txn requires enable.idempotence=true", .{});
-    var cli = client.Client.init(alloc, io, init.environ_map, &cfg);
+    var cli = client.Client.init(std.heap.page_allocator, io, init.environ_map, &cfg);
     connectAndResolve(&cli, topic, "write", quiet, true);
     if (produce.txn) |txn_id| {
         installSignalHandlers();
@@ -217,6 +217,9 @@ pub fn main(init: std.process.Init) !void {
     const nparts = cli.partitionCount();
     var pend = alloc.alloc(Pending, nparts) catch fatal("out of memory", .{});
     for (pend) |*p| p.* = .{};
+    var batch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer batch_arena.deinit();
+    const batch_alloc = batch_arena.allocator();
 
     var stdin_buf: [64 * 1024]u8 = undefined;
     const stdin_fd = std.Io.File.stdin().handle;
@@ -246,6 +249,9 @@ pub fn main(init: std.process.Init) !void {
 
     var rr: usize = 0; // round-robin cursor for unkeyed records
     var total: u64 = 0;
+    var pending_bytes: usize = 0;
+    const pending_budget = 8 << 20;
+    const inflight_budget = 32 << 20;
     const timing = init.environ_map.get("KITE_TIME") != null;
     var t_read: u64 = 0;
     var t_flush: u64 = 0;
@@ -258,6 +264,18 @@ pub fn main(init: std.process.Init) !void {
     read_loop: while (true) {
         if (produce.txn != null and interrupted.load(.acquire))
             abortInterrupted();
+        // The parsed input can be much larger than the encoded records (e.g.
+        // skipped JSON whitespace), and each partition has its own batch.
+        if (pending_bytes >= pending_budget or batch_arena.queryCapacity() >= pending_budget) {
+            flushAll(&cli, topic, pend, &batch_arena) catch |err| produceFatal(&cli, err);
+            pending_bytes = 0;
+            t_flush += timer.lap();
+        }
+        if (cli.outstanding_bytes > inflight_budget) {
+            cli.produceDrainUntil(topic, inflight_budget) catch |err| produceFatal(&cli, err);
+            stats.maybeRender();
+            t_drain += timer.lap();
+        }
         // Linger: with pending records and no stdin data within linger_ms,
         // flush rather than block indefinitely on a slow producer. Skip the
         // poll when a full line is already buffered — no read() can block.
@@ -265,40 +283,42 @@ pub fn main(init: std.process.Init) !void {
             csv.rowReady(r)
         else
             std.mem.indexOfScalar(u8, r.buffered(), '\n') != null;
-        if (!ready and pendingBytes(pend) > 0) {
+        if (!ready and pending_bytes > 0) {
             var fds = [_]std.posix.pollfd{.{ .fd = stdin_fd, .events = std.posix.POLL.IN, .revents = 0 }};
             const nready = std.posix.poll(&fds, @intCast(@min(cfg.linger_ms, std.math.maxInt(i32)))) catch 1;
             if (produce.txn != null and interrupted.load(.acquire))
                 abortInterrupted();
             if (nready == 0) {
-                flushAll(&cli, topic, pend) catch |err| produceFatal(&cli, err);
+                flushAll(&cli, topic, pend, &batch_arena) catch |err| produceFatal(&cli, err);
+                pending_bytes = 0;
                 stats.maybeRender();
                 continue;
             }
         }
 
         const rec = if (csv_mode) blk: {
-            const row = csv.nextRow(r, alloc) catch {
+            const row = csv.nextRow(r, batch_alloc) catch {
                 if (produce.txn != null and interrupted.load(.acquire)) abortInterrupted();
                 fatal("failed reading stdin", .{});
             } orelse break :read_loop;
-            break :blk csvRecord(alloc, row, cols, key_idx, static_headers, total + 1);
+            break :blk csvRecord(batch_alloc, row, cols, key_idx, static_headers, total + 1);
         } else blk: {
-            const owned = nextLine(r, alloc) catch {
+            const owned = nextLine(r, batch_alloc) catch {
                 if (produce.txn != null and interrupted.load(.acquire)) abortInterrupted();
                 fatal("failed reading stdin", .{});
             } orelse break :read_loop;
             if (json_mode) {
                 if (std.mem.trim(u8, owned, " \t").len == 0) continue;
-                break :blk jsonRecord(alloc, owned, static_headers, total + 1);
+                break :blk jsonRecord(batch_alloc, owned, static_headers, total + 1);
             }
             if (value_mode)
                 break :blk protocol.Record{ .value = owned, .headers = static_headers };
-            break :blk parseLine(alloc, owned, static_headers, total + 1);
+            break :blk parseLine(batch_alloc, owned, static_headers, total + 1);
         };
         t_read += timer.lap();
         total += 1;
-        stats.add(1, recordSize(rec));
+        const size = recordSize(rec);
+        stats.add(1, size);
         stats.maybeRender();
         // Keyed records partition by murmur2 like Kafka's default partitioner;
         // unkeyed records round-robin so every partition fills together.
@@ -311,24 +331,21 @@ pub fn main(init: std.process.Init) !void {
             break :blk t;
         };
         const p = &pend[target];
-        p.records.append(alloc, rec) catch fatal("out of memory", .{});
-        p.bytes += recordSize(rec);
+        p.records.append(batch_alloc, rec) catch fatal("out of memory", .{});
+        p.bytes += size;
+        pending_bytes += size;
         if (p.bytes + batch_overhead >= cfg.batch_size) {
             // Cap hit: flush every partition's pending buffer in one pipelined
             // round so all leader conns go in flight together.
-            flushAll(&cli, topic, pend) catch |err| produceFatal(&cli, err);
+            flushAll(&cli, topic, pend, &batch_arena) catch |err| produceFatal(&cli, err);
+            pending_bytes = 0;
             t_flush += timer.lap();
-            if (cli.outstanding_bytes >= 96 << 20) {
-                cli.produceDrainUntil(topic, 96 << 20) catch |err| produceFatal(&cli, err);
-                stats.maybeRender();
-                t_drain += timer.lap();
-            }
         }
     }
 
     if (produce.txn != null and interrupted.load(.acquire))
         abortInterrupted();
-    flushAll(&cli, topic, pend) catch |err| produceFatal(&cli, err);
+    flushAll(&cli, topic, pend, &batch_arena) catch |err| produceFatal(&cli, err);
     cli.produceDrain(topic) catch |err| produceFatal(&cli, err);
     if (produce.txn != null) {
         if (interrupted.load(.acquire))
@@ -1856,12 +1873,6 @@ fn csvRecord(
     };
 }
 
-fn pendingBytes(pend: []Pending) usize {
-    var n: usize = 0;
-    for (pend) |p| n += p.bytes;
-    return n;
-}
-
 /// Estimated encoded size of a record: key + value + header bytes plus
 /// varint framing (~16B/record, ~8B/header). Charged against batch_size so
 /// encoded batches stay under the broker's ~1MiB message.max.bytes.
@@ -1954,22 +1965,18 @@ fn nextLine(r: *std.Io.Reader, alloc: std.mem.Allocator) !?[]const u8 {
     return owned;
 }
 
-fn flushAll(c: *client.Client, topic: []const u8, pend: []Pending) !void {
+fn flushAll(c: *client.Client, topic: []const u8, pend: []Pending, arena: *std.heap.ArenaAllocator) !void {
+    const alloc = arena.allocator();
     var parts: std.ArrayListUnmanaged(usize) = .empty;
     var sets: std.ArrayListUnmanaged([]const protocol.Record) = .empty;
-    defer parts.deinit(c.alloc);
-    defer sets.deinit(c.alloc);
     for (pend, 0..) |*p, i| {
         if (p.records.items.len == 0) continue;
-        try parts.append(c.alloc, i);
-        try sets.append(c.alloc, p.records.items);
+        try parts.append(alloc, i);
+        try sets.append(alloc, p.records.items);
     }
-    if (parts.items.len == 0) return;
-    try c.produceEnqueue(topic, parts.items, sets.items);
-    for (parts.items) |i| {
-        pend[i].records.clearRetainingCapacity();
-        pend[i].bytes = 0;
-    }
+    if (parts.items.len != 0) try c.produceEnqueue(topic, parts.items, sets.items);
+    for (parts.items) |i| pend[i] = .{};
+    _ = arena.reset(.{ .retain_with_limit = 1 << 20 });
 }
 
 fn produceFatal(c: *client.Client, err: anyerror) noreturn {
