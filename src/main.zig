@@ -500,18 +500,30 @@ fn jsonRecord(
                     var hfirst = true;
                     while (hs.nextElement(hfirst) catch |err| return jsonScanError(err)) : (hfirst = false) {
                         const is_entry = hs.beginObject() catch |err| return jsonScanError(err);
-                        if (!is_entry) return .{ .invalid = "header entries must be {\"key\",\"value\"} objects" };
+                        if (!is_entry) return .{ .invalid = "header entries must be objects with \"key\" or \"key_b64\"" };
                         var hk: ?[]const u8 = null;
+                        var hk_seen = false;
+                        var hk_b64_seen = false;
                         var hv: ?[]const u8 = null;
                         var hv_seen = false;
                         var hv_b64_seen = false;
                         var efirst = true;
                         while (hs.nextMember(efirst) catch |err| return jsonScanError(err)) |e| : (efirst = false) {
                             if (std.mem.eql(u8, e.key, "key")) {
+                                if (hk_b64_seen) return .{ .invalid = "use \"key\" or \"key_b64\", not both, in a header entry" };
+                                hk_seen = true;
                                 hk = switch (e.value) {
                                     .string => |v| v,
                                     else => return .{ .invalid = "header \"key\" must be a string" },
                                 };
+                            } else if (std.mem.eql(u8, e.key, "key_b64")) {
+                                if (hk_seen) return .{ .invalid = "use \"key\" or \"key_b64\", not both, in a header entry" };
+                                hk_b64_seen = true;
+                                const encoded = switch (e.value) {
+                                    .string => |v| v,
+                                    else => return .{ .invalid = "header \"key_b64\" must be a string" },
+                                };
+                                hk = decodeJsonBase64(alloc, encoded) orelse return .{ .invalid = "header \"key_b64\" is not valid base64" };
                             } else if (std.mem.eql(u8, e.key, "value")) {
                                 if (hv_b64_seen) return .{ .invalid = "use \"value\" or \"value_b64\", not both" };
                                 hv_seen = true;
@@ -527,7 +539,7 @@ fn jsonRecord(
                             }
                         }
                         headers.append(alloc, .{
-                            .key = hk orelse return .{ .invalid = "header entry has no \"key\"" },
+                            .key = hk orelse return .{ .invalid = "header entry has no \"key\" or \"key_b64\"" },
                             .value = hv,
                         }) catch oom();
                     }
@@ -574,6 +586,19 @@ test "JSON record parsing returns a diagnostic without exiting" {
     try std.testing.expect(std.mem.startsWith(u8, invalid.invalid, "invalid JSON"));
     const invalid_header = jsonRecord(alloc, "{\"value\":42,\"headers\":{\"x\":false}}", &.{});
     try std.testing.expectEqualStrings("header values must be strings or null", invalid_header.invalid);
+}
+
+test "JSON header entries decode binary key names and reject invalid definitions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const valid = jsonRecord(alloc, "{\"value\":\"x\",\"headers\":[{\"key_b64\":\"/w==\",\"value\":\"v\"}]}", &.{});
+    try std.testing.expectEqualStrings("\xff", valid.record.headers[0].key);
+    try std.testing.expectEqualStrings("v", valid.record.headers[0].value.?);
+    const invalid_base64 = jsonRecord(alloc, "{\"value\":\"x\",\"headers\":[{\"key_b64\":\"!!!!\"}]}", &.{});
+    try std.testing.expectEqualStrings("header \"key_b64\" is not valid base64", invalid_base64.invalid);
+    const conflicting = jsonRecord(alloc, "{\"value\":\"x\",\"headers\":[{\"key_b64\":\"/w==\",\"key\":\"h\"}]}", &.{});
+    try std.testing.expectEqualStrings("use \"key\" or \"key_b64\", not both, in a header entry", conflicting.invalid);
 }
 
 fn note(comptime fmt: []const u8, args: anytype) void {

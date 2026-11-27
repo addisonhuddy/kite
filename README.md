@@ -689,8 +689,10 @@ A string `value` is sent as its decoded bytes; any other JSON value (object,
 array, number, boolean) is sent verbatim, so JSON payloads can be embedded
 without double encoding. The `_b64` fields must be strings containing standard
 RFC 4648 Base64 with padding; they are decoded as record bytes. `headers` may
-be an object or an array of `{"key","value"}`; array entries also accept
-`value_b64`. `-H` headers are added to every record. Malformed lines fail with
+be an object or an array of `{"key","value"}`; array entries accept
+`key_b64` and `value_b64` instead of the corresponding plain fields.
+`kite consume --json` uses `key_b64` for header names that are not valid UTF-8.
+`-H` headers are added to every record. Malformed lines fail with
 `kite: line N: ...`. Without `--txn`, kite sends the valid records before the
 malformed line and reports how many the broker acknowledged. With `--txn`, the
 malformed line aborts the transaction instead. `--json` and `--csv` are mutually exclusive.

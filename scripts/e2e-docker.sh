@@ -92,13 +92,20 @@ echo "PASS json-base64 jq roundtrip"
 
 HEADER_SRC="kite-header-src-$(date +%s)-$RANDOM"
 HEADER_DST="kite-header-dst-$(date +%s)-$RANDOM"
-printf 'payload\n' | zig-out/bin/kite produce -H $'h\xff\\name: header-value' "$HEADER_SRC"
+HEADER_NAME=$'h\xff\\name'
+HEADER_B64=$(printf '%s' "$HEADER_NAME" | base64)
+printf 'payload\n' | zig-out/bin/kite produce -H "$HEADER_NAME: header-value" "$HEADER_SRC"
 zig-out/bin/kite consume -B -n 1 --idle 3s --json "$HEADER_SRC" \
     | zig-out/bin/kite produce --json "$HEADER_DST"
-zig-out/bin/kite consume -B -n 1 --idle 3s --json "$HEADER_DST" >"$TMP/binary-header.json"
-grep -aFq $'"headers":[{"key":"h\xff\\\\name","value":"header-value"}]' "$TMP/binary-header.json" \
-    || fail "json-binary-header: header name changed across consume | produce"
-echo "PASS JSON binary header-name roundtrip"
+zig-out/bin/kite consume -B -n 1 --idle 3s --json "$HEADER_SRC" \
+    | jq -c . \
+    | zig-out/bin/kite produce --json "$HEADER_DST-jq"
+for destination in "$HEADER_DST" "$HEADER_DST-jq"; do
+    headers=$(zig-out/bin/kite consume -B -n 1 --idle 3s --json "$destination" | jq -c '.headers')
+    [ "$headers" = "[{\"key_b64\":\"$HEADER_B64\",\"value\":\"header-value\"}]" ] \
+        || fail "json-binary-header: header name changed on $destination: [$headers]"
+done
+echo "PASS JSON binary header-name roundtrip (direct and through jq)"
 
 expect_json_produce_error() {
     local input=$1 expected=$2 label=$3 rc

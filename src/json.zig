@@ -201,6 +201,7 @@ pub const Scanner = struct {
                 '"' => {
                     const raw = s.src[start..s.pos];
                     s.pos += 1;
+                    if (!std.unicode.utf8ValidateSlice(raw)) return error.Malformed;
                     return if (escaped) try unescape(s.alloc, raw, decode) else raw;
                 },
                 '\\' => {
@@ -357,6 +358,13 @@ test "scanner: rejects invalid tokens, containers and strings" {
         "[",        "[[[]]",       "{\"x\":[{\"y\":tru}]}", "[{\"x\":01}]", "[true\x0c]",            "\x0btrue",
         "\"a\tb\"", "\"\\u+01f\"", "\"\\u0_01\"",           "\"\\q\"",      "{\"x\":[\"\\ud800\"]}", "{\"\\q\":1}",
     }) |raw| {
+        var s = Scanner{ .src = raw, .alloc = std.testing.allocator };
+        try std.testing.expectError(error.Malformed, s.value());
+    }
+}
+
+test "scanner: rejects non-Unicode strings in both decoded and verbatim values" {
+    for ([_][]const u8{ "\"\xff\"", "\"\\ud800\"", "{\"x\":\"\xff\"}", "[\"\\udc00\"]" }) |raw| {
         var s = Scanner{ .src = raw, .alloc = std.testing.allocator };
         try std.testing.expectError(error.Malformed, s.value());
     }
