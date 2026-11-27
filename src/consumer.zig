@@ -1064,14 +1064,21 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             }
         };
         session.beginRound();
-        const selected = for (0..session.owned.items.len) |_| {
-            const idx = leader_index % session.owned.items.len;
-            leader_index +%= 1;
+        const since_beat = session.last_heartbeat.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds();
+        const until_beat = session.interval -| @as(u64, @intCast(@max(0, since_beat)));
+        const slack = heartbeatSlack(session.interval);
+        if (until_beat <= slack and session.fetched_since_beat) {
+            c.sleep(until_beat);
+            continue;
+        }
+        const selected = for (0..session.owned.items.len) |offset| {
+            const idx = (leader_index +% offset) % session.owned.items.len;
             if (session.fetchReady(session.owned.items[idx])) break idx;
         } else {
             if (!session.positions_pending_initial) _ = retry.pause(c);
             continue;
         };
+        leader_index = selected +% 1;
         if (session.owned.items[selected].leader_stale) {
             c.refreshMetadata(opts.topic) catch |err| {
                 if (!session.recoverEpoch(err)) {
@@ -1092,13 +1099,6 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             try parts.append(arena.allocator(), .{ .pidx = cursor.pidx, .cursor = cursor });
         };
         var fetch_opts = opts;
-        const since_beat = session.last_heartbeat.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds();
-        const until_beat = session.interval -| @as(u64, @intCast(@max(0, since_beat)));
-        const slack = heartbeatSlack(session.interval);
-        if (until_beat <= slack and session.fetched_since_beat) {
-            c.sleep(until_beat);
-            continue;
-        }
         const remaining = c.groupRemainingMs() catch {
             session.heartbeat_due = true;
             continue;
