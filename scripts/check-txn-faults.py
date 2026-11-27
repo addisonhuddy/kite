@@ -161,20 +161,30 @@ def run_kite(*args, data=None, check=True):
 def wait_complete_abort(txn_id, timeout=15.0):
     deadline = time.monotonic() + timeout
     last = ""
-    while time.monotonic() < deadline:
-        res = subprocess.run(
-            [
-                "docker", "exec", container,
-                "/opt/kafka/bin/kafka-transactions.sh",
-                "--bootstrap-server", "localhost:9092",
-                "describe", "--transactional-id", txn_id,
-            ],
-            text=True, capture_output=True, timeout=30,
-        )
-        last = res.stdout + res.stderr
-        if res.returncode == 0 and "CompleteAbort" in res.stdout:
-            return
-        time.sleep(0.2)
+    while True:
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            break
+        try:
+            res = subprocess.run(
+                [
+                    "docker", "exec", container,
+                    "/opt/kafka/bin/kafka-transactions.sh",
+                    "--bootstrap-server", "localhost:9092",
+                    "describe", "--transactional-id", txn_id,
+                ],
+                text=True, capture_output=True, timeout=rem,
+            )
+            last = res.stdout + res.stderr
+            if res.returncode == 0 and "CompleteAbort" in res.stdout:
+                return
+        except subprocess.TimeoutExpired as e:
+            last = f"describe timed out after {rem:.1f}s: {e.stdout or ''}{e.stderr or ''}"
+            break
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            break
+        time.sleep(min(0.2, rem))
     raise AssertionError(f"{txn_id} did not reach CompleteAbort within {timeout}s:\n{last}")
 
 
@@ -411,4 +421,138 @@ out5 = run_kite("consume", "-B", "-n", "1", "--idle", "3s", "--format", "value",
 assert out5 == "sentinel-after-abort", f"expected sentinel under read_committed, got: {out5!r}"
 print("PASS txn-fault: lost AddPartitionsToTxn reply aborts cleanly and unblocks LSO")
 
-run_kite("topic", "delete", "-y", t1, t2, t3, t4, t5, check=False)
+
+# Fault 6 (R3 P1): Abort must settle an in-flight Produce before sending EndTxn(abort).
+# Linger dispatches Produce asynchronously; delay its reply while a parse error triggers abort.
+t6 = "kite-txn-fault-abort-vs-produce"
+txn6 = "kite-e2e-fault-abort-vs-produce"
+run_kite("topic", "delete", "-y", "--if-exists", t6, check=False)
+run_kite("topic", "create", "-p", "1", "-r", "1", t6)
+
+state6 = {"produce_started": threading.Event(), "produce_resp_sent": None, "abort_req_recv": None}
+
+
+class HoldProduceProxy(KafkaFaultProxy):
+    def _handle(self, client):
+        upstream = socket.create_connection((BROKER_HOST, BROKER_PORT), timeout=15)
+        try:
+            while not self.stop_evt.is_set():
+                req = read_frame(client)
+                if req is None:
+                    break
+                api_key, _api_ver, _corr_id = struct.unpack(">hhi", req[:8])
+                if api_key == API_END_TXN and not parse_end_txn_committed(req):
+                    with self.lock:
+                        self.abort_requests += 1
+                        if state6["abort_req_recv"] is None:
+                            state6["abort_req_recv"] = time.monotonic()
+                write_frame(upstream, req)
+                resp = read_frame(upstream)
+                if resp is None:
+                    break
+                if api_key in (API_METADATA, API_FIND_COORDINATOR):
+                    resp = resp[:4] + resp[4:].replace(
+                        struct.pack(">I", BROKER_PORT),
+                        struct.pack(">I", self.port),
+                    )
+                if api_key == API_PRODUCE and not state6["produce_started"].is_set():
+                    state6["produce_started"].set()
+                    time.sleep(0.5)
+                    state6["produce_resp_sent"] = time.monotonic()
+                write_frame(client, resp)
+        except OSError:
+            pass
+        finally:
+            for s in (client, upstream):
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+
+proxy6 = HoldProduceProxy(lambda *_: None)
+try:
+    p = subprocess.Popen(
+        [kite, "produce", "--bootstrap", f"{BROKER_HOST}:{proxy6.port}", "--txn", txn6, "--json", t6],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    p.stdin.write('{"key":"k1","value":"aborted-in-flight"}\n')
+    p.stdin.flush()
+    assert state6["produce_started"].wait(timeout=10), "expected linger to dispatch Produce"
+    # Trigger parse error while Produce reply is still held for 0.5s.
+    _, err = p.communicate("not-valid-json\n", timeout=30)
+    assert p.returncode == 1, (p.returncode, err)
+    assert state6["produce_resp_sent"] is not None, state6
+    assert state6["abort_req_recv"] is not None, state6
+    assert state6["abort_req_recv"] >= state6["produce_resp_sent"], (
+        f"EndTxn(abort) overtook in-flight Produce: abort={state6['abort_req_recv']} < produce_resp={state6['produce_resp_sent']}"
+    )
+finally:
+    proxy6.close()
+
+wait_complete_abort(txn6)
+run_kite("produce", "--txn", "kite-e2e-fault6-sentinel", t6, data="k1\tsentinel-6\n")
+out6 = run_kite("consume", "-B", "-n", "1", "--idle", "3s", "--format", "value", t6).stdout.strip()
+assert out6 == "sentinel-6", f"expected only sentinel after settled abort, got: {out6!r}"
+print("PASS txn-fault: abort waits for in-flight Produce to settle before EndTxn(abort)")
+
+
+# Fault 7 (R3 P2): SIGINT during FindCoordinator rediscovery after a lost commit reply exits promptly.
+t7 = "kite-txn-fault-sigint-discovery"
+txn7 = "kite-e2e-fault-sigint-discovery"
+run_kite("topic", "delete", "-y", "--if-exists", t7, check=False)
+run_kite("topic", "create", "-p", "1", "-r", "1", t7)
+
+proc7 = []
+state7 = {"commit_dropped": False, "signaled_at": None, "fc_after_drop": 0}
+
+
+def build_coord_not_avail(corr_id, key_str):
+    kb = key_str.encode()
+    # Header v1: corr_id(i32) + tag(0)
+    # Body v6: throttle(i32 0) + compact_array(len=1 -> 2)
+    #   key(compact_str) + node(-1) + host("") + port(-1) + err(15) + msg(null -> 0) + elem_tag(0)
+    #   + resp_tag(0)
+    return (
+        struct.pack(">iBiBB", corr_id, 0, 0, 2, len(kb) + 1)
+        + kb
+        + struct.pack(">iBihBBB", -1, 1, -1, 15, 0, 0, 0)
+    )
+
+
+def fault7(api_key, corr_id, req, resp):
+    if api_key == API_END_TXN and parse_end_txn_committed(req) and not state7["commit_dropped"]:
+        state7["commit_dropped"] = True
+        return "drop"
+    if api_key == API_FIND_COORDINATOR and state7["commit_dropped"]:
+        state7["fc_after_drop"] += 1
+        if state7["signaled_at"] is None and proc7:
+            state7["signaled_at"] = time.monotonic()
+            os.kill(proc7[0].pid, signal.SIGINT)
+        return ("replace", build_coord_not_avail(corr_id, txn7))
+    return None
+
+
+proxy7 = KafkaFaultProxy(fault7)
+try:
+    p = subprocess.Popen(
+        [kite, "produce", "--bootstrap", f"{BROKER_HOST}:{proxy7.port}", "--txn", txn7, t7],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    proc7.append(p)
+    _, err = p.communicate("k1\tcommitted-before-discovery-sigint\n", timeout=30)
+    exited_at = time.monotonic()
+    assert state7["commit_dropped"] and state7["signaled_at"] is not None, state7
+    elapsed = exited_at - state7["signaled_at"]
+    assert p.returncode == 130, (p.returncode, err)
+    assert "outcome unknown" in err, f"expected unknown-outcome message, got: {err!r}"
+    assert proxy7.abort_requests == 0, f"must not send abort: {proxy7.abort_requests}"
+    assert elapsed < 3.0, f"SIGINT took {elapsed:.2f}s during FindCoordinator rediscovery (want < 3s)"
+finally:
+    proxy7.close()
+
+out7 = run_kite("consume", "-B", "-n", "1", "--idle", "3s", "--format", "value", t7).stdout.strip()
+assert out7 == "committed-before-discovery-sigint", f"expected committed record under read_committed, got: {out7!r}"
+print("PASS txn-fault: SIGINT interrupts FindCoordinator rediscovery promptly")
+
+run_kite("topic", "delete", "-y", t1, t2, t3, t4, t5, t6, t7, check=False)

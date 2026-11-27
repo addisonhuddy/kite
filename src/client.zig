@@ -36,13 +36,29 @@ pub const Retry = struct {
     backoff_ms: u64 = 100,
 
     pub fn pause(r: *Retry, c: *Client) bool {
+        return r.pauseInterruptible(c, null);
+    }
+
+    pub fn pauseInterruptible(r: *Retry, c: *Client, stop: ?*const std.atomic.Value(bool)) bool {
+        if (stop) |s| if (s.load(.acquire)) return false;
         const now = std.Io.Timestamp.now(c.io, .awake);
         const start = r.started orelse now;
         r.started = start;
         const elapsed = start.durationTo(now).toMilliseconds();
         if (c.group_deadline == null and elapsed >= 30000) return false;
         const remaining = if (c.group_deadline != null) c.groupRemainingMs() catch return false else @as(u64, @intCast(30000 - elapsed));
-        c.sleep(@min(remaining, r.backoff_ms));
+        var to_sleep = @min(remaining, r.backoff_ms);
+        if (stop) |s| {
+            while (to_sleep > 0) {
+                if (s.load(.acquire)) return false;
+                const step = @min(to_sleep, 50);
+                c.sleep(step);
+                to_sleep -= step;
+            }
+            if (s.load(.acquire)) return false;
+        } else {
+            c.sleep(to_sleep);
+        }
         r.backoff_ms = @min(r.backoff_ms * 2, 3000);
         _ = c.groupRemainingMs() catch return false;
         return c.group_deadline != null or start.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds() < 30000;
@@ -1267,16 +1283,25 @@ pub const Client = struct {
         c.txn_coordinator_node = -1;
     }
 
-    fn findTxnCoordinator(c: *Client) !i32 {
+    fn findTxnCoordinator(
+        c: *Client,
+        stop: ?*const std.atomic.Value(bool),
+        shared_retry: ?*Retry,
+    ) !i32 {
         if (c.txn_coordinator_node >= 0) return c.txn_coordinator_node;
         const txn_id = c.txn_id orelse return error.ProduceFailed;
-        var retry: Retry = .{};
+        var local_retry: Retry = .{};
+        const retry = shared_retry orelse &local_retry;
         while (true) {
+            if (stop) |s| if (s.load(.acquire)) return error.Interrupted;
             if (c.control == null) c.reconnectControl() catch {
-                if (retry.pause(c)) continue;
+                if (stop) |s| if (s.load(.acquire)) return error.Interrupted;
+                if (retry.pauseInterruptible(c, stop)) continue;
+                if (stop) |s| if (s.load(.acquire)) return error.Interrupted;
                 c.setErr("FindCoordinator (txn '{s}'): control broker unreachable", .{txn_id});
                 return error.ProduceFailed;
             };
+            if (stop) |s| if (s.load(.acquire)) return error.Interrupted;
             const resp = c.sendRequest(
                 c.control.?,
                 protocol.api_key.find_coordinator,
@@ -1285,14 +1310,18 @@ pub const Client = struct {
                 protocol.findTxnCoordinatorRequest,
             ) catch {
                 c.dropControl();
-                if (retry.pause(c)) continue;
+                if (stop) |s| if (s.load(.acquire)) return error.Interrupted;
+                if (retry.pauseInterruptible(c, stop)) continue;
+                if (stop) |s| if (s.load(.acquire)) return error.Interrupted;
                 c.setErr("FindCoordinator (txn '{s}'): request failed", .{txn_id});
                 return error.ProduceFailed;
             };
             defer c.alloc.free(resp.frame);
             var d = Decoder.init(resp.body);
             const coord = try protocol.coordinatorResponse(&d);
-            if ((isCoordinatorError(coord.code) or coord.code.retriable()) and retry.pause(c)) continue;
+            if (stop) |s| if (s.load(.acquire)) return error.Interrupted;
+            if ((isCoordinatorError(coord.code) or coord.code.retriable()) and retry.pauseInterruptible(c, stop)) continue;
+            if (stop) |s| if (s.load(.acquire)) return error.Interrupted;
             if (coord.code != .none) {
                 c.setErr("FindCoordinator (txn '{s}'): {s}", .{ txn_id, coord.code.name() });
                 return error.ProduceFailed;
@@ -1331,7 +1360,7 @@ pub const Client = struct {
         const init_args: InitArgs = .{ .id = txn_id, .timeout_ms = c.cfg.transaction_timeout_ms };
         var retry: Retry = .{};
         while (true) {
-            const node = try c.findTxnCoordinator();
+            const node = try c.findTxnCoordinator(null, &retry);
             const conn = c.connFor(node, connKey(node, txn_coord_slot)) catch {
                 c.invalidateTxnCoordinator();
                 if (retry.pause(c)) continue;
@@ -1373,7 +1402,7 @@ pub const Client = struct {
 
         var retry: Retry = .{};
         while (remaining.items.len > 0) {
-            const node = try c.findTxnCoordinator();
+            const node = try c.findTxnCoordinator(null, &retry);
             const conn = c.connFor(node, connKey(node, txn_coord_slot)) catch {
                 c.invalidateTxnCoordinator();
                 if (retry.pause(c)) continue;
@@ -1459,12 +1488,15 @@ pub const Client = struct {
         const verb = if (commit) "commit" else "abort";
         var retry: Retry = .{};
         var commit_ambiguous = false;
+        const commit_stop = if (commit) stop else null;
         while (true) {
-            if (commit) if (stop) |s| if (s.load(.acquire)) {
+            if (commit_stop) |s| if (s.load(.acquire)) {
                 return if (commit_ambiguous) error.CommitOutcomeUnknown else error.Interrupted;
             };
-            const node = c.findTxnCoordinator() catch |err| {
-                if (commit) if (stop) |s| if (s.load(.acquire)) {
+            const node = c.findTxnCoordinator(commit_stop, &retry) catch |err| {
+                if (err == error.Interrupted)
+                    return if (commit_ambiguous) error.CommitOutcomeUnknown else error.Interrupted;
+                if (commit_stop) |s| if (s.load(.acquire)) {
                     return if (commit_ambiguous) error.CommitOutcomeUnknown else error.Interrupted;
                 };
                 if (commit_ambiguous) {
@@ -1473,15 +1505,18 @@ pub const Client = struct {
                 }
                 return err;
             };
-            if (commit) if (stop) |s| if (s.load(.acquire)) {
+            if (commit_stop) |s| if (s.load(.acquire)) {
                 return if (commit_ambiguous) error.CommitOutcomeUnknown else error.Interrupted;
             };
             const conn = c.connFor(node, connKey(node, txn_coord_slot)) catch {
                 c.invalidateTxnCoordinator();
-                if (commit) if (stop) |s| if (s.load(.acquire)) {
+                if (commit_stop) |s| if (s.load(.acquire)) {
                     return if (commit_ambiguous) error.CommitOutcomeUnknown else error.Interrupted;
                 };
-                if (retry.pause(c)) continue;
+                if (retry.pauseInterruptible(c, commit_stop)) continue;
+                if (commit_stop) |s| if (s.load(.acquire)) {
+                    return if (commit_ambiguous) error.CommitOutcomeUnknown else error.Interrupted;
+                };
                 if (commit_ambiguous)
                     c.setErr("EndTxn (commit '{s}'): coordinator unreachable (outcome unknown; broker may have committed)", .{txn_id})
                 else
@@ -1490,7 +1525,7 @@ pub const Client = struct {
             };
             // Recheck stop after a fresh connection / ApiVersions handshake,
             // right before dispatching EndTxn on the wire.
-            if (commit) if (stop) |s| if (s.load(.acquire)) {
+            if (commit_stop) |s| if (s.load(.acquire)) {
                 return if (commit_ambiguous) error.CommitOutcomeUnknown else error.Interrupted;
             };
             const resp = c.sendRequest(
@@ -1507,8 +1542,9 @@ pub const Client = struct {
             ) catch {
                 c.invalidateTxnCoordinator();
                 if (commit) commit_ambiguous = true;
-                if (commit) if (stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
-                if (retry.pause(c)) continue;
+                if (commit_stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
+                if (retry.pauseInterruptible(c, commit_stop)) continue;
+                if (commit_stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
                 if (commit_ambiguous)
                     c.setErr("EndTxn (commit '{s}'): request failed (outcome unknown; broker may have committed)", .{txn_id})
                 else
@@ -1520,8 +1556,9 @@ pub const Client = struct {
             const code = protocol.endTxnResponse(&d) catch {
                 c.invalidateTxnCoordinator();
                 if (commit) commit_ambiguous = true;
-                if (commit) if (stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
-                if (retry.pause(c)) continue;
+                if (commit_stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
+                if (retry.pauseInterruptible(c, commit_stop)) continue;
+                if (commit_stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
                 if (commit_ambiguous)
                     c.setErr("EndTxn (commit '{s}'): malformed response (outcome unknown; broker may have committed)", .{txn_id})
                 else
@@ -1542,8 +1579,9 @@ pub const Client = struct {
             if (isCoordinatorError(code)) c.invalidateTxnCoordinator();
             if (isCoordinatorError(code) or code.retriable()) {
                 if (commit) commit_ambiguous = true;
-                if (commit) if (stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
-                if (retry.pause(c)) continue;
+                if (commit_stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
+                if (retry.pauseInterruptible(c, commit_stop)) continue;
+                if (commit_stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
             } else if (commit and code == .transaction_abortable) {
                 _ = c.abortTransactionBestEffort();
             }
@@ -1555,10 +1593,52 @@ pub const Client = struct {
         }
     }
 
+    /// Await or settle every already-dispatched Produce request before sending
+    /// EndTxn(abort), so a late Produce cannot overtake the abort marker on
+    /// brokers without partition verification (KIP-890 part 1).
+    fn settleOutstandingBeforeAbort(c: *Client) void {
+        if (c.outstanding.items.len == 0) return;
+        const produce_timeout_ms: i64 = 15000;
+        var unsettled_deadline: ?std.Io.Timestamp = null;
+        for (c.outstanding.items) |*o| {
+            c.outstanding_bytes -= o.bytes;
+            c.releaseConn(o.pidx[0]);
+            if (o.corr >= 0) {
+                var settled = false;
+                if (c.conns.get(o.ckey)) |conn| {
+                    var codes = std.AutoHashMapUnmanaged(i32, protocol.ErrorCode).empty;
+                    defer codes.deinit(c.alloc);
+                    if (c.produceRecv(conn, o.corr, &codes, o, null)) |_| {
+                        settled = true;
+                    } else |_| {
+                        c.dropConn(o.ckey);
+                    }
+                }
+                if (!settled) {
+                    const d = o.sent.addDuration(.fromMilliseconds(produce_timeout_ms));
+                    if (unsettled_deadline == null or unsettled_deadline.?.durationTo(d).toMilliseconds() > 0)
+                        unsettled_deadline = d;
+                }
+            }
+            for (o.encoders.items) |*e| e.deinit();
+            o.encoders.deinit(c.alloc);
+            c.alloc.free(o.pidx);
+            c.alloc.free(o.batches);
+            c.alloc.free(o.counts);
+        }
+        c.outstanding.items.len = 0;
+        c.outstanding_bytes = 0;
+        if (unsettled_deadline) |d| {
+            const rem = std.Io.Timestamp.now(c.io, .awake).durationTo(d).toMilliseconds();
+            if (rem > 0) c.sleep(@intCast(rem));
+        }
+    }
+
     /// Best-effort abort for fatal/interrupt paths; preserves any prior err_ctx.
     /// Returns true if no transaction was active or the abort succeeded.
     pub fn abortTransactionBestEffort(c: *Client) bool {
         if (!c.hasActiveTxn()) return true;
+        c.settleOutstandingBeforeAbort();
         const saved_err = c.err_ctx;
         defer c.err_ctx = saved_err;
         c.endTransaction(false, null) catch {

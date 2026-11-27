@@ -330,15 +330,20 @@ rc=$?
 set -e
 wait_complete_abort() {
     local tid=$1
+    local deadline=$(( $(date +%s) + 15 ))
     local desc=""
-    for _ in $(seq 1 75); do
-        desc=$(docker exec "$NAME" /opt/kafka/bin/kafka-transactions.sh --bootstrap-server localhost:9092 describe --transactional-id "$tid" 2>/dev/null || true)
+    while :; do
+        local rem=$(( deadline - $(date +%s) ))
+        [ "$rem" -le 0 ] && break
+        desc=$(timeout "${rem}s" docker exec "$NAME" /opt/kafka/bin/kafka-transactions.sh --bootstrap-server localhost:9092 describe --transactional-id "$tid" 2>/dev/null || true)
         if echo "$desc" | grep -q "CompleteAbort"; then
             return 0
         fi
+        rem=$(( deadline - $(date +%s) ))
+        [ "$rem" -le 0 ] && break
         sleep 0.2
     done
-    fail "txn: $tid did not reach CompleteAbort: [$desc]"
+    fail "txn: $tid did not reach CompleteAbort within 15s: [$desc]"
 }
 
 [ "$rc" -eq 1 ] || fail "txn: aborted produce exited $rc, want 1"
