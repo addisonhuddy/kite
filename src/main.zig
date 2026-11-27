@@ -427,15 +427,15 @@ fn jsonRecord(
         if (std.mem.eql(u8, m.key, "value")) {
             if (value_b64_seen) fatal("line {d}: use \"value\" or \"value_b64\", not both", .{lineno});
             value_seen = true;
-            value = m.value.bytes() orelse fatal("line {d}: \"value\" must not be null", .{lineno});
+            value = m.value.bytes();
         } else if (std.mem.eql(u8, m.key, "value_b64")) {
             if (value_seen) fatal("line {d}: use \"value\" or \"value_b64\", not both", .{lineno});
             value_b64_seen = true;
-            const encoded = switch (m.value) {
-                .string => |v| v,
-                else => fatal("line {d}: \"value_b64\" must be a string", .{lineno}),
+            value = switch (m.value) {
+                .null => null,
+                .string => |v| decodeJsonBase64(alloc, v, "value_b64", lineno),
+                else => fatal("line {d}: \"value_b64\" must be a string or null", .{lineno}),
             };
-            value = decodeJsonBase64(alloc, encoded, "value_b64", lineno);
         } else if (std.mem.eql(u8, m.key, "key")) {
             if (key_b64_seen) fatal("line {d}: use \"key\" or \"key_b64\", not both", .{lineno});
             key_seen = true;
@@ -507,11 +507,25 @@ fn jsonRecord(
         }
     }
     if (!sc.atEnd()) jsonFatal(lineno, shape);
+    if (!value_seen and !value_b64_seen)
+        fatal("line {d}: JSON object has no \"value\" or \"value_b64\" field", .{lineno});
     return .{
         .key = key,
-        .value = value orelse fatal("line {d}: JSON object has no \"value\" or \"value_b64\" field", .{lineno}),
+        .value = value,
         .headers = headers.items,
     };
+}
+
+test "JSON produce distinguishes tombstones from empty values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const tombstone = jsonRecord(alloc, "{\"key\":\"k\",\"value\":null}", &.{}, 1);
+    try std.testing.expectEqualStrings("k", tombstone.key.?);
+    try std.testing.expect(tombstone.value == null);
+    try std.testing.expect(jsonRecord(alloc, "{\"value_b64\":null}", &.{}, 1).value == null);
+    try std.testing.expectEqualStrings("", jsonRecord(alloc, "{\"value\":\"\"}", &.{}, 1).value.?);
+    try std.testing.expectEqualStrings("", jsonRecord(alloc, "{\"value_b64\":\"\"}", &.{}, 1).value.?);
 }
 
 fn decodeJsonBase64(alloc: std.mem.Allocator, encoded: []const u8, field: []const u8, lineno: u64) []const u8 {
@@ -1866,7 +1880,7 @@ fn pendingBytes(pend: []Pending) usize {
 /// varint framing (~16B/record, ~8B/header). Charged against batch_size so
 /// encoded batches stay under the broker's ~1MiB message.max.bytes.
 fn recordSize(rec: protocol.Record) usize {
-    var n: usize = 16 + rec.value.len;
+    var n: usize = 16 + if (rec.value) |v| v.len else 0;
     if (rec.key) |k| n += k.len;
     for (rec.headers) |h| {
         n += h.key.len + 8;

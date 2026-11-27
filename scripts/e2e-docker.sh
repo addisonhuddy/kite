@@ -90,6 +90,21 @@ destination_bytes=$(zig-out/bin/kite consume -B -n 1 --idle 3s --json "$B64_DST"
 [ "$destination_bytes" = "$source_bytes" ] || fail "json-base64: bytes changed across consume | jq | produce"
 echo "PASS json-base64 jq roundtrip"
 
+TOMBSTONE_SRC="kite-tombstone-src-$(date +%s)-$RANDOM"
+TOMBSTONE_DST="kite-tombstone-dst-$(date +%s)-$RANDOM"
+printf '%s\n' '{"key":"k","value":null}' '{"key":"k","value":""}' '{"key":"k","value_b64":null}' \
+    | zig-out/bin/kite produce --json "$TOMBSTONE_SRC"
+zig-out/bin/kite consume -B -n 3 --idle 3s --json "$TOMBSTONE_SRC" 2>/dev/null \
+    | jq -c . \
+    | tee "$TMP/tombstones.jsonl" \
+    | zig-out/bin/kite produce --json "$TOMBSTONE_DST"
+zig-out/bin/kite consume -B -n 3 --idle 3s --json "$TOMBSTONE_DST" >"$TMP/tombstones-copy.jsonl" 2>/dev/null
+for records in "$TMP/tombstones.jsonl" "$TMP/tombstones-copy.jsonl"; do
+    got=$(jq -sc 'map(select(has("value") and (has("value_b64") | not)) | [.key, .value])' "$records")
+    [ "$got" = '[["k",null],["k",""],["k",null]]' ] || fail "json-tombstones: unexpected records: $got"
+done
+echo "PASS json-tombstones jq roundtrip"
+
 expect_json_produce_error() {
     local input=$1 expected=$2 label=$3 rc
     set +e
