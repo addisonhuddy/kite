@@ -356,15 +356,20 @@ kite --version                            Print the version.
 
 For transactional produce, kite requires broker-side transaction partition
 verification (`transaction.partition.verification.enable=true`, enabled by
-default in Apache Kafka 3.6+). Before aborting, kite settles in-flight Produce
-requests up to their request deadline and then sends an epoch-checked
-`EndTxn(abort)` so a fenced process cannot affect a replacement producer. If an
-in-flight Produce cannot be confirmed within its deadline, kite closes that
-connection, aborts the transaction, and warns on stderr with the partition-level
-recovery commands (`kafka-transactions.sh --bootstrap-server <host:port>
-find-hanging --topic <topic> --partition <p> --max-transaction-timeout 0`
-followed by `abort --topic <topic> --partition <p> --start-offset <n>`) in case
-partition verification is disabled on the broker.
+default in Apache Kafka 3.6+). Before aborting, unless the producer has already
+been fenced, kite settles in-flight Produce requests up to their request
+deadline and then sends an epoch-checked `EndTxn(abort)` so a fenced process
+cannot affect a replacement producer. If the broker has already fenced the
+producer (`PRODUCER_FENCED` or `INVALID_PRODUCER_EPOCH`, e.g. after
+`transaction.timeout.ms` expires or another producer takes over the same
+transactional ID), Kafka is aborting the transaction and kite reports the
+transaction as aborted by Kafka instead of reporting an unknown abort outcome.
+If an in-flight Produce cannot be confirmed within its deadline, kite closes
+that connection, aborts the transaction, and warns on stderr with the
+partition-level recovery commands (`kafka-transactions.sh --bootstrap-server
+<host:port> find-hanging --topic <topic> --partition <p>
+--max-transaction-timeout 0` followed by `abort --topic <topic> --partition <p>
+--start-offset <n>`) in case partition verification is disabled on the broker.
 
 ## Topics
 
