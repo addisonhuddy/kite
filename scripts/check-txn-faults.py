@@ -518,4 +518,145 @@ finally:
 assert run_kite("consume", "-B", "-n", "1", "--idle", "3s", "--format", "value", t7).stdout == "committed-before-rediscovery\n"
 print("PASS txn-fault: SIGINT during stalled coordinator rediscovery exits promptly without abort")
 
-run_kite("topic", "delete", "-y", t1, t2, t3, t4, t5, t6, t7, check=False)
+
+# Fault 8 (R4 P1): Unsettled Produce triggers KIP-360 epoch bump via InitProducerId
+# instead of plain EndTxn(abort), so a straggling Produce released after CompleteAbort
+# is fenced by epoch and cannot create a hanging transaction.
+API_INIT_PRODUCER_ID = 22
+t8 = "kite-txn-fault-epoch-bump"
+txn8 = "kite-e2e-fault-epoch-bump"
+run_kite("topic", "delete", "-y", "--if-exists", t8, check=False)
+run_kite("topic", "create", "-p", "1", "-r", "1", t8)
+
+state8 = {
+    "held_produce": None,
+    "produce_captured": threading.Event(),
+    "init_count": 0,
+    "end_txn_aborts": 0,
+}
+
+
+class UnsettledProduceProxy(KafkaFaultProxy):
+    def _handle(self, client):
+        upstream = socket.create_connection((BROKER_HOST, BROKER_PORT), timeout=15)
+        try:
+            while not self.stop_evt.is_set():
+                req = read_frame(client)
+                if req is None:
+                    break
+                api_key, _api_ver, _corr_id = struct.unpack(">hhi", req[:8])
+                if api_key == API_INIT_PRODUCER_ID:
+                    with self.lock:
+                        state8["init_count"] += 1
+                elif api_key == API_END_TXN and not parse_end_txn_committed(req):
+                    with self.lock:
+                        state8["end_txn_aborts"] += 1
+                elif api_key == API_PRODUCE and state8["held_produce"] is None:
+                    # Capture the Produce frame without forwarding it yet and drop
+                    # the client connection so kite cannot confirm the write.
+                    state8["held_produce"] = req
+                    state8["produce_captured"].set()
+                    break
+                write_frame(upstream, req)
+                resp = read_frame(upstream)
+                if resp is None:
+                    break
+                if api_key in (API_METADATA, API_FIND_COORDINATOR):
+                    resp = resp[:4] + resp[4:].replace(
+                        struct.pack(">I", BROKER_PORT),
+                        struct.pack(">I", self.port),
+                    )
+                write_frame(client, resp)
+        except OSError:
+            pass
+        finally:
+            for s in (client, upstream):
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+
+proxy8 = UnsettledProduceProxy(lambda *_: None)
+try:
+    with subprocess.Popen(
+        [kite, "produce", "--bootstrap", f"{BROKER_HOST}:{proxy8.port}", "--txn", txn8, "--json", t8],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    ) as p:
+        p.stdin.write('{"key":"k1","value":"late-straggler"}\n')
+        p.stdin.flush()
+        assert state8["produce_captured"].wait(10), "expected linger to dispatch Produce"
+        _, err = p.communicate("invalid-json\n", timeout=30)
+        assert p.returncode == 1, (p.returncode, err)
+        assert state8["init_count"] >= 2, f"expected KIP-360 InitProducerId epoch bump, got init_count={state8['init_count']} err={err!r}"
+        assert state8["end_txn_aborts"] == 0, f"expected epoch-bump abort rather than plain EndTxn(abort), got {state8['end_txn_aborts']}"
+finally:
+    proxy8.close()
+
+wait_complete_abort(txn8)
+# Now release the straggling Produce frame directly to Kafka AFTER CompleteAbort.
+late_conn = socket.create_connection((BROKER_HOST, BROKER_PORT), timeout=15)
+try:
+    write_frame(late_conn, state8["held_produce"])
+    late_resp = read_frame(late_conn)
+    assert late_resp is not None, "expected Kafka to reject late straggling Produce"
+finally:
+    late_conn.close()
+
+run_kite("produce", "--txn", "kite-e2e-fault8-sentinel", t8, data="k1\tsentinel-after-epoch-bump\n")
+assert run_kite("consume", "-B", "-n", "1", "--idle", "3s", "--format", "value", t8).stdout == "sentinel-after-epoch-bump\n"
+assert run_kite("consume", "-B", "--read-uncommitted", "-n", "1", "--idle", "3s", "--format", "value", t8).stdout == "sentinel-after-epoch-bump\n"
+print("PASS txn-fault: unsettled Produce aborts via KIP-360 epoch bump and fences late straggler")
+
+
+# Fault 9 (R4 P2): SIGINT during withheld ApiVersions on coordinator reconnect exits promptly.
+t9 = "kite-txn-fault-sigint-handshake"
+txn9 = "kite-e2e-fault-sigint-handshake"
+run_kite("topic", "delete", "-y", "--if-exists", t9, check=False)
+run_kite("topic", "create", "-p", "1", "-r", "1", t9)
+
+commit_lost9 = threading.Event()
+apiversions_held9 = threading.Event()
+release_apiversions9 = threading.Event()
+
+
+def fault9(api_key, corr_id, req, resp):
+    if api_key == API_END_TXN and parse_end_txn_committed(req):
+        commit_lost9.set()
+        return "drop"
+    if api_key == API_API_VERSIONS and commit_lost9.is_set():
+        apiversions_held9.set()
+        release_apiversions9.wait(10)
+        return "drop"
+    return None
+
+
+proxy9 = KafkaFaultProxy(fault9)
+try:
+    with subprocess.Popen(
+        [kite, "produce", "--bootstrap", f"{BROKER_HOST}:{proxy9.port}", "--txn", txn9, t9],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    ) as p:
+        try:
+            p.stdin.write("k1\tcommitted-before-handshake-sigint\n")
+            p.stdin.close()
+            p.stdin = None
+            assert apiversions_held9.wait(5), "expected reconnect ApiVersions after commit reply loss"
+            t0 = time.monotonic()
+            p.send_signal(signal.SIGINT)
+            _, err = p.communicate(timeout=3)
+            elapsed = time.monotonic() - t0
+            assert p.returncode == 130 and "outcome unknown" in err, (p.returncode, err)
+            assert proxy9.commit_requests == 1 and proxy9.abort_requests == 0, err
+            assert elapsed < 2.0, f"SIGINT blocked {elapsed:.2f}s on reconnect ApiVersions"
+        finally:
+            release_apiversions9.set()
+            if p.poll() is None:
+                p.kill()
+finally:
+    proxy9.close()
+
+assert run_kite("consume", "-B", "-n", "1", "--idle", "3s", "--format", "value", t9).stdout == "committed-before-handshake-sigint\n"
+print("PASS txn-fault: SIGINT during stalled reconnect ApiVersions exits promptly without abort")
+
+run_kite("topic", "delete", "-y", t1, t2, t3, t4, t5, t6, t7, t8, t9, check=False)

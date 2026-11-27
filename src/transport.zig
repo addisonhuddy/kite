@@ -33,7 +33,7 @@ const SocketReader = struct {
     fd: std.posix.socket_t,
     err: ?TransportError = null,
     cancellation: ?struct {
-        stop: *const std.atomic.Value(bool),
+        stop: ?*const std.atomic.Value(bool),
         deadline: std.Io.Timestamp,
         io: std.Io,
     } = null,
@@ -45,14 +45,15 @@ const SocketReader = struct {
         std.debug.assert(nbufs != 0 and buffers[0].len != 0);
         while (true) {
             if (self.cancellation) |cancel| {
-                if (cancel.stop.load(.acquire)) return error.ReadFailed;
+                if (cancel.stop) |flag| if (flag.load(.acquire)) return error.ReadFailed;
                 const remaining = std.Io.Timestamp.now(cancel.io, .awake).durationTo(cancel.deadline).toMilliseconds();
                 if (remaining <= 0) {
                     self.err = error.IoTimedOut;
                     return error.ReadFailed;
                 }
+                const poll_ms = if (cancel.stop != null) @min(remaining, 50) else remaining;
                 var fds = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
-                if ((std.posix.poll(&fds, @intCast(@min(remaining, 50))) catch return error.ReadFailed) == 0) continue;
+                if ((std.posix.poll(&fds, @intCast(@min(poll_ms, std.math.maxInt(i32)))) catch return error.ReadFailed) == 0) continue;
             }
             const n = std.posix.system.read(self.fd, buffers[0].ptr, buffers[0].len);
             switch (std.posix.errno(n)) {
@@ -140,11 +141,15 @@ pub const Conn = struct {
     }
 
     pub fn setReadCancellation(c: *Conn, stop: ?*const std.atomic.Value(bool), deadline: ?std.Io.Timestamp) void {
-        c.net_reader.cancellation = if (stop) |flag| .{
-            .stop = flag,
-            .deadline = deadline orelse unreachable,
+        c.net_reader.cancellation = if (deadline) |dl| .{
+            .stop = stop,
+            .deadline = dl,
             .io = c.io,
         } else null;
+    }
+
+    pub fn setReadDeadline(c: *Conn, deadline: ?std.Io.Timestamp) void {
+        c.setReadCancellation(null, deadline);
     }
 
     fn ioError(c: *Conn) TransportError {

@@ -111,6 +111,8 @@ pub const Client = struct {
     /// connection, so error cleanup still aborts if the reply is lost.
     txn_add_attempted: bool = false,
     txn_produce_unsettled_until: ?std.Io.Timestamp = null,
+    /// Active cancellation flag during EndTxn(commit) discovery/reconnect.
+    txn_stop: ?*const std.atomic.Value(bool) = null,
     last_offset: ?i64 = null,
     /// Highest acked offset per partition (sorted by pidx), for the summary.
     last_offsets: std.ArrayListUnmanaged(PartOffset) = .empty,
@@ -270,9 +272,20 @@ pub const Client = struct {
             }
             return error.AllBootstrapFailed;
         };
+        if (c.txn_stop) |flag| {
+            if (flag.load(.acquire)) {
+                conn.close();
+                c.alloc.destroy(conn);
+                return error.Interrupted;
+            }
+            const dl = c.group_deadline orelse std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(15000));
+            conn.setReadCancellation(flag, dl);
+        }
+        defer conn.setReadCancellation(null, null);
         c.postConnect(conn) catch |err| {
             conn.close();
             c.alloc.destroy(conn);
+            if (c.txn_stop) |flag| if (flag.load(.acquire)) return error.Interrupted;
             var prev: [512]u8 = undefined;
             const d = c.errDetail();
             const n = @min(d.len, prev.len);
@@ -292,6 +305,7 @@ pub const Client = struct {
         var first_err_ctx: [512]u8 = undefined;
         var have_err = false;
         for (c.cfg.bootstrap_servers) |server| {
+            if (c.txn_stop) |flag| if (flag.load(.acquire)) return error.Interrupted;
             const addr = parseBootstrapServer(server) catch {
                 c.setErr("invalid bootstrap server '{s}' (want HOST or HOST:PORT with port 1..65535)", .{server});
                 if (!have_err) {
@@ -1341,17 +1355,26 @@ pub const Client = struct {
         try c.requireVersion(protocol.api_key.add_partitions_to_txn, protocol.version.add_partitions_to_txn, "AddPartitionsToTxn");
         try c.requireVersion(protocol.api_key.end_txn, protocol.version.end_txn, "EndTxn");
         c.txn_id = txn_id;
-        const InitArgs = struct { id: []const u8, timeout_ms: i32 };
+        try c.initProducerIdTxn(txn_id, -1, -1);
+    }
+
+    fn initProducerIdTxn(c: *Client, txn_id: []const u8, req_pid: i64, req_epoch: i16) !void {
+        const InitArgs = struct { id: []const u8, timeout_ms: i32, pid: i64, epoch: i16 };
         const body = struct {
             fn f(e: *Encoder, args: InitArgs) protocol.ProtoError!void {
                 try e.compactString(args.id);
                 try e.i32v(args.timeout_ms); // transaction_timeout_ms
-                try e.i64v(-1); // producer_id
-                try e.i16v(-1); // producer_epoch
+                try e.i64v(args.pid); // producer_id (-1 for fresh, current for KIP-360 epoch bump)
+                try e.i16v(args.epoch); // producer_epoch
                 try e.tagBuffer();
             }
         }.f;
-        const init_args: InitArgs = .{ .id = txn_id, .timeout_ms = c.cfg.transaction_timeout_ms };
+        const init_args: InitArgs = .{
+            .id = txn_id,
+            .timeout_ms = c.cfg.transaction_timeout_ms,
+            .pid = req_pid,
+            .epoch = req_epoch,
+        };
         var retry: Retry = .{};
         while (true) {
             const node = try c.findTxnCoordinator(null);
@@ -1478,7 +1501,6 @@ pub const Client = struct {
     /// it returns `error.CommitOutcomeUnknown` instead of switching to abort.
     pub fn endTransaction(c: *Client, commit: bool, stop: ?*const std.atomic.Value(bool)) !void {
         if (!c.hasActiveTxn()) return;
-        if (!commit) c.settleProduceBeforeAbort();
         const txn_id = c.txn_id.?;
         const verb = if (commit) "commit" else "abort";
         const previous_deadline = c.group_deadline;
@@ -1486,6 +1508,22 @@ pub const Client = struct {
         const deadline = std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(30000));
         c.group_deadline = if (previous_deadline) |prev| .{ .nanoseconds = @min(prev.nanoseconds, deadline.nanoseconds) } else deadline;
         const commit_stop = if (commit) stop else null;
+        const previous_stop = c.txn_stop;
+        c.txn_stop = commit_stop;
+        defer c.txn_stop = previous_stop;
+        if (!commit and c.settleProduceBeforeAbort()) {
+            // An already-dispatched Produce could not be confirmed. Bump the
+            // producer epoch via InitProducerId v4 (KIP-360) so the coordinator
+            // aborts the ongoing transaction under the new epoch and partition
+            // leaders fence any straggling Produce batch even when
+            // transaction.partition.verification.enable=false.
+            try c.initProducerIdTxn(txn_id, c.producer_id, c.producer_epoch);
+            c.txn_added_parts.clearRetainingCapacity();
+            c.txn_add_attempted = false;
+            c.txn_produce_unsettled_until = null;
+            c.vlog("transaction '{s}' aborted via epoch bump", .{txn_id});
+            return;
+        }
         var retry: Retry = .{};
         var commit_ambiguous = false;
         while (true) {
@@ -1625,36 +1663,43 @@ pub const Client = struct {
         c.txn_produce_unsettled_until = until;
     }
 
-    fn settleProduceBeforeAbort(c: *Client) void {
+    /// Await responses for every already-dispatched Produce request using one
+    /// absolute deadline per response. Returns true if any Produce outcome
+    /// could not be confirmed (caller must abort via KIP-360 epoch bump).
+    fn settleProduceBeforeAbort(c: *Client) bool {
+        var unsettled = c.txn_produce_unsettled_until != null;
         for (c.outstanding.items) |*o| {
             if (o.corr < 0) continue;
-            const conn = c.conns.get(o.ckey) orelse continue;
+            const conn = c.conns.get(o.ckey) orelse {
+                unsettled = true;
+                o.corr = -1;
+                continue;
+            };
             const deadline = o.sent.addDuration(.fromMilliseconds(produce_timeout_ms + 1000));
             const rem_ms = std.Io.Timestamp.now(c.io, .awake).durationTo(deadline).toMilliseconds();
             if (rem_ms <= 0) {
+                unsettled = true;
                 c.dropConn(o.ckey);
                 continue;
             }
-            transport.setTimeout(conn, @intCast(rem_ms));
+            conn.setReadDeadline(deadline);
             var codes: std.AutoHashMapUnmanaged(i32, protocol.ErrorCode) = .empty;
             defer codes.deinit(c.alloc);
             c.produceRecv(conn, o.corr, &codes, null, null) catch {
+                conn.setReadDeadline(null);
+                unsettled = true;
                 c.dropConn(o.ckey);
                 continue;
             };
+            conn.setReadDeadline(null);
             if (!codes.contains(o.pidx[0])) {
+                unsettled = true;
                 c.dropConn(o.ckey);
                 continue;
             }
             o.corr = -1;
         }
-        if (c.txn_produce_unsettled_until) |deadline| {
-            while (true) {
-                const remaining = std.Io.Timestamp.now(c.io, .awake).durationTo(deadline);
-                if (remaining.nanoseconds <= 0) break;
-                std.Io.sleep(c.io, remaining, .awake) catch {};
-            }
-        }
+        return unsettled or c.txn_produce_unsettled_until != null;
     }
 
     /// A sent ProduceRequest awaiting its response. Batches stay alive in the
@@ -1990,11 +2035,13 @@ pub const Client = struct {
         c.dropControl();
         var brokers = c.brokers.valueIterator();
         while (brokers.next()) |addr| {
+            if (c.txn_stop) |flag| if (flag.load(.acquire)) return error.Interrupted;
             const conn = c.connectOne(addr.host, addr.port) catch continue;
             c.control = conn;
             c.vlog("control connected {s}:{d}", .{ addr.host, addr.port });
             return;
         }
+        if (c.txn_stop) |flag| if (flag.load(.acquire)) return error.Interrupted;
         try c.bootstrap();
     }
 

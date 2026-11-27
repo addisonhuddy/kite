@@ -351,11 +351,14 @@ kite --version                            Print the version.
 `kite consume --help`, `kite topic --help`, and `kite cluster --help`
 print the full pages.
 
-For transactional produce, keep broker-side transaction partition verification
-enabled (KIP-890; enabled by default in Apache Kafka 3.6 and later). Kite settles
-in-flight Produce requests before aborting. If it cannot confirm a Produce
-outcome, it closes the connection and waits out the request timeout; partition
-verification protects against requests delayed beyond that wait.
+For transactional produce, kite settles in-flight Produce requests before
+aborting. If a Produce outcome cannot be confirmed within its request deadline,
+kite closes that connection and bumps the producer epoch via `InitProducerId`
+v4 (KIP-360) so the coordinator aborts the transaction under a new epoch and
+partition leaders fence any straggling Produce batch even when
+`transaction.partition.verification.enable=false`. Keeping broker-side
+transaction partition verification enabled (KIP-890; default in Apache Kafka
+3.6+) is still recommended as defense in depth.
 
 ## Topics
 
