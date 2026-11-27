@@ -1,4 +1,5 @@
 const std = @import("std");
+const transport = @import("transport.zig");
 const yaml = @import("yaml.zig");
 
 pub const SecurityProtocol = enum { plaintext, ssl, sasl_ssl, sasl_plaintext };
@@ -645,13 +646,19 @@ fn applyKey(cfg: *Config, alloc: std.mem.Allocator, source: *Source, origin: Ori
             return;
         },
         .fetch_max_bytes => {
-            cfg.fetch_max_bytes = std.fmt.parseInt(usize, val, 10) catch {
+            const parsed = std.fmt.parseInt(usize, val, 10) catch {
                 warn("invalid fetch.max.bytes '{s}' ignored", .{val});
                 return;
             };
-            if (cfg.fetch_max_bytes >= 16 << 20) {
+            if (parsed == 0) {
+                warn("invalid fetch.max.bytes '{s}' ignored", .{val});
+                return;
+            }
+            if (parsed >= transport.max_response_len) {
                 warn("fetch.max.bytes '{s}' is >= transport maximum; using default", .{val});
                 cfg.fetch_max_bytes = 8 << 20;
+            } else {
+                cfg.fetch_max_bytes = parsed;
             }
         },
         .fetch_max_wait_ms => {
@@ -952,4 +959,19 @@ test "transaction.timeout.ms parses positive ints and ignores invalid values" {
     try std.testing.expectEqual(@as(i32, 15_000), cfg.transaction_timeout_ms);
     try applyKey(&cfg, arena.allocator(), &src, .file, "transaction.timeout.ms", "-5");
     try std.testing.expectEqual(@as(i32, 15_000), cfg.transaction_timeout_ms);
+}
+
+test "fetch.max.bytes honors transport limit and rejects zero" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg: Config = .{ .bootstrap_servers = &.{} };
+    var src: Source = .{};
+    try std.testing.expectEqual(@as(usize, 8 << 20), cfg.fetch_max_bytes);
+    try applyKey(&cfg, arena.allocator(), &src, .file, "fetch.max.bytes", "33554432");
+    try std.testing.expectEqual(@as(usize, 32 << 20), cfg.fetch_max_bytes);
+    try applyKey(&cfg, arena.allocator(), &src, .file, "fetch.max.bytes", "0");
+    try std.testing.expectEqual(@as(usize, 32 << 20), cfg.fetch_max_bytes);
+    const over = try std.fmt.allocPrint(arena.allocator(), "{d}", .{transport.max_response_len});
+    try applyKey(&cfg, arena.allocator(), &src, .file, "fetch.max.bytes", over);
+    try std.testing.expectEqual(@as(usize, 8 << 20), cfg.fetch_max_bytes);
 }
