@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Consumer-group checks against the broker started by e2e-docker.sh."""
 import json
+import os
 from pathlib import Path
+import pty
 import signal
 import subprocess
 import sys
@@ -21,6 +23,43 @@ def run(*args, data=None):
 
 def rows(text):
     return [json.loads(line) for line in text.splitlines() if line]
+
+
+def terminal(*args):
+    master, slave = pty.openpty()
+    try:
+        result = subprocess.run([kite, *args], stdout=slave, stderr=subprocess.PIPE,
+                                text=True, timeout=90)
+        os.close(slave)
+        slave = None
+        output = b""
+        while True:
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output += chunk
+        assert result.returncode == 0, (args, result.stderr)
+        return output.decode().replace("\r\n", "\n")
+    finally:
+        os.close(master)
+        if slave is not None:
+            os.close(slave)
+
+
+def aligned_table(output, headers):
+    lines = output.splitlines()
+    assert len(lines) > 1, output
+    assert lines[0].split() == headers, output
+    assert "\t" not in output, output
+    starts = [lines[0].index(header) for header in headers]
+    for line in lines[1:]:
+        cells = [line[start:starts[i + 1]].strip() if i + 1 < len(starts) else line[start:].strip()
+                 for i, start in enumerate(starts)]
+        assert cells == line.split(), output
+        assert all(line[start] != " " for start in starts), output
 
 
 def consume(group, topic, *args):
@@ -84,6 +123,16 @@ try:
     assert description[0]["member_id"] == description[0]["client_id"] == "", description
     assert any(g["group"] == "kite-resume" for g in rows(run("group", "list", "--json")))
     print("PASS groups list/describe lag and leave", flush=True)
+
+    description_table = terminal("group", "describe", "kite-resume")
+    aligned_table(description_table, ["GROUP", "TOPIC", "PARTITION", "COMMITTED", "END", "LAG", "MEMBER_ID", "CLIENT_ID"])
+    listing_table = terminal("group", "list")
+    aligned_table(listing_table, ["GROUP", "STATE"])
+    (root / "group-describe-terminal.txt").write_text(description_table)
+    (root / "group-list-terminal.txt").write_text(listing_table)
+    assert run("group", "describe", "kite-resume").splitlines() == [f"kite-resume\t{topic}\t0\t10\t13\t3\t-\t-"]
+    assert any(line.split("\t") == ["kite-resume", "Empty"] for line in run("group", "list").splitlines())
+    print("PASS groups terminal columns and piped TSV", flush=True)
 
     scale = "kite-group-scale"
     run("topic", "create", "-p", "6", scale)
