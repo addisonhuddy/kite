@@ -66,7 +66,7 @@ scripts/smoke.sh "$TOPIC"
 STREAM_TOPIC="kite-stream-$(date +%s)-$RANDOM"
 docker exec "$NAME" /opt/kafka/bin/kafka-topics.sh \
     --bootstrap-server localhost:9092 --create --topic "$STREAM_TOPIC" \
-    --partitions 1 --replication-factor 1 --config max.message.bytes=2097152 >/dev/null
+    --partitions 1 --replication-factor 1 >/dev/null
 stream_fixture() {
     python3 - <<'PY'
 import sys
@@ -433,6 +433,7 @@ ru_want=$(printf 'before-int-1\nbefore-int-2\nsentinel-int-1\nsentinel-int-2')
 [ "$ru_out" = "$ru_want" ] || fail "txn: read_uncommitted did not see SIGINT-aborted + sentinel records: [$ru_out]"
 
 python3 scripts/check-txn-faults.py "$PWD/zig-out/bin/kite" "$NAME"
+timeout 180s python3 scripts/check-txn-streaming.py "$PWD/zig-out/bin/kite"
 
 zig-out/bin/kite topic delete -y "$TXN_TOPIC" "$TXN_ABORT" "$TXN_INT" >/dev/null 2>&1 || true
 echo "PASS txn"

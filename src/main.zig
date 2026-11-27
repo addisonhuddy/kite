@@ -220,6 +220,8 @@ pub fn main(init: std.process.Init) !void {
     var batch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer batch_arena.deinit();
     const batch_alloc = batch_arena.allocator();
+    var next_batch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer next_batch_arena.deinit();
 
     var stdin_buf: [64 * 1024]u8 = undefined;
     const stdin_fd = std.Io.File.stdin().handle;
@@ -273,6 +275,8 @@ pub fn main(init: std.process.Init) !void {
         }
         if (cli.outstanding_bytes > inflight_budget) {
             cli.produceDrainUntil(topic, inflight_budget) catch |err| produceFatal(&cli, err);
+            if (produce.txn != null and interrupted.load(.acquire))
+                abortInterrupted();
             stats.maybeRender();
             t_drain += timer.lap();
         }
@@ -296,7 +300,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        const rec = if (csv_mode) blk: {
+        var rec = if (csv_mode) blk: {
             const row = csv.nextRow(r, batch_alloc) catch {
                 if (produce.txn != null and interrupted.load(.acquire)) abortInterrupted();
                 fatal("failed reading stdin", .{});
@@ -331,6 +335,15 @@ pub fn main(init: std.process.Init) !void {
             break :blk t;
         };
         const p = &pend[target];
+        if (p.records.items.len > 0 and p.bytes + size + batch_overhead > cfg.batch_size) {
+            rec = copyRecord(next_batch_arena.allocator(), rec) catch fatal("out of memory", .{});
+            flushAll(&cli, topic, pend, &batch_arena) catch |err| produceFatal(&cli, err);
+            if (produce.txn != null and interrupted.load(.acquire))
+                abortInterrupted();
+            std.mem.swap(std.heap.ArenaAllocator, &batch_arena, &next_batch_arena);
+            pending_bytes = 0;
+            t_flush += timer.lap();
+        }
         p.records.append(batch_alloc, rec) catch fatal("out of memory", .{});
         p.bytes += size;
         pending_bytes += size;
@@ -1884,6 +1897,19 @@ fn recordSize(rec: protocol.Record) usize {
         if (h.value) |v| n += v.len;
     }
     return n;
+}
+
+fn copyRecord(alloc: std.mem.Allocator, rec: protocol.Record) !protocol.Record {
+    const headers = try alloc.alloc(protocol.Header, rec.headers.len);
+    for (headers, rec.headers) |*dest, src| dest.* = .{
+        .key = try alloc.dupe(u8, src.key),
+        .value = if (src.value) |v| try alloc.dupe(u8, v) else null,
+    };
+    return .{
+        .key = if (rec.key) |k| try alloc.dupe(u8, k) else null,
+        .value = try alloc.dupe(u8, rec.value),
+        .headers = headers,
+    };
 }
 
 /// Record-batch header (61B) plus slack, charged against batch_size on
