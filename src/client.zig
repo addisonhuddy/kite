@@ -281,7 +281,6 @@ pub const Client = struct {
             const dl = c.group_deadline orelse std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(15000));
             conn.setReadCancellation(flag, dl);
         }
-        defer conn.setReadCancellation(null, null);
         c.postConnect(conn) catch |err| {
             conn.close();
             c.alloc.destroy(conn);
@@ -296,6 +295,7 @@ pub const Client = struct {
                 c.setErr("handshake {s}:{d}: {s}", .{ host, port, @errorName(err) });
             return error.AllBootstrapFailed;
         };
+        conn.setReadCancellation(null, null);
         return conn;
     }
 
