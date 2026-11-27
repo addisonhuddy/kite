@@ -329,10 +329,13 @@ try:
         "--group", classic, "--consumer-property", "group.protocol=classic",
         "--consumer-property", "enable.auto.commit=false", "--timeout-ms", "60000",
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as member:
+        def classic_is_stable():
+            assert member.poll() is None, ("classic member exited", member.returncode)
+            return any(g["group"] == classic and g["state"] == "Stable"
+                       for g in rows(run("group", "list", "--all", "--json")))
+
         try:
-            wait_for(lambda: any(g["group"] == classic and g["state"] == "Stable"
-                                 for g in rows(run("group", "list", "--all", "--json"))),
-                     "classic group stable")
+            wait_for(classic_is_stable, "classic group stable")
             description = rows(run("group", "describe", classic, "--json"))
             assert [p["topic"] for p in description] == [denied, topic], description
             partition = description[1]
@@ -342,12 +345,16 @@ try:
             print("PASS groups active classic describe shows partitions without commits", flush=True)
 
             acl = ["docker", "exec", "kite-e2e-kafka", "/opt/kafka/bin/kafka-acls.sh",
-                   "--bootstrap-server", "localhost:9092", "--deny-principal", "User:ANONYMOUS",
+                   "--bootstrap-server", "localhost:9092", "--deny-principal", "User:kite_observer",
                    "--operation", "Describe", "--topic", denied]
+            observer = dict(os.environ, SECURITY_PROTOCOL="SASL_PLAINTEXT", SASL_MECHANISM="PLAIN",
+                            SASL_USERNAME="kite_observer", SASL_PASSWORD="kite-e2e")
             subprocess.run([*acl, "--add"], check=True, capture_output=True, text=True, timeout=30)
             try:
-                result = subprocess.run([kite, "group", "describe", classic, "--json"],
-                                        text=True, capture_output=True, timeout=30)
+                assert classic_is_stable(), "classic group stopped being stable after adding the ACL"
+                assert rows(run("group", "describe", classic, "--json")) == description
+                result = subprocess.run([kite, "group", "describe", classic, "--json", "-b", "127.0.0.1:19092"],
+                                        env=observer, text=True, capture_output=True, timeout=30)
                 assert result.returncode == 0, result
                 assert rows(result.stdout) == [partition], result.stdout
                 assert "warning: skipping a topic the current principal is not authorized to describe" in result.stderr, result.stderr
