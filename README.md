@@ -327,16 +327,16 @@ kite --version                            Print the version.
 
 | Mode | Option | Meaning |
 | --- | --- | --- |
-| produce, consume | `-b`, `--bootstrap HOSTS` | Comma-separated `host:port` brokers (overrides env and file). |
+| produce, consume, group | `-b`, `--bootstrap HOSTS` | Comma-separated `host:port` brokers (overrides env and file). |
 | all | `--config FILE` | Read this properties file instead of searching. |
-| produce, consume | `@NAME` | Use cluster `NAME` from kite.yaml for this run only (also `$KITE_TARGET`). |
+| produce, consume, group | `@NAME` | Use cluster `NAME` from kite.yaml for this run only (also `$KITE_TARGET`). |
 | produce, consume | `--format FMT` | Record shape: `value`, `tsv`, `json` (default `auto`). |
 | produce | `--format csv` | RFC 4180 CSV input (produce only); same as `--csv`. |
-| produce, consume | `--json` | Alias for `--format json`. |
+| produce, consume, group | `--json` | Alias for `--format json` in produce and consume; one JSON object per group or partition in group. |
 | produce | `-H 'name: value'` | Add a header to every record (repeatable). |
 | produce | `--csv` | Read RFC 4180 CSV; each row becomes a JSON object value. |
 | produce | `--key COL` | Use CSV column `COL` as the record key (requires `--csv`). |
-| produce | `--txn ID` | Produce all of stdin atomically under transactional `ID` (commits on EOF, aborts on error or interrupt before commit; if interrupted after commit is sent, exits 130 reporting unknown outcome instead of aborting; requires `enable.idempotence=true`). |
+| produce | `--txn ID` | Produce all of stdin atomically under transactional `ID` (commits on EOF, aborts on error or interrupt before commit; if interrupted after commit is sent, exits 130 reporting unknown outcome instead of aborting). Requires `enable.idempotence=true` and broker-side `transaction.partition.verification.enable=true` (enabled by default in Apache Kafka 3.6+). |
 | consume | `-g`, `--group GROUP` | Join a Kafka 4.0 consumer group and resume committed offsets. |
 | consume | `-B`, `--from-beginning` | Start at the earliest offset (with a group, only where no offset is committed). |
 | consume | `--offset N` | Start at offset N in every selected partition; errors if N is out of range. |
@@ -345,8 +345,9 @@ kite --version                            Print the version.
 | consume | `-t`, `--idle DUR` | Stop after DUR without a record (`3s`, `500ms`, `1m`; bare number = ms). |
 | consume | `-f`, `--follow` | Never stop on idle, even when stdout is a pipe. |
 | consume | `--read-uncommitted` | Include open and aborted transactional records. |
+| group | `-a`, `--all` | Include classic groups (list only). |
 | all | `-q`, `--quiet` | Suppress the summary and progress lines on stderr. |
-| produce, consume | `-v`, `--verbose` | Connection, retry, and fetch diagnostics on stderr. |
+| produce, consume, group | `-v`, `--verbose` | Verbose diagnostics on stderr. |
 | all | `-h`, `--help` | Plain-text help for the selected mode. |
 
 `kite --help` prints the command overview; `kite produce --help`,
@@ -579,11 +580,12 @@ See the full walkthrough in [examples/wing/](examples/wing).
 ## Consuming
 
 Starting in v0.5.0, `kite consume` (including `consume -g`) defaults to
-read-committed isolation: it skips aborted transactional records and reads only up to the
-last stable offset, holding back records at or after the first open
-transaction in each partition until it completes. Use `--read-uncommitted`
-to read up to the high watermark instead, including open and aborted
-transactional records. Transaction markers never appear on stdout.
+read-committed isolation: it skips aborted transactional records and reads
+only up to the last stable offset, holding back records at or after the
+first open transaction in each partition until it completes. Use
+`--read-uncommitted` to read up to the high watermark instead, including
+open and aborted transactional records. Transaction markers never appear
+on stdout.
 
 By default, `kite consume` starts at the latest offset for its isolation
 level and selects all partitions.
