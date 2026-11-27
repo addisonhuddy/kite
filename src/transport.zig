@@ -46,6 +46,7 @@ const SocketReader = struct {
         io: std.Io,
     } = null,
     wait_hook: ?WaitHook = null,
+    poll_nonblock: bool = false,
 
     fn readVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
         const self: *SocketReader = @alignCast(@fieldParentPtr("interface", r));
@@ -53,6 +54,17 @@ const SocketReader = struct {
         const nbufs, const data_size = try r.writableVector(&buffers, data);
         std.debug.assert(nbufs != 0 and buffers[0].len != 0);
         while (true) {
+            if (self.poll_nonblock) {
+                var fds = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+                const rc = std.posix.poll(&fds, 0) catch {
+                    self.err = error.IoFailed;
+                    return error.ReadFailed;
+                };
+                if (rc == 0) {
+                    self.err = error.IoTimedOut;
+                    return error.ReadFailed;
+                }
+            }
             var poll_limit: ?u64 = null;
             var hook_due = false;
             var ready = false;
@@ -304,6 +316,47 @@ test "socket reads time out normally and discard partial frames" {
     }
 }
 
+test "FrameAccumulator handles partial header and body without blocking" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(alloc);
+    defer env.deinit();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+    const c = try connect(io, alloc, &env, "127.0.0.1", server.socket.address.getPort(), null, 50);
+    defer alloc.destroy(c);
+    defer c.close();
+    const peer = try server.accept(io);
+    defer peer.close(io);
+    const frame = [_]u8{ 0, 0, 0, 6, 0, 0, 0, 7, 0, 'k' };
+    var buf: [32]u8 = undefined;
+    var writer = peer.writer(io, &buf);
+    var acc: FrameAccumulator = .{};
+    defer acc.deinit(alloc);
+
+    try std.testing.expect((try acc.step(c, alloc, 7, true)) == null);
+    try writer.interface.writeAll(frame[0..2]);
+    try writer.interface.flush();
+    try std.testing.expect(waitReadable(c, 50));
+    try std.testing.expect((try acc.step(c, alloc, 7, true)) == null);
+    try std.testing.expectEqual(@as(usize, 2), acc.hdr_len);
+
+    try writer.interface.writeAll(frame[2..7]);
+    try writer.interface.flush();
+    try std.testing.expect(waitReadable(c, 50));
+    try std.testing.expect((try acc.step(c, alloc, 7, true)) == null);
+    try std.testing.expectEqual(@as(usize, 3), acc.body_len);
+
+    try writer.interface.writeAll(frame[7..]);
+    try writer.interface.flush();
+    try std.testing.expect(waitReadable(c, 50));
+    const resp = (try acc.step(c, alloc, 7, true)).?;
+    defer alloc.free(resp.frame);
+    try std.testing.expectEqualStrings("k", resp.body);
+    try std.testing.expect(!c.closed);
+}
+
 test "socket write timeouts are normal errors and close the connection" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -486,6 +539,98 @@ pub const Response = struct {
     frame: []u8,
     /// Response body after the v1 header (correlation id + tag buffer).
     body: []u8,
+};
+
+pub const FrameAccumulator = struct {
+    hdr: [4]u8 = undefined,
+    hdr_len: usize = 0,
+    frame: ?[]u8 = null,
+    body_len: usize = 0,
+
+    pub fn deinit(f: *FrameAccumulator, alloc: std.mem.Allocator) void {
+        if (f.frame) |buf| alloc.free(buf);
+        f.frame = null;
+        f.hdr_len = 0;
+        f.body_len = 0;
+    }
+
+    pub fn hasPartial(f: *const FrameAccumulator) bool {
+        return f.hdr_len > 0 or f.frame != null;
+    }
+
+    fn readAvailable(c: *Conn, dst: []u8) TransportError!usize {
+        if (c.input.buffered().len == 0) {
+            c.net_reader.err = null;
+            c.net_reader.poll_nonblock = true;
+            defer c.net_reader.poll_nonblock = false;
+            c.input.fillMore() catch |err| {
+                if (err == error.ReadFailed and c.net_reader.err != null and c.net_reader.err.? == error.IoTimedOut) {
+                    c.net_reader.err = null;
+                    return 0;
+                }
+                c.close();
+                return if (err == error.EndOfStream) error.IoFailed else c.ioError();
+            };
+        }
+        const avail = c.input.buffered();
+        const n = @min(avail.len, dst.len);
+        @memcpy(dst[0..n], avail[0..n]);
+        c.input.toss(n);
+        return n;
+    }
+
+    /// Drain any currently available bytes from `c` without blocking.
+    /// Returns a complete validated Response once the full frame arrives,
+    /// `null` while the frame is incomplete, or a TransportError on failure.
+    pub fn step(f: *FrameAccumulator, c: *Conn, alloc: std.mem.Allocator, expect_corr: i32, header_tags: bool) TransportError!?Response {
+        if (c.closed) return error.IoFailed;
+        while (f.hdr_len < 4) {
+            const n = try readAvailable(c, f.hdr[f.hdr_len..4]);
+            if (n == 0) return null;
+            f.hdr_len += n;
+        }
+        if (f.frame == null) {
+            const len = std.mem.readInt(u32, &f.hdr, .big);
+            if (len > max_response_len) {
+                c.close();
+                return error.ResponseTooLarge;
+            }
+            f.frame = alloc.alloc(u8, len) catch return error.OutOfMemory;
+        }
+        const buf = f.frame.?;
+        while (f.body_len < buf.len) {
+            const n = try readAvailable(c, buf[f.body_len..]);
+            if (n == 0) return null;
+            f.body_len += n;
+        }
+        f.frame = null;
+        f.hdr_len = 0;
+        f.body_len = 0;
+        errdefer alloc.free(buf);
+        if (c.debug) {
+            if (c.redact_next_recv) {
+                c.redact_next_recv = false;
+                std.debug.print("recv {d}B: <redacted>\n", .{buf.len});
+            } else {
+                const n = @min(buf.len, 512);
+                std.debug.print("recv {d}B: {x}\n", .{ buf.len, buf[0..n] });
+            }
+        }
+        var d = protocol.Decoder.init(buf);
+        const corr = d.i32v() catch {
+            c.close();
+            return error.MalformedResponse;
+        };
+        if (corr != expect_corr) {
+            c.close();
+            return error.CorrelationMismatch;
+        }
+        if (header_tags) d.tagBuffer() catch {
+            c.close();
+            return error.MalformedResponse;
+        };
+        return .{ .frame = buf, .body = buf[d.pos..] };
+    }
 };
 
 /// Receive one framed response and validate its correlation id.

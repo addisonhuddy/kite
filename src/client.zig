@@ -103,6 +103,7 @@ pub const Client = struct {
     controller_id: i32 = -1,
     coordinator_group: ?[]const u8 = null,
     coordinator_node: i32 = -1,
+    coordinator_discovery_cursor: usize = 0,
     /// partition index -> leader node_id for the target topic
     partitions: std.ArrayListUnmanaged(Partition),
     topic_id: [16]u8 = @splat(0),
@@ -678,13 +679,24 @@ pub const Client = struct {
         return null;
     }
 
+    fn candidateDeadline(c: *const Client, remaining_candidates: usize) ?std.Io.Timestamp {
+        const dl = c.group_deadline orelse return null;
+        if (remaining_candidates <= 1) return dl;
+        const now = std.Io.Timestamp.now(c.io, .awake);
+        const rem = now.durationTo(dl).toMilliseconds();
+        if (rem <= 0) return dl;
+        const share: u64 = @max(@as(u64, 150), @as(u64, @intCast(rem)) / remaining_candidates);
+        const cap = @min(@as(u64, @intCast(rem)), share);
+        return now.addDuration(.fromMilliseconds(@intCast(cap)));
+    }
+
     pub fn findCoordinator(c: *Client, group: []const u8) !i32 {
         if (c.coordinator_group) |cached| {
             if (std.mem.eql(u8, cached, group) and c.coordinator_node >= 0) return c.coordinator_node;
         }
         try c.requireVersion(protocol.api_key.find_coordinator, protocol.version.find_coordinator, "FindCoordinator");
         var retry: Retry = .{};
-        var candidate: usize = 0;
+        var tried_control: usize = 0;
         while (true) {
             const resp = if (c.control_busy) blk: {
                 const count = c.brokers.count();
@@ -692,8 +704,11 @@ pub const Client = struct {
                 var tried: usize = 0;
                 var last_err: anyerror = error.MetadataFailed;
                 while (tried < count) : (tried += 1) {
-                    const node = c.brokerNodeAt(candidate) orelse break;
-                    candidate +%= 1;
+                    const node = c.brokerNodeAt(c.coordinator_discovery_cursor) orelse break;
+                    c.coordinator_discovery_cursor +%= 1;
+                    const prev_deadline = c.group_deadline;
+                    c.group_deadline = c.candidateDeadline(count - tried);
+                    defer c.group_deadline = prev_deadline;
                     const conn = c.connFor(node, connKey(node, 0xFFFF_FFFC)) catch |err| {
                         c.dropConn(connKey(node, 0xFFFF_FFFC));
                         last_err = err;
@@ -711,16 +726,23 @@ pub const Client = struct {
                 _ = try c.groupRemainingMs();
                 return last_err;
             } else blk: {
-                if (c.control == null) c.reconnectControlAt(candidate) catch |err| {
-                    candidate +%= 1;
-                    if (try retry.pauseOrAbort(c)) continue;
-                    _ = try c.groupRemainingMs();
-                    return err;
+                const count = c.brokers.count();
+                const rem_candidates = if (count > tried_control) count - tried_control else 1;
+                const prev_deadline = c.group_deadline;
+                c.group_deadline = c.candidateDeadline(rem_candidates);
+                const attempt: anyerror!Resp = inner: {
+                    defer c.group_deadline = prev_deadline;
+                    if (c.control == null) c.reconnectControlAt(c.coordinator_discovery_cursor) catch |err| break :inner err;
+                    break :inner c.sendRequest(c.control.?, protocol.api_key.find_coordinator, protocol.version.find_coordinator, group, protocol.findCoordinatorRequest);
                 };
-                break :blk c.sendRequest(c.control.?, protocol.api_key.find_coordinator, protocol.version.find_coordinator, group, protocol.findCoordinatorRequest) catch |err| {
+                break :blk attempt catch |err| {
                     c.dropControl();
-                    candidate +%= 1;
-                    if (c.brokers.count() > 1 and candidate % c.brokers.count() != 0) continue;
+                    c.coordinator_discovery_cursor +%= 1;
+                    tried_control += 1;
+                    if (count > 1 and tried_control < count) {
+                        if (c.groupRemainingMs()) |_| continue else |_| {}
+                    }
+                    tried_control = 0;
                     if (try retry.pauseOrAbort(c)) continue;
                     _ = try c.groupRemainingMs();
                     return err;
@@ -779,6 +801,12 @@ pub const Client = struct {
     const GroupResp = struct {
         resp: Resp,
         node: i32,
+        overlapped: bool = false,
+    };
+
+    const HeartbeatAttempt = struct {
+        resp: Resp,
+        overlapped: bool = false,
     };
 
     fn invalidateCoordinatorEndpoint(c: *Client, node: i32, slot: u32) void {
@@ -786,7 +814,16 @@ pub const Client = struct {
         if (c.coordinator_node == node) c.coordinator_node = -1;
     }
 
-    fn sendHeartbeatAttempt(c: *Client, alloc: std.mem.Allocator, node: i32, conn: *Conn, req: protocol.Heartbeat) !Resp {
+    fn finishFrame(io: std.Io, conn: *Conn, acc: *transport.FrameAccumulator, alloc: std.mem.Allocator, corr: i32, deadline: std.Io.Timestamp) !Resp {
+        while (true) {
+            if (try acc.step(conn, alloc, corr, true)) |resp| return resp;
+            const left = std.Io.Timestamp.now(io, .awake).durationTo(deadline).toMilliseconds();
+            if (left <= 0) return error.IoTimedOut;
+            if (!transport.waitReadable(conn, @intCast(left))) return error.IoTimedOut;
+        }
+    }
+
+    fn sendHeartbeatAttempt(c: *Client, alloc: std.mem.Allocator, node: i32, conn: *Conn, req: protocol.Heartbeat) !HeartbeatAttempt {
         const timeout = try c.requestTimeoutMs(0);
         transport.setTimeout(conn, timeout);
         var e1 = Encoder.init(alloc);
@@ -796,27 +833,56 @@ pub const Client = struct {
         try transport.send(conn, e1.written());
 
         const hedge_ms = if (req.member_epoch > 0) req.hedge_ms else null;
-        if (hedge_ms == null or transport.waitReadable(conn, @min(hedge_ms.?, timeout))) {
-            return transport.recv(conn, alloc, corr1, true);
+        if (hedge_ms == null) {
+            return .{ .resp = try transport.recv(conn, alloc, corr1, true) };
         }
 
-        const deadline = c.group_deadline orelse std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(@intCast(timeout)));
-        const addr = c.brokers.get(node) orelse return transport.recv(conn, alloc, corr1, true);
+        const now0 = std.Io.Timestamp.now(c.io, .awake);
+        const deadline = c.group_deadline orelse now0.addDuration(.fromMilliseconds(@intCast(timeout)));
+        const hedge_cap = now0.addDuration(.fromMilliseconds(@intCast(@min(hedge_ms.?, timeout))));
+        const hedge_deadline = if (now0.durationTo(deadline).toMilliseconds() < now0.durationTo(hedge_cap).toMilliseconds()) deadline else hedge_cap;
+
+        var acc1: transport.FrameAccumulator = .{};
+        defer acc1.deinit(alloc);
+        while (true) {
+            if (try acc1.step(conn, alloc, corr1, true)) |resp| return .{ .resp = resp };
+            const rem = std.Io.Timestamp.now(c.io, .awake).durationTo(hedge_deadline).toMilliseconds();
+            if (rem <= 0) break;
+            _ = transport.waitReadable(conn, @intCast(rem));
+        }
+
+        const addr = c.brokers.get(node) orelse return .{ .resp = try finishFrame(c.io, conn, &acc1, alloc, corr1, deadline) };
         const Watch = struct {
             io: std.Io,
             conn: *Conn,
+            acc: *transport.FrameAccumulator,
+            alloc: std.mem.Allocator,
+            corr: i32,
+            ready: ?Resp = null,
+            failed: bool = false,
+            oom: bool = false,
             fn nextDue(ctx: *anyopaque) ?std.Io.Timestamp {
                 const w: *@This() = @ptrCast(@alignCast(ctx));
                 const now = std.Io.Timestamp.now(w.io, .awake);
-                if (transport.waitReadable(w.conn, 0)) return now;
+                if (w.ready != null or w.failed or w.oom or transport.waitReadable(w.conn, 0)) return now;
                 return now.addDuration(.fromMilliseconds(5));
             }
             fn tick(ctx: *anyopaque) bool {
                 const w: *@This() = @ptrCast(@alignCast(ctx));
-                return transport.waitReadable(w.conn, 0);
+                if (w.ready != null or w.failed or w.oom) return true;
+                if (w.acc.step(w.conn, w.alloc, w.corr, true)) |maybe_resp| {
+                    if (maybe_resp) |resp| {
+                        w.ready = resp;
+                        return true;
+                    }
+                    return false;
+                } else |err| {
+                    if (err == error.OutOfMemory) w.oom = true else w.failed = true;
+                    return true;
+                }
             }
         };
-        var watch: Watch = .{ .io = c.io, .conn = conn };
+        var watch: Watch = .{ .io = c.io, .conn = conn, .acc = &acc1, .alloc = alloc, .corr = corr1 };
         var conn_alive = true;
         const hedge = blk: {
             const prev_watch = c.hedge_watch_hook;
@@ -824,14 +890,13 @@ pub const Client = struct {
             defer c.hedge_watch_hook = prev_watch;
             if (c.connectOne(addr.host, addr.port)) |h| break :blk h else |err| {
                 if (err == error.WaitHookAborted) {
-                    if (transport.recv(conn, alloc, corr1, true)) |resp| return resp else |rerr| {
-                        if (rerr == error.OutOfMemory) return rerr;
-                        conn_alive = false;
-                    }
+                    if (watch.oom) return error.OutOfMemory;
+                    if (watch.ready) |resp| return .{ .resp = resp };
+                    conn_alive = false;
                     c.hedge_watch_hook = prev_watch;
                     break :blk c.connectOne(addr.host, addr.port) catch return error.IoFailed;
                 }
-                return transport.recv(conn, alloc, corr1, true);
+                return .{ .resp = try finishFrame(c.io, conn, &acc1, alloc, corr1, deadline) };
             }
         };
         var keep_hedge = false;
@@ -839,9 +904,14 @@ pub const Client = struct {
             hedge.close();
             c.alloc.destroy(hedge);
         };
-        if (conn_alive and transport.waitReadable(conn, 0)) {
-            if (transport.recv(conn, alloc, corr1, true)) |resp| return resp else |rerr| {
-                if (rerr == error.OutOfMemory) return rerr;
+        if (watch.oom) return error.OutOfMemory;
+        if (watch.ready) |resp| return .{ .resp = resp };
+        if (watch.failed) conn_alive = false;
+        if (conn_alive) {
+            if (acc1.step(conn, alloc, corr1, true)) |maybe_resp| {
+                if (maybe_resp) |resp| return .{ .resp = resp };
+            } else |err| {
+                if (err == error.OutOfMemory) return err;
                 conn_alive = false;
             }
         }
@@ -853,9 +923,11 @@ pub const Client = struct {
         const corr2 = protocol.lastCorrelationId();
         transport.send(hedge, e2.written()) catch |err| {
             if (!conn_alive) return err;
-            return transport.recv(conn, alloc, corr1, true);
+            return .{ .resp = try finishFrame(c.io, conn, &acc1, alloc, corr1, deadline) };
         };
 
+        var acc2: transport.FrameAccumulator = .{};
+        defer acc2.deinit(alloc);
         var hedge_alive = true;
         while (conn_alive or hedge_alive) {
             const pick: u1 = if (conn_alive and hedge_alive)
@@ -869,25 +941,23 @@ pub const Client = struct {
                 if (left <= 0 or !transport.waitReadable(hedge, @intCast(left))) return error.IoTimedOut;
                 break :blk 1;
             };
-            const left = std.Io.Timestamp.now(c.io, .awake).durationTo(deadline).toMilliseconds();
-            if (left <= 0) return error.IoTimedOut;
             if (pick == 0) {
-                transport.setTimeout(conn, @intCast(left));
-                if (transport.recv(conn, alloc, corr1, true)) |resp| {
-                    return resp;
+                if (acc1.step(conn, alloc, corr1, true)) |maybe_resp| {
+                    if (maybe_resp) |resp| return .{ .resp = resp, .overlapped = true };
                 } else |err| {
                     if (err == error.OutOfMemory) return err;
                     conn_alive = false;
                     if (!hedge_alive) return err;
                 }
             } else {
-                transport.setTimeout(hedge, @intCast(left));
-                if (transport.recv(hedge, alloc, corr2, true)) |resp| {
-                    const slot_key = connKey(node, 0xFFFF_FFFD);
-                    c.dropConn(slot_key);
-                    c.conns.put(c.alloc, slot_key, hedge) catch return resp;
-                    keep_hedge = true;
-                    return resp;
+                if (acc2.step(hedge, alloc, corr2, true)) |maybe_resp| {
+                    if (maybe_resp) |resp| {
+                        const slot_key = connKey(node, 0xFFFF_FFFD);
+                        c.dropConn(slot_key);
+                        c.conns.put(c.alloc, slot_key, hedge) catch return .{ .resp = resp, .overlapped = true };
+                        keep_hedge = true;
+                        return .{ .resp = resp, .overlapped = true };
+                    }
                 } else |err| {
                     if (err == error.OutOfMemory) return err;
                     hedge_alive = false;
@@ -912,16 +982,26 @@ pub const Client = struct {
                 _ = try c.groupRemainingMs();
                 return err;
             };
-            const resp = (if (comptime @TypeOf(ctx) == protocol.Heartbeat)
-                c.sendHeartbeatAttempt(alloc, node, conn, request)
-            else
-                c.sendRequestAlloc(alloc, conn, key, ver, request, encode)) catch |err| {
+            if (comptime @TypeOf(ctx) == protocol.Heartbeat) {
+                const attempt = c.sendHeartbeatAttempt(alloc, node, conn, request) catch |err| {
+                    if (err == error.WaitHookAborted) {
+                        c.dropConn(connKey(node, slot));
+                        return err;
+                    }
+                    c.invalidateCoordinatorEndpoint(node, slot);
+                    request = request.forRetry();
+                    if (try retry.pauseOrAbort(c)) continue;
+                    _ = try c.groupRemainingMs();
+                    return err;
+                };
+                return .{ .resp = attempt.resp, .node = node, .overlapped = attempt.overlapped };
+            }
+            const resp = c.sendRequestAlloc(alloc, conn, key, ver, request, encode) catch |err| {
                 if (err == error.WaitHookAborted) {
                     c.dropConn(connKey(node, slot));
                     return err;
                 }
                 c.invalidateCoordinatorEndpoint(node, slot);
-                if (comptime @TypeOf(ctx) == protocol.Heartbeat) request = request.forRetry();
                 if (try retry.pauseOrAbort(c)) continue;
                 _ = try c.groupRemainingMs();
                 return err;
@@ -933,15 +1013,27 @@ pub const Client = struct {
     pub fn heartbeat(c: *Client, alloc: std.mem.Allocator, req: protocol.Heartbeat) !protocol.HeartbeatResult {
         var retry: Retry = .{};
         var request = req;
+        var pending_assignment: ?[]protocol.TopicAssignment = null;
         while (true) {
             const res = try c.groupRequest(alloc, req.group, protocol.api_key.consumer_group_heartbeat, protocol.version.consumer_group_heartbeat, "ConsumerGroupHeartbeat", request, protocol.heartbeatRequest);
             var d = Decoder.init(res.resp.body);
-            const result = try protocol.heartbeatResponse(&d, alloc);
+            var result = try protocol.heartbeatResponse(&d, alloc);
             if (isCoordinatorError(result.code)) {
                 c.invalidateCoordinatorEndpoint(res.node, 0xFFFF_FFFD);
                 request = request.forRetry();
                 if (try retry.pauseOrAbort(c)) continue;
                 _ = try c.groupRemainingMs();
+            }
+            if (res.overlapped and result.code == .none and request.member_epoch > 0) {
+                if (result.assignment != null) pending_assignment = result.assignment;
+                var reconcile = request.forRetry();
+                reconcile.member_epoch = result.member_epoch;
+                reconcile.hedge_ms = null;
+                request = reconcile;
+                continue;
+            }
+            if (result.code == .none and result.assignment == null and pending_assignment != null) {
+                result.assignment = pending_assignment;
             }
             return result;
         }
