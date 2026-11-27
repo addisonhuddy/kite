@@ -170,6 +170,10 @@ const group_session_assumed_ms = 45000;
 const group_commit_floor_ms = 1000;
 const heartbeat_slack_ms = 100;
 
+fn heartbeatSlack(interval: u64) u64 {
+    return @min(heartbeat_slack_ms, interval / 4);
+}
+
 const GroupSession = struct {
     c: *client.Client,
     opts: Options,
@@ -194,7 +198,7 @@ const GroupSession = struct {
 
     fn beginAttempt(s: *GroupSession) void {
         s.attempt_started = std.Io.Timestamp.now(s.c.io, .awake);
-        s.c.group_deadline = s.attempt_started.addDuration(.fromMilliseconds(@intCast(@max(1, s.interval -| heartbeat_slack_ms))));
+        s.c.group_deadline = s.attempt_started.addDuration(.fromMilliseconds(@intCast(@max(1, s.interval -| heartbeatSlack(s.interval)))));
     }
 
     fn beginRound(s: *GroupSession) void {
@@ -949,6 +953,28 @@ test "failed final commits preserve pending progress and report replay" {
     }
 }
 
+test "short heartbeat intervals keep fetch and attempt budgets open" {
+    try std.testing.expectEqual(@as(u64, 100), heartbeatSlack(5000));
+    try std.testing.expectEqual(@as(u64, 100), heartbeatSlack(400));
+    try std.testing.expectEqual(@as(u64, 25), heartbeatSlack(100));
+    try std.testing.expectEqual(@as(u64, 12), heartbeatSlack(50));
+    try std.testing.expectEqual(@as(u64, 0), heartbeatSlack(1));
+
+    var c: client.Client = undefined;
+    c.io = std.testing.io;
+    const now = std.Io.Timestamp.now(c.io, .awake);
+    var session: GroupSession = .{ .c = &c, .opts = .{ .topic = "t", .group = "g" }, .member = @splat('m'), .interval = 100, .last_heartbeat = now, .last_record = now };
+    session.beginAttempt();
+    const attempt_remaining = try c.groupRemainingMs();
+    try std.testing.expect(attempt_remaining > 50);
+    try std.testing.expect(attempt_remaining <= 75);
+    session.beginRound();
+    const round_remaining = try c.groupRemainingMs();
+    try std.testing.expect(round_remaining > 50);
+    try std.testing.expect(round_remaining <= 75);
+    try std.testing.expect(session.interval > heartbeatSlack(session.interval));
+}
+
 fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
     defer c.group_deadline = null;
     var random: [16]u8 = undefined;
@@ -1050,7 +1076,8 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         var fetch_opts = opts;
         const since_beat = session.last_heartbeat.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds();
         const until_beat = session.interval -| @as(u64, @intCast(@max(0, since_beat)));
-        if (until_beat <= heartbeat_slack_ms) {
+        const slack = heartbeatSlack(session.interval);
+        if (until_beat <= slack) {
             c.sleep(until_beat);
             continue;
         }
@@ -1062,7 +1089,7 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             c.sleep(remaining);
             continue;
         }
-        fetch_opts.fetch_wait_ms = @min(c.cfg.fetch_max_wait_ms, @min(until_beat - heartbeat_slack_ms, remaining - @min(1000, remaining / 2)));
+        fetch_opts.fetch_wait_ms = @min(c.cfg.fetch_max_wait_ms, @min(until_beat - slack, remaining - @min(1000, remaining / 2)));
         if (session.idleReady()) if (opts.idle_ms) |idle| {
             const idle_remaining = idle -| @as(u64, @intCast(@max(0, session.last_record.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds())));
             if (idle_remaining <= 1) {
