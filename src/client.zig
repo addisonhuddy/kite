@@ -1568,7 +1568,7 @@ pub const Client = struct {
             return;
         }
         var retry: Retry = .{};
-        var commit_ambiguous = false;
+        var commit_ambiguous = commit and c.txn_commit_dispatched;
         while (true) {
             if (commit) if (stop) |s| if (s.load(.acquire)) {
                 return if (commit_ambiguous) error.CommitOutcomeUnknown else error.Interrupted;
@@ -1656,6 +1656,14 @@ pub const Client = struct {
                     c.clearTxnState();
                     c.noteFencedAbort(txn_id, code);
                     return;
+                }
+                if (!commit_ambiguous) {
+                    c.clearTxnState();
+                    c.setErr(
+                        "EndTxn (commit '{s}'): {s}; transaction aborted by Kafka (transaction.timeout.ms={d} exceeded, or another producer used this transactional ID)",
+                        .{ txn_id, code.name(), c.cfg.transaction_timeout_ms },
+                    );
+                    return error.ProduceFailed;
                 }
             }
             if (!commit and c.txn_added_parts.count() == 0 and code == .invalid_txn_state) {
@@ -2537,11 +2545,11 @@ test "abort treats fenced producer as already aborted by broker while commit sti
     const peer = try server.accept(io);
     defer peer.close(io);
 
-    const writeEndTxnResp = struct {
-        fn send(p: std.Io.net.Stream, a: std.mem.Allocator, code: protocol.ErrorCode) !void {
+    const writeEndTxnRespWithCorr = struct {
+        fn send(p: std.Io.net.Stream, a: std.mem.Allocator, corr: i32, code: protocol.ErrorCode) !void {
             var body = Encoder.init(a);
             defer body.deinit();
-            try body.i32v(protocol.lastCorrelationId() + 1);
+            try body.i32v(corr);
             try body.tagBuffer();
             try body.i32v(0); // throttle_time_ms
             try body.i16v(@intFromEnum(code));
@@ -2554,6 +2562,11 @@ test "abort treats fenced producer as already aborted by broker while commit sti
             var w = p.writer(std.testing.io, &wbuf);
             try w.interface.writeAll(frame.written());
             try w.interface.flush();
+        }
+    }.send;
+    const writeEndTxnResp = struct {
+        fn send(p: std.Io.net.Stream, a: std.mem.Allocator, code: protocol.ErrorCode) !void {
+            try writeEndTxnRespWithCorr(p, a, protocol.lastCorrelationId() + 1, code);
         }
     }.send;
 
@@ -2575,14 +2588,32 @@ test "abort treats fenced producer as already aborted by broker while commit sti
     try std.testing.expect(c.txn_fenced);
     try std.testing.expect(!c.hasActiveTxn());
 
-    // Case 4: EndTxn(commit) returns PRODUCER_FENCED -> must still fail, and
-    // a subsequent abort must not claim the transaction was aborted by Kafka.
+    // Case 4a: Unambiguous first EndTxn(commit) returns PRODUCER_FENCED ->
+    // fails with "aborted by Kafka" context and clears active txn state.
     c.txn_fenced = false;
     c.txn_fence_code = null;
     c.txn_add_attempted = true;
     try c.txn_added_parts.put(alloc, 0, {});
     try writeEndTxnResp(peer, alloc, .producer_fenced);
     try std.testing.expectError(error.ProduceFailed, c.endTransaction(true, null));
+    try std.testing.expect(std.mem.indexOf(u8, c.errDetail(), "aborted by Kafka") != null);
+    try std.testing.expect(c.txn_fenced);
+    try std.testing.expect(!c.txn_commit_dispatched);
+    try std.testing.expect(!c.hasActiveTxn());
+    try std.testing.expect(c.abortTransactionBestEffort());
+
+    // Case 4b: Ambiguous retried EndTxn(commit) (first attempt retriable, retry
+    // returns PRODUCER_FENCED) -> fails with "outcome unknown", keeps
+    // txn_commit_dispatched set, and a subsequent abort must not claim aborted.
+    c.txn_fenced = false;
+    c.txn_fence_code = null;
+    c.txn_add_attempted = true;
+    try c.txn_added_parts.put(alloc, 0, {});
+    const base_corr = protocol.lastCorrelationId();
+    try writeEndTxnRespWithCorr(peer, alloc, base_corr + 1, .concurrent_transactions);
+    try writeEndTxnRespWithCorr(peer, alloc, base_corr + 2, .producer_fenced);
+    try std.testing.expectError(error.ProduceFailed, c.endTransaction(true, null));
+    try std.testing.expect(std.mem.indexOf(u8, c.errDetail(), "outcome unknown") != null);
     try std.testing.expect(c.txn_fenced);
     try std.testing.expect(c.txn_commit_dispatched);
     try std.testing.expectError(error.ProduceFailed, c.endTransaction(false, null));

@@ -771,10 +771,11 @@ assert run_kite("consume", "-B", "-n", "1", "--idle", "3s", "--format", "value",
 print("PASS txn-fault: stale fenced producer cannot abort replacement transaction")
 
 # Fault 11 (#107): Broker-timed-out --txn transaction is already aborted by Kafka;
-# neither a subsequent fenced Produce nor SIGINT reports "abort outcome unknown".
+# neither a subsequent fenced Produce, SIGINT, nor EOF commit reports "outcome unknown".
 t11 = "kite-txn-fault-broker-timeout"
 txn11_produce = "kite-e2e-fault-timeout-produce"
 txn11_sigint = "kite-e2e-fault-timeout-sigint"
+txn11_commit = "kite-e2e-fault-timeout-commit"
 run_kite("topic", "delete", "-y", "--if-exists", t11, check=False)
 run_kite("topic", "create", "-p", "1", "-r", "1", t11)
 
@@ -792,15 +793,22 @@ try:
             [kite, "produce", "--config", timeout_cfg, "--txn", txn11_sigint, t11],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         ) as p_int,
+        subprocess.Popen(
+            [kite, "produce", "--config", timeout_cfg, "--txn", txn11_commit, t11],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ) as p_commit,
     ):
         try:
             p_prod.stdin.write("k1\ttimed-out-produce\n")
             p_prod.stdin.flush()
             p_int.stdin.write("k1\ttimed-out-sigint\n")
             p_int.stdin.flush()
+            p_commit.stdin.write("k1\ttimed-out-commit\n")
+            p_commit.stdin.flush()
 
             wait_complete_abort(txn11_produce, timeout=25.0)
             wait_complete_abort(txn11_sigint, timeout=25.0)
+            wait_complete_abort(txn11_commit, timeout=25.0)
 
             _, err_prod = p_prod.communicate("k1\tafter-timeout\n", timeout=15)
             assert p_prod.returncode == 1, (p_prod.returncode, err_prod)
@@ -815,8 +823,14 @@ try:
             assert "INVALID_PRODUCER_EPOCH" in err_int or "PRODUCER_FENCED" in err_int, err_int
             assert "transaction aborted (interrupted)" in err_int, err_int
             assert "abort outcome unknown" not in err_int, err_int
+
+            _, err_commit = p_commit.communicate(timeout=15)
+            assert p_commit.returncode == 1, (p_commit.returncode, err_commit)
+            assert "aborted by Kafka" in err_commit, err_commit
+            assert "INVALID_PRODUCER_EPOCH" in err_commit or "PRODUCER_FENCED" in err_commit, err_commit
+            assert "outcome unknown" not in err_commit, err_commit
         finally:
-            for proc in (p_prod, p_int):
+            for proc in (p_prod, p_int, p_commit):
                 if proc.poll() is None:
                     proc.kill()
 finally:
