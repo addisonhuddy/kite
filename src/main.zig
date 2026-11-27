@@ -1091,7 +1091,7 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
                 outw.writeAll(",\"type\":") catch {};
                 json.writeString(outw, g.group_type) catch {};
                 outw.writeAll("}\n") catch {};
-            } else human_rows.append(alloc, .{ g.group, g.state }) catch oom();
+            } else human_rows.append(alloc, .{ groupText(alloc, g.group), groupText(alloc, g.state) }) catch oom();
         }
         if (!as_json) writeGroupTable(2, outw, .{ "GROUP", "STATE" }, human_rows.items, tty) catch {};
         outw.flush() catch {};
@@ -1099,16 +1099,8 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
         std.process.exit(0);
     }
     const group = opts.group.?;
-    const described = c.describeGroup(alloc, group) catch |err| switch (err) {
-        error.GroupNotFound => classic: {
-            const groups = c.listCoordinatorGroups(alloc, group) catch fatalErr(&c, "could not describe classic group");
-            for (groups) |g| {
-                if (std.mem.eql(u8, g.group, group)) break :classic protocol.DescribedGroup{ .code = .none, .message = null, .group = group, .state = g.state, .partitions = &.{} };
-            }
-            fatalErr(&c, "could not describe group");
-        },
-        else => fatalErr(&c, "could not describe group"),
-    };
+    const group_text = groupText(alloc, group);
+    const described = c.describeGroup(alloc, group) catch fatalErr(&c, "could not describe group");
     const fetched = c.fetchGroupOffsets(alloc, .{ .group = group }) catch fatalErr(&c, "could not fetch group offsets");
     const Row = struct { topic: []const u8, partition: i32, committed: i64 = -1, member: []const u8 = "", client_id: []const u8 = "" };
     var rows: std.ArrayList(Row) = .empty;
@@ -1131,11 +1123,18 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
         }
     }.less);
     var human_rows: std.ArrayList([8][]const u8) = .empty;
+    var reported: usize = 0;
     var i: usize = 0;
     while (i < rows.items.len) {
         const topic = rows.items[i].topic;
+        const topic_text = groupText(alloc, topic);
         const available = if (c.refreshMetadata(topic)) |_| true else |err| switch (err) {
             error.TopicNotFound => false,
+            error.TopicAuthorizationFailed => {
+                note("warning: skipping a topic the current principal is not authorized to describe", .{});
+                while (i < rows.items.len and std.mem.eql(u8, topic, rows.items[i].topic)) : (i += 1) {}
+                continue;
+            },
             else => fatalErr(&c, "could not resolve topic"),
         };
         const cursors = alloc.alloc(consumer.Cursor, if (available) c.partitions.items.len else 0) catch oom();
@@ -1147,13 +1146,14 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
         if (available) consumer.listOffsets(&c, &arena, topic, cursors, .latest, .read_uncommitted) catch fatalErr(&c, "could not fetch end offsets");
         while (i < rows.items.len and std.mem.eql(u8, topic, rows.items[i].topic)) : (i += 1) {
             const r = rows.items[i];
+            reported += 1;
             var end: ?i64 = null;
             for (cursors) |cursor| if (cursor.pidx == r.partition) {
                 end = cursor.offset;
             };
-            if (end == null) note("warning: {s}/{d} no longer exists; end and lag unavailable", .{ topic, r.partition });
+            if (end == null) note("warning: {s}/{d} no longer exists; end and lag unavailable", .{ topic_text, r.partition });
             if (end) |latest| {
-                if (r.committed > latest) note("warning: {s}/{d} committed offset exceeds end; lag clamped to 0", .{ topic, r.partition });
+                if (r.committed > latest) note("warning: {s}/{d} committed offset exceeds end; lag clamped to 0", .{ topic_text, r.partition });
             }
             const lag = groupLag(r.committed, end);
             if (as_json) {
@@ -1174,26 +1174,79 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
                 outw.writeAll("}\n") catch {};
             } else {
                 human_rows.append(alloc, .{
-                    group,
-                    topic,
+                    group_text,
+                    topic_text,
                     groupNumber(alloc, r.partition),
                     groupNumber(alloc, if (r.committed < 0) null else r.committed),
                     groupNumber(alloc, end),
                     groupNumber(alloc, lag),
-                    if (r.member.len == 0) "-" else r.member,
-                    if (r.client_id.len == 0) "-" else r.client_id,
+                    if (r.member.len == 0) "-" else groupText(alloc, r.member),
+                    if (r.client_id.len == 0) "-" else groupText(alloc, r.client_id),
                 }) catch oom();
             }
         }
     }
     if (!as_json) writeGroupTable(8, outw, .{ "GROUP", "TOPIC", "PARTITION", "COMMITTED", "END", "LAG", "MEMBER_ID", "CLIENT_ID" }, human_rows.items, tty) catch {};
     outw.flush() catch {};
-    if (!opts.common.quiet) note("{s}: {s}, {d} partition(s)", .{ group, described.state, rows.items.len });
+    if (!opts.common.quiet) note("{s}: {s}, {d} partition(s)", .{ group_text, groupText(alloc, described.state), reported });
     std.process.exit(0);
 }
 
 fn groupNumber(alloc: std.mem.Allocator, value: ?i64) []const u8 {
     return if (value) |number| std.fmt.allocPrint(alloc, "{d}", .{number}) catch oom() else "-";
+}
+
+fn groupText(alloc: std.mem.Allocator, value: []const u8) []const u8 {
+    var escaped: std.Io.Writer.Allocating = .init(alloc);
+    defer escaped.deinit();
+    const writer = &escaped.writer;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < value.len) {
+        const byte = value[i];
+        const len = std.unicode.utf8ByteSequenceLength(byte) catch 0;
+        const cp = if (len != 0 and len <= value.len - i)
+            std.unicode.utf8Decode(value[i..][0..len]) catch null
+        else
+            null;
+        const unicode_control = switch (cp orelse 0) {
+            0x0080...0x009f, 0x061c, 0x200e, 0x200f, 0x2028...0x202e, 0x2066...0x2069 => true,
+            else => false,
+        };
+        const next = i + if (cp != null) @as(usize, len) else 1;
+        if (!unicode_control and cp != null and !std.ascii.isControl(byte) and byte != '\\') {
+            i = next;
+            continue;
+        }
+        writer.writeAll(value[start..i]) catch oom();
+        if (unicode_control) {
+            writer.print("\\u{{{x:0>4}}}", .{cp.?}) catch oom();
+        } else if (byte == '\\') {
+            writer.writeAll("\\\\") catch oom();
+        } else {
+            writer.writeAll("\\x") catch oom();
+            writer.writeAll(&std.fmt.hex(byte)) catch oom();
+        }
+        i = next;
+        start = next;
+    }
+    if (start == 0) return value;
+    writer.writeAll(value[start..]) catch oom();
+    return escaped.toOwnedSlice() catch oom();
+}
+
+test "group text escapes row separators and terminal controls but preserves UTF-8" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    try std.testing.expectEqualStrings("café", groupText(alloc, "café"));
+    try std.testing.expectEqualStrings("member\\x09cell\\x0aforged\\x0d\\x1b[2J\\x7f\\\\", groupText(alloc, "member\tcell\nforged\r\x1b[2J\x7f\\"));
+    try std.testing.expectEqualStrings("café\\u{0085}\\u{2028}\\u{2029}雪", groupText(alloc, "café\u{85}\u{2028}\u{2029}雪"));
+    try std.testing.expectEqualStrings(
+        "\\u{061c}\\u{200e}\\u{200f}\\u{202a}\\u{202b}\\u{202c}\\u{202d}\\u{202e}\\u{2066}\\u{2067}\\u{2068}\\u{2069}",
+        groupText(alloc, "\u{61c}\u{200e}\u{200f}\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}\u{2066}\u{2067}\u{2068}\u{2069}"),
+    );
+    try std.testing.expectEqualStrings("\\xe2(\\xa1\\xff猫\\xe2\\x80", groupText(alloc, "\xe2(\xa1\xff猫\xe2\x80"));
 }
 
 fn writeGroupTable(comptime columns: usize, writer: *std.Io.Writer, headers: [columns][]const u8, rows: []const [columns][]const u8, tty: bool) !void {

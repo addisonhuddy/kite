@@ -9,6 +9,7 @@ pub const api_key = struct {
     pub const find_coordinator: i16 = 10;
     pub const offset_commit: i16 = 8;
     pub const offset_fetch: i16 = 9;
+    pub const describe_groups: i16 = 15;
     pub const list_groups: i16 = 16;
     pub const consumer_group_heartbeat: i16 = 68;
     pub const consumer_group_describe: i16 = 69;
@@ -33,6 +34,7 @@ pub const version = struct {
     pub const find_coordinator: i16 = 6;
     pub const offset_commit: i16 = 9;
     pub const offset_fetch: i16 = 9;
+    pub const describe_groups: i16 = 6;
     pub const list_groups: i16 = 5;
     pub const consumer_group_heartbeat: i16 = 1;
     pub const consumer_group_describe: i16 = 0;
@@ -583,6 +585,26 @@ test "describe group member assignment" {
     try std.testing.expectEqual(d.data.len, d.pos);
 }
 
+test "describe classic group decodes legacy consumer assignments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const response = "\x00\x00\x00\x00\x02\x00\x00\x00\x02g\x07Stable\x09consumer\x06range\x03" ++
+        "\x02m\x02i\x02c\x02h\x02x\x22" ++
+        "\x00\x03\x00\x00\x00\x02\x00\x01t\x00\x00\x00\x01\x00\x00\x00\x03" ++
+        "\x00\x01u\x00\x00\x00\x01\x00\x00\x00\x04\x00\x00\x00\x01x" ++
+        "\x00\x02n\x00\x02d\x02h\x01\x01\x00\x80\x00\x00\x00\x00\x00";
+    var d = Decoder.init(response);
+    const result = try describeClassicGroupResponse(&d, arena.allocator());
+    try std.testing.expectEqual(ErrorCode.none, result.code);
+    try std.testing.expectEqualStrings("Stable", result.state);
+    const expected: []const AssignedPartition = &.{
+        .{ .topic = "t", .partition = 3, .member_id = "m", .client_id = "c" },
+        .{ .topic = "u", .partition = 4, .member_id = "m", .client_id = "c" },
+    };
+    try std.testing.expectEqualDeep(expected, result.partitions);
+    try std.testing.expectEqual(d.data.len, d.pos);
+}
+
 test "heartbeat owned assignment golden bytes and decode" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -840,6 +862,58 @@ pub fn describeGroupResponse(d: *Decoder, alloc: std.mem.Allocator) ProtoError!D
         _ = try d.compactString();
         try describeAssignment(d, alloc, &rows, member, client_id);
         try describeAssignment(d, alloc, null, member, client_id);
+        try d.tagBuffer();
+    }
+    _ = try d.i32v();
+    try d.tagBuffer();
+    try d.tagBuffer();
+    return .{ .code = code, .message = message, .group = group, .state = state, .partitions = try rows.toOwnedSlice(alloc) };
+}
+
+fn classicAssignment(bytes: []const u8, alloc: std.mem.Allocator, rows: *std.ArrayList(AssignedPartition), member: []const u8, client_id: []const u8) ProtoError!void {
+    var d = Decoder.init(bytes);
+    _ = try d.i16v(); // ConsumerProtocolAssignment version; v0-v3 share the same layout.
+    const nt = try d.i32v();
+    if (nt < 0 or nt > (d.data.len - d.pos) / 6) return error.NegativeLength;
+    for (0..@as(usize, @intCast(nt))) |_| {
+        const len = try d.i16v();
+        if (len < 0) return error.NegativeLength;
+        const start = d.pos;
+        try d.skip(@intCast(len));
+        const topic = d.data[start..d.pos];
+        const np = try d.i32v();
+        if (np < 0 or np > (d.data.len - d.pos) / 4) return error.NegativeLength;
+        for (0..@as(usize, @intCast(np))) |_| {
+            const partition = try d.i32v();
+            try rows.append(alloc, .{ .topic = topic, .partition = partition, .member_id = member, .client_id = client_id });
+        }
+    }
+    const user_data_len = try d.i32v();
+    if (user_data_len < -1) return error.NegativeLength;
+    if (user_data_len >= 0) try d.skip(@intCast(user_data_len));
+}
+
+pub fn describeClassicGroupResponse(d: *Decoder, alloc: std.mem.Allocator) ProtoError!DescribedGroup {
+    _ = try d.i32v();
+    if (try d.compactArrayLen() != 1) return error.NegativeLength;
+    const code: ErrorCode = @enumFromInt(try d.i16v());
+    const message = try d.compactString();
+    const group = try groupString(d);
+    const state = try groupString(d);
+    const protocol_type = try groupString(d);
+    _ = try groupString(d);
+    var rows: std.ArrayList(AssignedPartition) = .empty;
+    errdefer rows.deinit(alloc);
+    const nm = try groupArrayLen(d);
+    for (0..nm) |_| {
+        const member = try groupString(d);
+        _ = try d.compactString();
+        const client_id = try groupString(d);
+        _ = try groupString(d);
+        _ = (try d.compactBytes()) orelse return error.NegativeLength;
+        const assignment = (try d.compactBytes()) orelse return error.NegativeLength;
+        if (code == .none and assignment.len != 0 and std.mem.eql(u8, protocol_type, "consumer"))
+            try classicAssignment(assignment, alloc, &rows, member, client_id);
         try d.tagBuffer();
     }
     _ = try d.i32v();

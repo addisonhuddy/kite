@@ -36,7 +36,20 @@ echo "== pull $IMAGE =="
 docker pull "$IMAGE" >/dev/null || fail "image-pull: cannot pull $IMAGE"
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
-docker run -d --rm --name "$NAME" -p 127.0.0.1:9092:9092 "$IMAGE" >/dev/null
+docker run -d --rm --name "$NAME" -p 127.0.0.1:9092:9092 -p 127.0.0.1:19092:19092 \
+    -e KAFKA_NODE_ID=1 -e KAFKA_PROCESS_ROLES=broker,controller \
+    -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+    -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093,OBSERVER://:19092 \
+    -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092,OBSERVER://localhost:19092 \
+    -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,OBSERVER:SASL_PLAINTEXT \
+    -e KAFKA_SASL_ENABLED_MECHANISMS=PLAIN \
+    -e 'KAFKA_LISTENER_NAME_OBSERVER_PLAIN_SASL_JAAS_CONFIG=org.apache.kafka.common.security.plain.PlainLoginModule required user_kite_observer="kite-e2e";' \
+    -e KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+    -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+    -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+    -e KAFKA_AUTHORIZER_CLASS_NAME=org.apache.kafka.metadata.authorizer.StandardAuthorizer \
+    -e KAFKA_SUPER_USERS=User:ANONYMOUS \
+    -e KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND=true "$IMAGE" >/dev/null
 
 echo "== wait for broker (up to ${TIMEOUT}s) =="
 deadline=$((SECONDS + TIMEOUT))

@@ -132,6 +132,11 @@ pub const Client = struct {
     /// Set once any transactional RPC reports PRODUCER_FENCED or INVALID_PRODUCER_EPOCH,
     /// so cleanup never sends KIP-360 InitProducerId after a replacement producer took over.
     txn_fenced: bool = false,
+    /// Specific fencing error code reported by the broker, if known.
+    txn_fence_code: ?protocol.ErrorCode = null,
+    /// Set once EndTxn(commit) has been dispatched on the wire for this transaction;
+    /// a subsequent fence cannot prove the transaction was aborted.
+    txn_commit_dispatched: bool = false,
     last_offset: ?i64 = null,
     /// Highest acked offset per partition (sorted by pidx), for the summary.
     last_offsets: std.ArrayListUnmanaged(PartOffset) = .empty,
@@ -953,12 +958,6 @@ pub const Client = struct {
         return groups.toOwnedSlice(alloc);
     }
 
-    pub fn listCoordinatorGroups(c: *Client, alloc: std.mem.Allocator, group: []const u8) ![]protocol.ListedGroup {
-        try c.requireVersion(protocol.api_key.list_groups, protocol.version.list_groups, "ListGroups");
-        const node = try c.findCoordinator(group);
-        return c.listGroupsOnNode(alloc, node, true);
-    }
-
     fn listGroupsOnNode(c: *Client, alloc: std.mem.Allocator, node: i32, all: bool) ![]protocol.ListedGroup {
         const conn = try c.connFor(node, connKey(node, 0xFFFF_FFFE));
         var retry: Retry = .{};
@@ -973,11 +972,28 @@ pub const Client = struct {
     }
 
     pub fn describeGroup(c: *Client, alloc: std.mem.Allocator, group: []const u8) !protocol.DescribedGroup {
+        if (c.checkVersion(protocol.api_key.consumer_group_describe, protocol.version.consumer_group_describe)) {
+            if (c.describeGroupOnCoordinator(alloc, group, false)) |result| {
+                return result;
+            } else |err| switch (err) {
+                error.GroupNotFound, error.ConsumerGroupDescribeUnsupported => {},
+                else => return err,
+            }
+        }
+        return c.describeGroupOnCoordinator(alloc, group, true);
+    }
+
+    fn describeGroupOnCoordinator(c: *Client, alloc: std.mem.Allocator, group: []const u8, comptime classic: bool) !protocol.DescribedGroup {
+        const key = if (classic) protocol.api_key.describe_groups else protocol.api_key.consumer_group_describe;
+        const ver = if (classic) protocol.version.describe_groups else protocol.version.consumer_group_describe;
+        const api = if (classic) "DescribeGroups" else "ConsumerGroupDescribe";
+        const decode = if (classic) protocol.describeClassicGroupResponse else protocol.describeGroupResponse;
         var retry: Retry = .{};
         while (true) {
-            const res = try c.groupRequest(alloc, group, protocol.api_key.consumer_group_describe, protocol.version.consumer_group_describe, "ConsumerGroupDescribe", group, protocol.describeGroupRequest);
+            const res = try c.groupRequest(alloc, group, key, ver, api, group, protocol.describeGroupRequest);
             var d = Decoder.init(res.resp.body);
-            const result = try protocol.describeGroupResponse(&d, alloc);
+            const result = try decode(&d, alloc);
+            if (!classic and result.code == .unsupported_version) return error.ConsumerGroupDescribeUnsupported;
             if (isCoordinatorError(result.code)) {
                 c.invalidateCoordinatorEndpoint(res.node, 0xFFFF_FFFE);
                 if (retry.pause(c)) continue;
@@ -1579,6 +1595,12 @@ pub const Client = struct {
         return code == .producer_fenced or code == .invalid_producer_epoch;
     }
 
+    fn recordFenced(c: *Client, code: protocol.ErrorCode) void {
+        if (!isFencedError(code)) return;
+        c.txn_fenced = true;
+        if (c.txn_fence_code == null) c.txn_fence_code = code;
+    }
+
     fn initProducerIdTxn(c: *Client, txn_id: []const u8, req_pid: i64, req_epoch: i16) !void {
         const InitArgs = struct { id: []const u8, timeout_ms: i32, pid: i64, epoch: i16 };
         const body = struct {
@@ -1625,7 +1647,7 @@ pub const Client = struct {
                 c.vlog("transactional producer '{s}': id={d} epoch={d}", .{ txn_id, pid, epoch });
                 return;
             }
-            if (isFencedError(code)) c.txn_fenced = true;
+            c.recordFenced(code);
             if (isCoordinatorError(code)) c.invalidateTxnCoordinator();
             if ((isCoordinatorError(code) or code.retriable()) and retry.pause(c)) continue;
             c.setErr("InitProducerId (txn '{s}'): {s}", .{ txn_id, code.name() });
@@ -1684,7 +1706,7 @@ pub const Client = struct {
                 } else if (res.code == .operation_not_attempted or res.code.retriable()) {
                     try next.append(c.alloc, res.partition);
                 } else {
-                    if (isFencedError(res.code)) c.txn_fenced = true;
+                    c.recordFenced(res.code);
                     c.setErr("AddPartitionsToTxn ({s}[{d}]): {s}", .{ topic, res.partition, res.code.name() });
                     return error.ProduceFailed;
                 }
@@ -1714,6 +1736,21 @@ pub const Client = struct {
         return c.txn_id != null and c.producer_inited and (c.txn_added_parts.count() > 0 or c.txn_add_attempted);
     }
 
+    fn clearTxnState(c: *Client) void {
+        c.txn_added_parts.clearRetainingCapacity();
+        c.txn_add_attempted = false;
+        c.txn_produce_unsettled_until = null;
+        c.txn_commit_dispatched = false;
+    }
+
+    fn noteFencedAbort(c: *const Client, txn_id: []const u8, code: ?protocol.ErrorCode) void {
+        const reason = if (code) |ec| ec.name() else "producer fenced";
+        std.debug.print(
+            "kite: transaction '{s}' aborted by Kafka: {s} (transaction.timeout.ms={d} exceeded, or another producer used this transactional ID)\n",
+            .{ txn_id, reason, c.cfg.transaction_timeout_ms },
+        );
+    }
+
     /// Commit (`commit=true`) or abort (`commit=false`) the active transaction.
     /// No-op when no partitions were registered (or attempted) in the transaction.
     /// When `commit` is true and `stop` becomes set before the first commit
@@ -1722,6 +1759,9 @@ pub const Client = struct {
     /// malformed reply or coordinator-movement error means the broker may have
     /// appended `PrepareCommit`: retries send only commit, and if `stop` is set
     /// it returns `error.CommitOutcomeUnknown` instead of switching to abort.
+    /// When `commit` is false and the producer has been fenced (broker timeout
+    /// or replacement producer) without a dispatched commit, Kafka is aborting
+    /// the transaction, so local state is cleared and the abort succeeds.
     pub fn endTransaction(c: *Client, commit: bool, stop: ?*const std.atomic.Value(bool)) !void {
         if (!c.hasActiveTxn()) return;
         const txn_id = c.txn_id.?;
@@ -1734,16 +1774,26 @@ pub const Client = struct {
         const previous_stop = c.txn_stop;
         c.txn_stop = commit_stop;
         defer c.txn_stop = previous_stop;
-        const unsettled = if (!commit) c.settleProduceBeforeAbort() else false;
-        if (!commit and c.txn_fenced) {
-            c.txn_added_parts.clearRetainingCapacity();
-            c.txn_add_attempted = false;
-            c.txn_produce_unsettled_until = null;
-            c.setErr("EndTxn (abort '{s}'): producer already fenced", .{txn_id});
+        if (!commit and c.txn_commit_dispatched) {
+            c.setErr("EndTxn (abort '{s}'): commit already dispatched (outcome unknown)", .{txn_id});
             return error.ProduceFailed;
         }
+        // Skip settling in-flight produces when already fenced: the coordinator's
+        // epoch bump and abort markers fence any stale requests on added partitions.
+        if (!commit and c.txn_fenced) {
+            c.clearTxnState();
+            c.noteFencedAbort(txn_id, c.txn_fence_code);
+            return;
+        }
+        const unsettled = if (!commit) c.settleProduceBeforeAbort() else false;
+        // Fires when settling in-flight Produce responses itself discovers the fence.
+        if (!commit and c.txn_fenced) {
+            c.clearTxnState();
+            c.noteFencedAbort(txn_id, c.txn_fence_code);
+            return;
+        }
         var retry: Retry = .{};
-        var commit_ambiguous = false;
+        var commit_ambiguous = commit and c.txn_commit_dispatched;
         while (true) {
             if (commit) if (stop) |s| if (s.load(.acquire)) {
                 return if (commit_ambiguous) error.CommitOutcomeUnknown else error.Interrupted;
@@ -1779,6 +1829,7 @@ pub const Client = struct {
             if (commit) if (stop) |s| if (s.load(.acquire)) {
                 return if (commit_ambiguous) error.CommitOutcomeUnknown else error.Interrupted;
             };
+            if (commit) c.txn_commit_dispatched = true;
             const resp = c.sendRequest(
                 conn,
                 protocol.api_key.end_txn,
@@ -1817,16 +1868,29 @@ pub const Client = struct {
                 return error.ProduceFailed;
             };
             if (code == .none) {
-                c.txn_added_parts.clearRetainingCapacity();
-                c.txn_add_attempted = false;
-                c.txn_produce_unsettled_until = null;
+                c.clearTxnState();
                 if (!commit and unsettled) {
                     std.debug.print("kite: warning: in-flight produce was unconfirmed before abort; if broker partition verification is disabled, check for hanging transactions with: kafka-transactions.sh --bootstrap-server <host:port> find-hanging --topic <topic> --partition <p> --max-transaction-timeout 0 (then abort --topic <topic> --partition <p> --start-offset <n>)\n", .{});
                 }
                 c.vlog("transaction '{s}' {s}", .{ txn_id, if (commit) "committed" else "aborted" });
                 return;
             }
-            if (isFencedError(code)) c.txn_fenced = true;
+            if (isFencedError(code)) {
+                c.recordFenced(code);
+                if (!commit) {
+                    c.clearTxnState();
+                    c.noteFencedAbort(txn_id, code);
+                    return;
+                }
+                if (!commit_ambiguous) {
+                    c.clearTxnState();
+                    c.setErr(
+                        "EndTxn (commit '{s}'): {s}; transaction aborted by Kafka (transaction.timeout.ms={d} exceeded, or another producer used this transactional ID)",
+                        .{ txn_id, code.name(), c.cfg.transaction_timeout_ms },
+                    );
+                    return error.ProduceFailed;
+                }
+            }
             if (!commit and c.txn_added_parts.count() == 0 and code == .invalid_txn_state) {
                 // AddPartitionsToTxn was attempted but never opened a transaction on the broker.
                 c.txn_add_attempted = false;
@@ -1839,6 +1903,7 @@ pub const Client = struct {
                 if (retry.pauseUnlessStopped(c, commit_stop)) continue;
                 if (commit_stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
             } else if (commit and code == .transaction_abortable) {
+                if (!commit_ambiguous) c.txn_commit_dispatched = false;
                 _ = c.abortTransactionBestEffort();
             }
             if (commit_ambiguous)
@@ -1850,7 +1915,8 @@ pub const Client = struct {
     }
 
     /// Best-effort abort for fatal/interrupt paths; preserves any prior err_ctx.
-    /// Returns true if no transaction was active or the abort succeeded.
+    /// Returns true if no transaction was active or the abort is confirmed
+    /// (including when the broker already fenced the producer and aborted it).
     pub fn abortTransactionBestEffort(c: *Client) bool {
         if (!c.hasActiveTxn()) return true;
         const saved_err = c.err_ctx;
@@ -1862,9 +1928,7 @@ pub const Client = struct {
                 std.debug.print("kite: warning: transaction abort outcome unknown ({s}); verify with: kafka-transactions.sh --bootstrap-server <host:port> describe --transactional-id '{s}'\n", .{ detail, txn_id })
             else
                 std.debug.print("kite: warning: transaction abort outcome unknown; verify with: kafka-transactions.sh --bootstrap-server <host:port> describe --transactional-id '{s}'\n", .{txn_id});
-            c.txn_added_parts.clearRetainingCapacity();
-            c.txn_add_attempted = false;
-            c.txn_produce_unsettled_until = null;
+            c.clearTxnState();
             return false;
         };
         return true;
@@ -2454,7 +2518,7 @@ pub const Client = struct {
                 const message = try d.compactString();
                 try d.tagBuffer(); // partition tags
                 try results.put(c.alloc, pidx, .{ .code = code, .message = message });
-                if (isFencedError(code)) c.txn_fenced = true;
+                c.recordFenced(code);
                 if (code == .none) {
                     const count = if (outstanding) |o| blk: {
                         for (o.pidx, o.counts) |op, oc| if (op == pidx) break :blk oc;
@@ -2482,7 +2546,7 @@ pub const Client = struct {
     }
 };
 
-test "classic fallback lists only the cached coordinator for results empty and errors" {
+test "classic describe uses the cached coordinator when consumer describe is unavailable" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     var env: std.process.Environ.Map = .init(alloc);
@@ -2492,7 +2556,7 @@ test "classic fallback lists only the cached coordinator for results empty and e
     defer c.deinit();
     c.coordinator_group = try alloc.dupe(u8, "g");
     c.coordinator_node = 2;
-    try c.api_ranges.put(alloc, protocol.api_key.list_groups, .{ .min = 0, .max = 5 });
+    try c.api_ranges.put(alloc, protocol.api_key.describe_groups, .{ .min = 0, .max = 6 });
     try c.brokers.put(alloc, 3, .{ .host = try alloc.dupe(u8, "unreachable.invalid"), .port = 1 });
     const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try addr.listen(io, .{});
@@ -2503,33 +2567,53 @@ test "classic fallback lists only the cached coordinator for results empty and e
     defer peer.close(io);
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    for (0..3) |case| {
-        var response = Encoder.init(alloc);
-        defer response.deinit();
-        try response.i32v(protocol.lastCorrelationId() + 1);
-        try response.tagBuffer();
-        try response.i32v(0);
-        try response.i16v(if (case == 2) 30 else 0);
-        try response.compactArrayLen(if (case == 0) 1 else 0);
-        if (case == 0) {
-            for ([_][]const u8{ "g", "consumer", "Empty", "classic" }) |field| try response.compactString(field);
-            try response.tagBuffer();
-        }
-        try response.tagBuffer();
+    for (0..4) |case| {
+        const unsupported = case == 3;
+        const next_corr = protocol.lastCorrelationId() + 1;
         var buffer: [128]u8 = undefined;
         var writer = peer.writer(io, &buffer);
+        if (unsupported) {
+            try c.api_ranges.put(alloc, protocol.api_key.consumer_group_describe, .{ .min = 0, .max = 0 });
+            const body = "\x00\x00\x00\x00\x02\x00\x23\x00\x02g\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x01\x80\x00\x00\x00\x00\x00";
+            var header: [8]u8 = undefined;
+            std.mem.writeInt(u32, header[0..4], 5 + body.len, .big);
+            std.mem.writeInt(i32, header[4..8], next_corr, .big);
+            try writer.interface.writeAll(&header);
+            try writer.interface.writeByte(0);
+            try writer.interface.writeAll(body);
+        }
+        var response = Encoder.init(alloc);
+        defer response.deinit();
+        try response.i32v(next_corr + @as(i32, @intFromBool(unsupported)));
+        try response.tagBuffer();
+        try response.i32v(0);
+        try response.compactArrayLen(1);
+        try response.i16v(switch (case) {
+            0, 3 => 0,
+            1 => @intFromEnum(protocol.ErrorCode.group_id_not_found),
+            else => @intFromEnum(protocol.ErrorCode.group_authorization_failed),
+        });
+        try response.compactString(null);
+        for ([_][]const u8{ "g", if (case == 0 or unsupported) "Empty" else "", "", "" }) |field| try response.compactString(field);
+        try response.compactArrayLen(0);
+        try response.i32v(std.math.minInt(i32));
+        try response.tagBuffer();
+        try response.tagBuffer();
         var length: [4]u8 = undefined;
         std.mem.writeInt(u32, &length, @intCast(response.written().len), .big);
         try writer.interface.writeAll(&length);
         try writer.interface.writeAll(response.written());
         try writer.interface.flush();
-        if (case == 2) {
-            try std.testing.expectError(error.GroupFailed, c.listCoordinatorGroups(arena.allocator(), "g"));
-        } else {
-            const groups = try c.listCoordinatorGroups(arena.allocator(), "g");
-            try std.testing.expectEqual(@as(usize, if (case == 0) 1 else 0), groups.len);
-            if (case == 0) try std.testing.expectEqualStrings("classic", groups[0].group_type);
+        switch (case) {
+            0, 3 => {
+                const group = try c.describeGroup(arena.allocator(), "g");
+                try std.testing.expectEqualStrings("Empty", group.state);
+                try std.testing.expectEqual(@as(usize, 0), group.partitions.len);
+            },
+            1 => try std.testing.expectError(error.GroupNotFound, c.describeGroup(arena.allocator(), "g")),
+            else => try std.testing.expectError(error.GroupFailed, c.describeGroup(arena.allocator(), "g")),
         }
+        try std.testing.expectEqual(next_corr + @as(i32, @intFromBool(unsupported)), protocol.lastCorrelationId());
         try std.testing.expect(c.control == null);
         try std.testing.expectEqual(@as(u32, 1), c.conns.count());
     }
@@ -2754,4 +2838,181 @@ test "group APIs check versions lazily and coordinator cache is group scoped" {
     try std.testing.expect(Client.isCoordinatorError(.not_coordinator));
     try std.testing.expect(Client.isCoordinatorError(.coordinator_not_available));
     try std.testing.expect(!Client.isCoordinatorError(.group_authorization_failed));
+}
+
+test "abort treats fenced producer as already aborted by broker while commit still fails" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var env: std.process.Environ.Map = .init(alloc);
+    defer env.deinit();
+    const cfg: config.Config = .{ .bootstrap_servers = &.{} };
+    var c = Client.init(alloc, io, &env, &cfg);
+    defer c.deinit();
+
+    // Case 1: already fenced (e.g. Produce returned INVALID_PRODUCER_EPOCH after broker timeout).
+    c.txn_id = "tx-fenced";
+    c.producer_inited = true;
+    c.producer_id = 42;
+    c.producer_epoch = 0;
+    c.txn_add_attempted = true;
+    try c.txn_added_parts.put(alloc, 0, {});
+    c.txn_fenced = true;
+    try std.testing.expect(c.abortTransactionBestEffort());
+    try std.testing.expect(!c.hasActiveTxn());
+    try std.testing.expectEqual(@as(u32, 0), c.txn_added_parts.count());
+
+    // Set up a mock transaction coordinator socket for EndTxn responses.
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+    const conn = try transport.connect(io, alloc, &env, "127.0.0.1", server.socket.address.getPort(), null, null);
+    try c.conns.put(alloc, Client.connKey(1, Client.txn_coord_slot), conn);
+    c.txn_coordinator_node = 1;
+    const peer = try server.accept(io);
+    defer peer.close(io);
+
+    const writeEndTxnRespWithCorr = struct {
+        fn send(p: std.Io.net.Stream, a: std.mem.Allocator, corr: i32, code: protocol.ErrorCode) !void {
+            var body = Encoder.init(a);
+            defer body.deinit();
+            try body.i32v(corr);
+            try body.tagBuffer();
+            try body.i32v(0); // throttle_time_ms
+            try body.i16v(@intFromEnum(code));
+            try body.tagBuffer();
+            var frame = Encoder.init(a);
+            defer frame.deinit();
+            try frame.i32v(@intCast(body.written().len));
+            try frame.raw(body.written());
+            var wbuf: [128]u8 = undefined;
+            var w = p.writer(std.testing.io, &wbuf);
+            try w.interface.writeAll(frame.written());
+            try w.interface.flush();
+        }
+    }.send;
+    const writeEndTxnResp = struct {
+        fn send(p: std.Io.net.Stream, a: std.mem.Allocator, code: protocol.ErrorCode) !void {
+            try writeEndTxnRespWithCorr(p, a, protocol.lastCorrelationId() + 1, code);
+        }
+    }.send;
+
+    // Case 2: EndTxn(abort) returns PRODUCER_FENCED -> known aborted, no error.
+    c.txn_fenced = false;
+    c.txn_add_attempted = true;
+    try c.txn_added_parts.put(alloc, 0, {});
+    try writeEndTxnResp(peer, alloc, .producer_fenced);
+    try std.testing.expect(c.abortTransactionBestEffort());
+    try std.testing.expect(c.txn_fenced);
+    try std.testing.expect(!c.hasActiveTxn());
+
+    // Case 3: EndTxn(abort) returns INVALID_PRODUCER_EPOCH -> known aborted, no error.
+    c.txn_fenced = false;
+    c.txn_add_attempted = true;
+    try c.txn_added_parts.put(alloc, 0, {});
+    try writeEndTxnResp(peer, alloc, .invalid_producer_epoch);
+    try std.testing.expect(c.abortTransactionBestEffort());
+    try std.testing.expect(c.txn_fenced);
+    try std.testing.expect(!c.hasActiveTxn());
+
+    // Case 4a: Unambiguous first EndTxn(commit) returns PRODUCER_FENCED ->
+    // fails with "aborted by Kafka" context and clears active txn state.
+    c.txn_fenced = false;
+    c.txn_fence_code = null;
+    c.txn_add_attempted = true;
+    try c.txn_added_parts.put(alloc, 0, {});
+    try writeEndTxnResp(peer, alloc, .producer_fenced);
+    try std.testing.expectError(error.ProduceFailed, c.endTransaction(true, null));
+    try std.testing.expect(std.mem.indexOf(u8, c.errDetail(), "aborted by Kafka") != null);
+    try std.testing.expect(c.txn_fenced);
+    try std.testing.expect(!c.txn_commit_dispatched);
+    try std.testing.expect(!c.hasActiveTxn());
+    try std.testing.expect(c.abortTransactionBestEffort());
+
+    // Case 4b: Ambiguous retried EndTxn(commit) (first attempt retriable, retry
+    // returns PRODUCER_FENCED) -> fails with "outcome unknown", keeps
+    // txn_commit_dispatched set, and a subsequent abort must not claim aborted.
+    c.txn_fenced = false;
+    c.txn_fence_code = null;
+    c.txn_add_attempted = true;
+    try c.txn_added_parts.put(alloc, 0, {});
+    const base_corr = protocol.lastCorrelationId();
+    try writeEndTxnRespWithCorr(peer, alloc, base_corr + 1, .concurrent_transactions);
+    try writeEndTxnRespWithCorr(peer, alloc, base_corr + 2, .producer_fenced);
+    try std.testing.expectError(error.ProduceFailed, c.endTransaction(true, null));
+    try std.testing.expect(std.mem.indexOf(u8, c.errDetail(), "outcome unknown") != null);
+    try std.testing.expect(c.txn_fenced);
+    try std.testing.expect(c.txn_commit_dispatched);
+    try std.testing.expectError(error.ProduceFailed, c.endTransaction(false, null));
+    try std.testing.expect(!c.abortTransactionBestEffort());
+    try std.testing.expect(!c.hasActiveTxn());
+
+    // Case 5: EndTxn(abort) returns a non-fenced fatal error -> still reports failure.
+    c.txn_fenced = false;
+    c.txn_fence_code = null;
+    c.txn_add_attempted = true;
+    try c.txn_added_parts.put(alloc, 0, {});
+    try writeEndTxnResp(peer, alloc, .transactional_id_authorization_failed);
+    try std.testing.expectError(error.ProduceFailed, c.endTransaction(false, null));
+    c.clearTxnState();
+
+    // Case 6: Fencing first discovered while settleProduceBeforeAbort() drains
+    // an in-flight ProduceResponse skips EndTxn(abort) and succeeds cleanly.
+    var prod_server = try addr.listen(io, .{});
+    defer prod_server.deinit(io);
+    const prod_conn = try transport.connect(io, alloc, &env, "127.0.0.1", prod_server.socket.address.getPort(), null, null);
+    const prod_key = Client.connKey(2, 0);
+    try c.conns.put(alloc, prod_key, prod_conn);
+    const prod_peer = try prod_server.accept(io);
+    defer prod_peer.close(io);
+
+    const pidx_slice = try alloc.alloc(i32, 1);
+    pidx_slice[0] = 0;
+    try c.outstanding.append(alloc, .{
+        .ckey = prod_key,
+        .corr = 77,
+        .pidx = pidx_slice,
+        .batches = try alloc.alloc([]const u8, 0),
+        .counts = try alloc.alloc(u32, 0),
+        .bytes = 0,
+        .sent = std.Io.Timestamp.now(io, .awake),
+    });
+
+    // Write a ProduceResponse v11 with INVALID_PRODUCER_EPOCH for partition 0.
+    var pbody = Encoder.init(alloc);
+    defer pbody.deinit();
+    try pbody.i32v(77); // correlation_id
+    try pbody.tagBuffer(); // response header v1 tags
+    try pbody.compactArrayLen(1); // responses (1 topic)
+    try pbody.compactString("t"); // topic name
+    try pbody.compactArrayLen(1); // partition_responses (1 partition)
+    try pbody.i32v(0); // partition index
+    try pbody.i16v(@intFromEnum(protocol.ErrorCode.invalid_producer_epoch));
+    try pbody.i64v(-1); // base_offset
+    try pbody.i64v(-1); // log_append_time_ms
+    try pbody.i64v(-1); // log_start_offset
+    try pbody.compactArrayLen(0); // record_errors
+    try pbody.compactString(null); // error_message
+    try pbody.tagBuffer(); // partition tags
+    try pbody.tagBuffer(); // topic tags
+    try pbody.i32v(0); // throttle_time_ms
+    try pbody.tagBuffer(); // response tags
+    var pframe = Encoder.init(alloc);
+    defer pframe.deinit();
+    try pframe.i32v(@intCast(pbody.written().len));
+    try pframe.raw(pbody.written());
+    var pwbuf: [256]u8 = undefined;
+    var pw = prod_peer.writer(io, &pwbuf);
+    try pw.interface.writeAll(pframe.written());
+    try pw.interface.flush();
+
+    // Clear coordinator cache so any attempt to send EndTxn(abort) would fail.
+    c.txn_coordinator_node = -1;
+    c.txn_fenced = false;
+    c.txn_fence_code = null;
+    c.txn_add_attempted = true;
+    try c.txn_added_parts.put(alloc, 0, {});
+    try std.testing.expect(c.abortTransactionBestEffort());
+    try std.testing.expect(c.txn_fenced);
+    try std.testing.expectEqual(@as(?protocol.ErrorCode, .invalid_producer_epoch), c.txn_fence_code);
+    try std.testing.expect(!c.hasActiveTxn());
 }

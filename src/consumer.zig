@@ -407,7 +407,6 @@ const GroupSession = struct {
     fn nextHeartbeatDue(ctx: *anyopaque) ?std.Io.Timestamp {
         const s: *GroupSession = @ptrCast(@alignCast(ctx));
         if (s.epoch <= 0 or s.hook_paused or s.pending_beat != null or s.pending_error != null) return null;
-        if (s.heartbeat_due) return s.last_heartbeat;
         return s.last_heartbeat.addDuration(.fromMilliseconds(@intCast(s.interval)));
     }
 

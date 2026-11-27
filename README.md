@@ -356,15 +356,20 @@ kite --version                            Print the version.
 
 For transactional produce, kite requires broker-side transaction partition
 verification (`transaction.partition.verification.enable=true`, enabled by
-default in Apache Kafka 3.6+). Before aborting, kite settles in-flight Produce
-requests up to their request deadline and then sends an epoch-checked
-`EndTxn(abort)` so a fenced process cannot affect a replacement producer. If an
-in-flight Produce cannot be confirmed within its deadline, kite closes that
-connection, aborts the transaction, and warns on stderr with the partition-level
-recovery commands (`kafka-transactions.sh --bootstrap-server <host:port>
-find-hanging --topic <topic> --partition <p> --max-transaction-timeout 0`
-followed by `abort --topic <topic> --partition <p> --start-offset <n>`) in case
-partition verification is disabled on the broker.
+default in Apache Kafka 3.6+). Before aborting, unless the producer has already
+been fenced, kite settles in-flight Produce requests up to their request
+deadline and then sends an epoch-checked `EndTxn(abort)` so a fenced process
+cannot affect a replacement producer. If the broker has already fenced the
+producer (`PRODUCER_FENCED` or `INVALID_PRODUCER_EPOCH`, e.g. after
+`transaction.timeout.ms` expires or another producer takes over the same
+transactional ID), Kafka is aborting the transaction and kite reports the
+transaction as aborted by Kafka instead of reporting an unknown abort outcome.
+If an in-flight Produce cannot be confirmed within its deadline, kite closes
+that connection, aborts the transaction, and warns on stderr with the
+partition-level recovery commands (`kafka-transactions.sh --bootstrap-server
+<host:port> find-hanging --topic <topic> --partition <p>
+--max-transaction-timeout 0` followed by `abort --topic <topic> --partition <p>
+--start-offset <n>`) in case partition verification is disabled on the broker.
 
 ## Topics
 
@@ -412,12 +417,18 @@ Missing commits and lag appear as `-` (JSON `null`); unassigned partitions have
 empty member/client IDs in JSON. These commands are read-only, accept common
 connection flags and `@CLUSTER`, and do not change consumer offsets. Lag is a
 snapshot: producing or committing concurrently can change it during the query.
-Classic groups show offsets and lag without member/client IDs. Deleted topics
-or partitions retain committed offsets but show unavailable end/lag (`-`, or
-JSON null). Negative lag after truncation is clamped to zero with a warning.
+Active classic groups show member and client IDs for assigned partitions, even
+without commits. Deleted topics or partitions retain committed offsets but show
+unavailable end/lag (`-`, or JSON null). Negative lag after truncation is clamped
+to zero with a warning.
 Lag uses the high watermark (`read_uncommitted`), like the stock tools, not
-the last stable offset used by `read_committed` consumers. Group listing warns
-and returns partial results when some brokers are unreachable.
+the last stable offset used by `read_committed` consumers. If an active classic
+member is assigned a topic the caller cannot describe, `group describe` skips
+the topic, warns on stderr, and exits successfully with the remaining rows on
+stdout, including with `--json`. Kafka can silently omit denied topics from
+committed offset results. For an inactive group, `--json` can therefore exit
+successfully with no output and no warning. Group listing warns and returns
+partial results when some brokers are unreachable.
 
 `consume -g GROUP` (or `--group GROUP`) joins a Kafka 4.0 consumer-protocol
 group and shares partitions with its other members. It resumes committed
