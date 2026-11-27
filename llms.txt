@@ -71,6 +71,7 @@ kite consume [OPTIONS] [@CLUSTER] TOPIC   records on stdout
 --json                          UTF-8 JSON per record; invalid UTF-8 key/value/header bytes use sibling *_b64 fields (standard padded base64), safe for jq
 Default when stdout is a pipe or file: stop after 5 s idle, so scripts never hang.
 Default isolation, also with -g: read committed (stop at the last stable offset and skip aborted transactions). --read-uncommitted reads to the high watermark. Neither mode prints transaction markers.
+An open transaction can hold records behind the last stable offset even with -B: consume may exit 0 with no records and an (idle timeout) summary (suppressed by -q). Use --follow instead of --idle to keep waiting for the transaction to resolve.
 
 ## Contract
 

@@ -599,8 +599,12 @@ For a finite read in automation, give both bounds
 of silence, whichever comes first. Neither flag is an overall deadline; if
 you need one, wrap the command in `timeout`.
 
-An idle-bounded read is not a guarantee of a complete topic snapshot. If the
-downstream process closes the pipe (`kite consume -f events | head`), kite exits
+An idle-bounded read is not a guarantee of a complete topic snapshot. In
+read-committed mode, an open transaction can hold records at or beyond the
+last stable offset (LSO). Even with `-B`, consume can exit 0 with no records
+and an `(idle timeout)` summary (no summary with `-q`). Use `--follow`
+instead of an idle bound if you need to wait for the transaction to resolve.
+If the downstream process closes the pipe (`kite consume -f events | head`), kite exits
 quietly with status 0 instead of dying from SIGPIPE.
 
 ## Input/output format and CSV
@@ -1025,9 +1029,10 @@ First run against a local broker:
 - **Produce fails with `not authorized` or a topic-creation error:** the
   broker disables automatic topic creation or the principal lacks the ACL;
   create the topic with your admin tooling and retry.
-- **Consume prints nothing and exits after the idle timeout:** `-B` was
-  omitted, so the read started at the latest offset, after the record you
-  produced. Add `-B` (or produce again while the consumer is running).
+- **Consume prints nothing and exits after the idle timeout:** Without `-B`,
+  the read may have started after your record. Add `-B` to read existing
+  records. If an open transaction is holding them behind the last stable
+  offset, even `-B` can return nothing; use `--follow` to wait for resolution.
 
 General:
 

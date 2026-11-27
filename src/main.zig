@@ -830,8 +830,12 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
             std.debug.print("{d} record(s) consumed from '{s}'{s}\n", .{ consumed, topic_name, old_reason });
         stats.finish();
     }
-    if (consumed == 0 and consume.start == .latest and !stats.live and !quiet)
-        note("no records arrived; consume starts at the latest offset, use -B to read existing records", .{});
+    if (consumed == 0 and !stats.live and !quiet) {
+        if (consume.start == .latest)
+            note("no records arrived; consume starts at the latest offset, use -B to read existing records", .{});
+        if (std.mem.eql(u8, reason, "idle timeout") and consume.isolation == .read_committed)
+            note("open transactions can hide records even with -B; use --follow to wait for them to resolve", .{});
+    }
     cli.deinit();
     std.process.exit(if (stopped_by_signal) 130 else 0);
 }
