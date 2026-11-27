@@ -958,6 +958,7 @@ pub const Heartbeat = struct {
         topics: []const []const u8,
         assignment: []const TopicAssignment,
     } = null,
+    hedge_ms: ?u64 = null,
 
     pub fn forRetry(req: Heartbeat) Heartbeat {
         var full = req;

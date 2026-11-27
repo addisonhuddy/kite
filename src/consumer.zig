@@ -184,7 +184,12 @@ fn heartbeatSlack(interval: u64) u64 {
 
 fn heartbeatTimeoutMs(interval: u64) u64 {
     if (interval >= group_rpc_min_timeout_ms) return interval -| heartbeatSlack(interval);
-    return @max(heartbeat_min_timeout_ms, interval);
+    return group_rpc_min_timeout_ms;
+}
+
+fn heartbeatHedgeMs(interval: u64) ?u64 {
+    if (interval >= group_rpc_min_timeout_ms) return null;
+    return @max(heartbeat_min_timeout_ms, interval -| @min(20, interval / 5));
 }
 
 const GroupSession = struct {
@@ -401,7 +406,8 @@ const GroupSession = struct {
 
     fn nextHeartbeatDue(ctx: *anyopaque) ?std.Io.Timestamp {
         const s: *GroupSession = @ptrCast(@alignCast(ctx));
-        if (s.epoch <= 0 or s.heartbeat_due or s.hook_paused or s.pending_beat != null or s.pending_error != null) return null;
+        if (s.epoch <= 0 or s.hook_paused or s.pending_beat != null or s.pending_error != null) return null;
+        if (s.heartbeat_due) return s.last_heartbeat;
         return s.last_heartbeat.addDuration(.fromMilliseconds(@intCast(s.interval)));
     }
 
@@ -442,7 +448,7 @@ const GroupSession = struct {
                 return true;
             };
             for (s.owned.items, parts) |cursor, *p| p.* = cursor.pidx;
-            const full = attempts > 0 or s.hook_timeouts > 0;
+            const full = attempts > 0 or s.hook_timeouts > 0 or s.heartbeat_due;
             const res = s.c.heartbeat(alloc, .{
                 .group = s.opts.group.?,
                 .member_id = &s.member,
@@ -455,6 +461,7 @@ const GroupSession = struct {
                     .topics = &.{s.opts.topic},
                     .assignment = if (parts.len == 0) &.{} else &.{.{ .topic_id = s.c.topic_id, .partitions = parts }},
                 },
+                .hedge_ms = heartbeatHedgeMs(s.interval),
             });
             if (res) |hb| {
                 s.hook_timeouts = 0;
@@ -462,6 +469,7 @@ const GroupSession = struct {
                     s.epoch = hb.member_epoch;
                     s.interval = @intCast(@max(1, hb.heartbeat_interval_ms));
                     s.last_heartbeat = sent;
+                    s.heartbeat_due = false;
                     s.heartbeatSucceeded();
                     return false;
                 }
@@ -550,6 +558,7 @@ const GroupSession = struct {
                 .topics = &.{s.opts.topic},
                 .assignment = if (parts.len == 0) &.{} else &.{.{ .topic_id = s.c.topic_id, .partitions = parts }},
             },
+            .hedge_ms = heartbeatHedgeMs(s.interval),
         });
         try s.applyHeartbeat(arena, result);
     }
@@ -1137,9 +1146,15 @@ test "short heartbeat intervals separate liveness and data budgets and schedule 
 
     try std.testing.expectEqual(@as(u64, 4900), heartbeatTimeoutMs(5000));
     try std.testing.expectEqual(@as(u64, 900), heartbeatTimeoutMs(1000));
-    try std.testing.expectEqual(@as(u64, 100), heartbeatTimeoutMs(100));
-    try std.testing.expectEqual(@as(u64, 50), heartbeatTimeoutMs(2));
-    try std.testing.expectEqual(@as(u64, 50), heartbeatTimeoutMs(1));
+    try std.testing.expectEqual(@as(u64, 1000), heartbeatTimeoutMs(100));
+    try std.testing.expectEqual(@as(u64, 1000), heartbeatTimeoutMs(2));
+    try std.testing.expectEqual(@as(u64, 1000), heartbeatTimeoutMs(1));
+
+    try std.testing.expectEqual(@as(?u64, null), heartbeatHedgeMs(5000));
+    try std.testing.expectEqual(@as(?u64, null), heartbeatHedgeMs(1000));
+    try std.testing.expectEqual(@as(?u64, 80), heartbeatHedgeMs(100));
+    try std.testing.expectEqual(@as(?u64, 50), heartbeatHedgeMs(2));
+    try std.testing.expectEqual(@as(?u64, 50), heartbeatHedgeMs(1));
 
     const alloc = std.testing.allocator;
     var env: std.process.Environ.Map = .init(alloc);

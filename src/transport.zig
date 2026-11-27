@@ -413,6 +413,34 @@ pub fn setTimeout(c: *Conn, ms: u64) void {
     c.timeout_ms = ms;
 }
 
+/// Wait until `c` has buffered or socket-readable bytes, or `timeout_ms` elapses.
+pub fn waitReadable(c: *Conn, timeout_ms: u64) bool {
+    if (c.closed) return true;
+    if (c.input.seek < c.input.end or c.net_reader.interface.seek < c.net_reader.interface.end) return true;
+    var fds = [_]std.posix.pollfd{.{ .fd = c.net_reader.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    const rc = std.posix.poll(&fds, @intCast(@min(timeout_ms, std.math.maxInt(i32)))) catch return true;
+    return rc > 0;
+}
+
+/// Wait until either `a` or `b` has buffered or socket-readable bytes, or `deadline` expires.
+/// Returns 0 if `a` is ready, 1 if `b` is ready, or null on timeout.
+pub fn waitEitherReadable(io: std.Io, a: *Conn, b: *Conn, deadline: std.Io.Timestamp) ?u1 {
+    if (a.closed or a.input.seek < a.input.end or a.net_reader.interface.seek < a.net_reader.interface.end) return 0;
+    if (b.closed or b.input.seek < b.input.end or b.net_reader.interface.seek < b.net_reader.interface.end) return 1;
+    while (true) {
+        const rem = std.Io.Timestamp.now(io, .awake).durationTo(deadline).toMilliseconds();
+        if (rem <= 0) return null;
+        var fds = [_]std.posix.pollfd{
+            .{ .fd = a.net_reader.fd, .events = std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = b.net_reader.fd, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+        const rc = std.posix.poll(&fds, @intCast(@min(@as(u64, @intCast(rem)), std.math.maxInt(i32)))) catch return 0;
+        if (rc == 0) return null;
+        if (fds[0].revents != 0) return 0;
+        if (fds[1].revents != 0) return 1;
+    }
+}
+
 /// Send a framed request (4-byte big-endian length + payload).
 pub fn send(c: *Conn, payload: []const u8) TransportError!void {
     return sendv(c, &.{payload});
