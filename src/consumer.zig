@@ -1227,6 +1227,7 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         const elapsed = session.last_heartbeat.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds();
         if (session.heartbeat_due or session.epoch == 0 or elapsed >= session.interval) {
             session.beat(&arena) catch |err| {
+                if (err == error.WaitHookAborted) continue;
                 if (!session.recoverEpoch(err)) {
                     exit_error = err;
                     break;
