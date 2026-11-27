@@ -594,7 +594,33 @@ try:
 finally:
     proxy8.close()
 
-wait_complete_abort(txn8)
+def wait_empty_bumped_epoch(txn_id, timeout=15.0):
+    deadline = time.monotonic() + timeout
+    last = ""
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            res = subprocess.run(
+                [
+                    "docker", "exec", container,
+                    "/opt/kafka/bin/kafka-transactions.sh",
+                    "--bootstrap-server", "localhost:9092",
+                    "describe", "--transactional-id", txn_id,
+                ],
+                text=True, capture_output=True, timeout=remaining,
+            )
+        except subprocess.TimeoutExpired:
+            break
+        last = res.stdout + res.stderr
+        if res.returncode == 0:
+            for line in res.stdout.splitlines()[1:]:
+                cols = line.split()
+                if len(cols) >= 5 and cols[1] == txn_id and cols[4] == "Empty" and int(cols[3]) >= 1:
+                    return
+        time.sleep(max(0, min(0.2, deadline - time.monotonic())))
+    raise AssertionError(f"{txn_id} did not reach Empty with epoch >= 1 within {timeout}s:\n{last}")
+
+
+wait_empty_bumped_epoch(txn8)
 # Now release the straggling Produce frame directly to Kafka AFTER CompleteAbort.
 late_conn = socket.create_connection((BROKER_HOST, BROKER_PORT), timeout=15)
 try:
