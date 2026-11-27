@@ -689,9 +689,10 @@ A null `value` (or `value_b64`) produces a Kafka tombstone. Consume emits
 tombstones as `"value":null` and empty values as `"value":""`. A string `value`
 is sent as its decoded bytes; objects, arrays, numbers, and booleans are sent
 verbatim, so JSON payloads can be embedded without double encoding. Base64
-fields accept either `null` for an absent key or value, or a string containing
-standard padded RFC 4648 Base64 for bytes. `headers` may be an object or an
-array of `{"key","value"}`; array entries also accept `value_b64`.
+fields accept JSON `null` for a Kafka null key, record value, or header value.
+For bytes, use a string containing standard padded RFC 4648 Base64.
+`headers` may be an object or an array of `{"key","value"}`; array entries
+also accept `value_b64`.
 `-H` headers are added to every record. Malformed lines fail with
 `kite: line N: ...`. `--json` and `--csv` are mutually exclusive.
 

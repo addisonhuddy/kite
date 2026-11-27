@@ -217,20 +217,31 @@ pub const Client = struct {
             ),
             else => c.setErr("produce to {s}[{d}]: {s}", .{ topic, pidx, result.code.name() }),
         }
-        if (result.message) |message| c.appendProduceErr(": ", message);
-        if (result.code == .invalid_record)
-            c.appendProduceErr("; ", "if the topic is compacted, records need a non-null key");
+        if (result.message) |message| {
+            const hint = if (result.code == .invalid_record and std.ascii.findIgnoreCase(message, "without key") != null)
+                "; if the topic is compacted, records need a non-null key"
+            else
+                "";
+            c.appendProduceErr(message, hint);
+        }
     }
 
-    fn appendProduceErr(c: *Client, separator: []const u8, detail: []const u8) void {
+    fn appendProduceErr(c: *Client, message: []const u8, hint: []const u8) void {
+        const separator = ": ";
         const suffix = c.err_ctx[c.errDetail().len..];
-        if (detail.len == 0 or suffix.len <= separator.len + 1) return;
-        const len = @min(detail.len, suffix.len - separator.len - 1);
-        @memcpy(suffix[0..separator.len], separator);
-        for (suffix[separator.len..][0..len], detail[0..len]) |*out, byte| {
-            out.* = if (std.ascii.isPrint(byte)) byte else '?';
+        if (suffix.len <= hint.len) return;
+        const available = suffix.len - hint.len - 1;
+        const len = @min(message.len, available -| separator.len);
+        var pos: usize = 0;
+        if (len > 0) {
+            @memcpy(suffix[0..separator.len], separator);
+            for (suffix[separator.len..][0..len], message[0..len]) |*out, byte| {
+                out.* = if (std.ascii.isPrint(byte)) byte else '?';
+            }
+            pos = separator.len + len;
         }
-        suffix[separator.len + len] = 0;
+        @memcpy(suffix[pos..][0..hint.len], hint);
+        suffix[pos + hint.len] = 0;
     }
 
     /// Verbose diagnostic to stderr, gated on `cfg.verbose` (-v).
@@ -2431,20 +2442,29 @@ test "produce error sanitizes and bounds broker detail" {
     try std.testing.expectEqual(@as(u8, '?'), detail[detail.len - 1]);
 }
 
-test "invalid record reports the broker reason before the conditional compaction hint" {
+test "invalid record appends the compaction hint only for a missing key" {
     var c: Client = undefined;
     c.err_ctx = @splat(0);
     c.produceErr("topic", 0, .{ .code = .invalid_record, .message = "schema ID validation failed" }, 0);
     try std.testing.expectEqualStrings(
-        "produce to topic[0]: INVALID_RECORD: schema ID validation failed; if the topic is compacted, records need a non-null key",
+        "produce to topic[0]: INVALID_RECORD: schema ID validation failed",
         c.errDetail(),
     );
 
     c.produceErr("topic", 0, .{ .code = .invalid_record }, 0);
+    try std.testing.expectEqualStrings("produce to topic[0]: INVALID_RECORD", c.errDetail());
+
+    c.produceErr("topic", 0, .{ .code = .invalid_record, .message = "Compacted topic cannot accept message without key" }, 0);
     try std.testing.expectEqualStrings(
-        "produce to topic[0]: INVALID_RECORD; if the topic is compacted, records need a non-null key",
+        "produce to topic[0]: INVALID_RECORD: Compacted topic cannot accept message without key; if the topic is compacted, records need a non-null key",
         c.errDetail(),
     );
+
+    const long_message = ("x" ** 512) ++ " WITHOUT KEY";
+    c.produceErr("topic", 0, .{ .code = .invalid_record, .message = long_message }, 0);
+    const detail = c.errDetail();
+    try std.testing.expectEqual(c.err_ctx.len - 1, detail.len);
+    try std.testing.expect(std.mem.endsWith(u8, detail, "; if the topic is compacted, records need a non-null key"));
 }
 
 test "dropping a produce socket invalidates only its outstanding responses" {
