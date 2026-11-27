@@ -391,18 +391,24 @@ ru_want=$(printf 'before-err-1\nbefore-err-2\nsentinel-a\nsentinel-b')
 [ "$ru_out" = "$ru_want" ] || fail "txn: read_uncommitted did not see aborted + sentinel records: [$ru_out]"
 
 TXN_INVALID_JSON="kite-txn-invalid-json-$(date +%s)-$RANDOM"
+TXN_INVALID_ID="kite-e2e-invalid-json-$RANDOM"
 zig-out/bin/kite topic create "$TXN_INVALID_JSON" >/dev/null
+printf 'bootstrap.servers=%s\nbatch.size=1\n' "$BOOTSTRAP_SERVERS" >"$TMP/txn-invalid-json.properties"
 set +e
 printf '%s\n' '{"value":42}' '{"value":tru}' '{"value":{"x":}}' \
-    | zig-out/bin/kite produce --txn kite-e2e-invalid-json --json "$TXN_INVALID_JSON" 2>"$TMP/txn-invalid-json.err"
+    | zig-out/bin/kite produce --config "$TMP/txn-invalid-json.properties" \
+        --txn "$TXN_INVALID_ID" --json "$TXN_INVALID_JSON" 2>"$TMP/txn-invalid-json.err"
 rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "txn: malformed JSON produce exited $rc, want 1"
 grep -Fq 'kite: line 2: invalid JSON' "$TMP/txn-invalid-json.err" \
     || fail "txn: malformed JSON produce did not report the invalid line"
+wait_complete_abort "$TXN_INVALID_ID"
+got=$(zig-out/bin/kite consume -B --read-uncommitted -n 2 --idle 1s --format value "$TXN_INVALID_JSON")
+[ "$got" = 42 ] || fail "txn: expected only the flushed record before malformed JSON, got [$got]"
 got=$(zig-out/bin/kite consume -B -n 1 --idle 1s --format value "$TXN_INVALID_JSON")
 [ -z "$got" ] || fail "txn: malformed JSON committed records: [$got]"
-echo "PASS malformed JSON is not committed"
+echo "PASS malformed JSON aborts an already-sent record (CompleteAbort)"
 
 # Aborted run on SIGINT after records flushed: read_committed sees only later sentinels.
 TXN_INT=kite-txn-sigint-e2e
