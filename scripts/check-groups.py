@@ -321,9 +321,11 @@ try:
     print("PASS groups inactive classic describe still shows committed offsets", flush=True)
 
     classic = "kite-classic-no-commits"
+    denied = "kite-classic-acl-denied"
+    run("topic", "create", "-p", "1", denied)
     with subprocess.Popen([
         "docker", "exec", "kite-e2e-kafka", "/opt/kafka/bin/kafka-console-consumer.sh",
-        "--bootstrap-server", "localhost:9092", "--topic", topic,
+        "--bootstrap-server", "localhost:9092", "--include", f"{denied}|{topic}",
         "--group", classic, "--consumer-property", "group.protocol=classic",
         "--consumer-property", "enable.auto.commit=false", "--timeout-ms", "60000",
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as member:
@@ -332,15 +334,29 @@ try:
                                  for g in rows(run("group", "list", "--all", "--json"))),
                      "classic group stable")
             description = rows(run("group", "describe", classic, "--json"))
-            assert len(description) == 1, description
-            partition = description[0]
+            assert [p["topic"] for p in description] == [denied, topic], description
+            partition = description[1]
             assert partition["topic"] == topic and partition["partition"] == 0, description
             assert partition["committed"] is None and partition["lag"] is None, description
             assert partition["end"] > 0 and partition["member_id"] and partition["client_id"], description
+            print("PASS groups active classic describe shows partitions without commits", flush=True)
+
+            acl = ["docker", "exec", "kite-e2e-kafka", "/opt/kafka/bin/kafka-acls.sh",
+                   "--bootstrap-server", "localhost:9092", "--deny-principal", "User:ANONYMOUS",
+                   "--operation", "Describe", "--topic", denied]
+            subprocess.run([*acl, "--add"], check=True, capture_output=True, text=True, timeout=30)
+            try:
+                result = subprocess.run([kite, "group", "describe", classic, "--json"],
+                                        text=True, capture_output=True, timeout=30)
+                assert result.returncode == 0, result
+                assert rows(result.stdout) == [partition], result.stdout
+                assert "warning: skipping a topic the current principal is not authorized to describe" in result.stderr, result.stderr
+                print("PASS groups ACL-denied classic describe returns partial JSON and a stderr warning", flush=True)
+            finally:
+                subprocess.run([*acl, "--remove", "--force"], check=True, capture_output=True, text=True, timeout=30)
         finally:
             if member.poll() is None:
                 member.terminate()
-    print("PASS groups active classic describe shows partitions without commits", flush=True)
 finally:
     for process, _, _ in workers:
         if process.poll() is None:
