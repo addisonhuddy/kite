@@ -1458,31 +1458,31 @@ pub const Client = struct {
         const txn_id = c.txn_id.?;
         const verb = if (commit) "commit" else "abort";
         var retry: Retry = .{};
-        var commit_dispatched = false;
+        var commit_ambiguous = false;
         while (true) {
             if (commit) if (stop) |s| if (s.load(.acquire)) {
-                return if (commit_dispatched) error.CommitOutcomeUnknown else error.Interrupted;
+                return if (commit_ambiguous) error.CommitOutcomeUnknown else error.Interrupted;
             };
             const node = c.findTxnCoordinator() catch |err| {
                 if (commit) if (stop) |s| if (s.load(.acquire)) {
-                    return if (commit_dispatched) error.CommitOutcomeUnknown else error.Interrupted;
+                    return if (commit_ambiguous) error.CommitOutcomeUnknown else error.Interrupted;
                 };
-                if (commit_dispatched) {
+                if (commit_ambiguous) {
                     c.setErr("EndTxn (commit '{s}'): coordinator lookup failed (outcome unknown; broker may have committed)", .{txn_id});
                     return error.ProduceFailed;
                 }
                 return err;
             };
             if (commit) if (stop) |s| if (s.load(.acquire)) {
-                return if (commit_dispatched) error.CommitOutcomeUnknown else error.Interrupted;
+                return if (commit_ambiguous) error.CommitOutcomeUnknown else error.Interrupted;
             };
             const conn = c.connFor(node, connKey(node, txn_coord_slot)) catch {
                 c.invalidateTxnCoordinator();
                 if (commit) if (stop) |s| if (s.load(.acquire)) {
-                    return if (commit_dispatched) error.CommitOutcomeUnknown else error.Interrupted;
+                    return if (commit_ambiguous) error.CommitOutcomeUnknown else error.Interrupted;
                 };
                 if (retry.pause(c)) continue;
-                if (commit_dispatched)
+                if (commit_ambiguous)
                     c.setErr("EndTxn (commit '{s}'): coordinator unreachable (outcome unknown; broker may have committed)", .{txn_id})
                 else
                     c.setErr("EndTxn ({s} '{s}'): coordinator unreachable", .{ verb, txn_id });
@@ -1491,9 +1491,8 @@ pub const Client = struct {
             // Recheck stop after a fresh connection / ApiVersions handshake,
             // right before dispatching EndTxn on the wire.
             if (commit) if (stop) |s| if (s.load(.acquire)) {
-                return if (commit_dispatched) error.CommitOutcomeUnknown else error.Interrupted;
+                return if (commit_ambiguous) error.CommitOutcomeUnknown else error.Interrupted;
             };
-            if (commit) commit_dispatched = true;
             const resp = c.sendRequest(
                 conn,
                 protocol.api_key.end_txn,
@@ -1507,9 +1506,10 @@ pub const Client = struct {
                 protocol.endTxnRequest,
             ) catch {
                 c.invalidateTxnCoordinator();
+                if (commit) commit_ambiguous = true;
                 if (commit) if (stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
                 if (retry.pause(c)) continue;
-                if (commit_dispatched)
+                if (commit_ambiguous)
                     c.setErr("EndTxn (commit '{s}'): request failed (outcome unknown; broker may have committed)", .{txn_id})
                 else
                     c.setErr("EndTxn ({s} '{s}'): request failed", .{ verb, txn_id });
@@ -1519,9 +1519,10 @@ pub const Client = struct {
             var d = Decoder.init(resp.body);
             const code = protocol.endTxnResponse(&d) catch {
                 c.invalidateTxnCoordinator();
+                if (commit) commit_ambiguous = true;
                 if (commit) if (stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
                 if (retry.pause(c)) continue;
-                if (commit_dispatched)
+                if (commit_ambiguous)
                     c.setErr("EndTxn (commit '{s}'): malformed response (outcome unknown; broker may have committed)", .{txn_id})
                 else
                     c.setErr("EndTxn ({s} '{s}'): malformed response", .{ verb, txn_id });
@@ -1539,14 +1540,14 @@ pub const Client = struct {
                 return;
             }
             if (isCoordinatorError(code)) c.invalidateTxnCoordinator();
-            if (commit) if (stop) |s| if (s.load(.acquire)) {
-                return if (commit_dispatched) error.CommitOutcomeUnknown else error.Interrupted;
-            };
-            if ((isCoordinatorError(code) or code.retriable()) and retry.pause(c)) continue;
-            if (commit and code == .transaction_abortable) {
+            if (isCoordinatorError(code) or code.retriable()) {
+                if (commit) commit_ambiguous = true;
+                if (commit) if (stop) |s| if (s.load(.acquire)) return error.CommitOutcomeUnknown;
+                if (retry.pause(c)) continue;
+            } else if (commit and code == .transaction_abortable) {
                 _ = c.abortTransactionBestEffort();
             }
-            if (commit_dispatched)
+            if (commit_ambiguous)
                 c.setErr("EndTxn (commit '{s}'): {s} (outcome unknown; broker may have committed)", .{ txn_id, code.name() })
             else
                 c.setErr("EndTxn ({s} '{s}'): {s}", .{ verb, txn_id, code.name() });
