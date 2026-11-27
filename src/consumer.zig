@@ -1464,13 +1464,20 @@ fn listOffsetsLeader(
             try e.tagBuffer();
         }
     }.f;
-    const conn = c.connFor(parts[0].cursor.leader, client.Client.connKey(parts[0].cursor.leader, 0)) catch return error.RetryFetch;
+    const leader = parts[0].cursor.leader;
+    const conn = c.connFor(leader, client.Client.connKey(leader, 0)) catch return error.RetryFetch;
     const resp = c.sendRequestAlloc(alloc, conn, protocol.api_key.list_offsets, protocol.version.list_offsets, Ctx{
         .topic = topic,
         .parts = parts,
         .start = start,
         .isolation = isolation,
-    }, body) catch return error.RetryFetch;
+    }, body) catch |err| {
+        if (err == error.WaitHookAborted) {
+            c.dropConn(client.Client.connKey(leader, 0));
+            return err;
+        }
+        return error.RetryFetch;
+    };
     var d = Decoder.init(resp.body);
     _ = try d.i32v();
     const topics = try d.compactArrayLen();
