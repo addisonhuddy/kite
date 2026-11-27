@@ -4,11 +4,13 @@ const config = @import("config.zig");
 const protocol = @import("protocol.zig");
 const stats = @import("stats.zig");
 const term = @import("term.zig");
+const transport = @import("transport.zig");
 const json = @import("json.zig");
 const format_mod = @import("format.zig");
 
 const Encoder = protocol.Encoder;
 const Decoder = protocol.Decoder;
+const round_arena_retain_limit: usize = 16 << 20;
 
 pub const Options = struct {
     pub const Start = enum { earliest, latest, offset };
@@ -104,6 +106,7 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
     var count: u64 = 0;
     var last_record = std.Io.Timestamp.now(c.io, .awake);
     var retry: client.Retry = .{};
+    var fetch_round: usize = 0;
     while (true) {
         if (opts.stop) |flag| if (flag.load(.acquire)) break;
         if (opts.max_records) |max| if (count >= max) break;
@@ -115,7 +118,7 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             if (retry.started == null and elapsed.toMilliseconds() >= idle) break;
         }
 
-        _ = round_arena.reset(.retain_capacity);
+        _ = round_arena.reset(.{ .retain_with_limit = round_arena_retain_limit });
         round_alloc = round_arena.allocator();
         var progress = false;
         var failed_leader: ?i32 = null;
@@ -129,6 +132,7 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             for (cursors[0..cursor_count]) |*candidate|
                 if (candidate.leader == cursor.leader)
                     try parts.append(round_alloc, .{ .pidx = candidate.pidx, .cursor = candidate });
+            if (parts.items.len > 1) std.mem.rotate(FetchPart, parts.items, fetch_round % parts.items.len);
 
             var fetch_opts = opts;
             if (opts.idle_ms) |idle| fetch_opts.fetch_idle_deadline = last_record.addDuration(.fromMilliseconds(@intCast(idle)));
@@ -141,11 +145,13 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
                     failed_leader = cursor.leader;
                 },
                 else => {
+                    if (err != error.WriteFailed) out.flush() catch {};
                     return err;
                 },
             };
             if (opts.max_records) |max| if (count >= max) break;
         }
+        fetch_round +%= 1;
         leader_seen.deinit(round_alloc);
         try out.flush();
         if (opts.stats) |s| s.maybeRender();
@@ -549,6 +555,8 @@ const GroupSession = struct {
 
     fn leave(s: *GroupSession) void {
         if (s.epoch <= 0) return;
+        const saved_err = s.c.err_ctx;
+        defer s.c.err_ctx = saved_err;
         if (s.recoveryDeadline() != null) {
             s.beginRound();
             if (s.c.groupRemainingMs()) |_| {} else |_| return;
@@ -977,7 +985,7 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             break;
         };
         if (session.idleExpired(std.Io.Timestamp.now(c.io, .awake))) break;
-        _ = arena.reset(.retain_capacity);
+        _ = arena.reset(.{ .retain_with_limit = round_arena_retain_limit });
         session.beginRound();
         const elapsed = session.last_heartbeat.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds();
         if (session.heartbeat_due or elapsed >= session.interval) {
@@ -1044,9 +1052,12 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         }
         const leader = session.owned.items[selected].leader;
         var parts: std.ArrayList(FetchPart) = .empty;
-        for (session.owned.items) |*cursor| if (cursor.leader == leader and !cursor.leader_stale and !cursor.awaiting_position) {
-            try parts.append(arena.allocator(), .{ .pidx = cursor.pidx, .cursor = cursor });
-        };
+        for (0..session.owned.items.len) |offset| {
+            const cursor = &session.owned.items[(selected + offset) % session.owned.items.len];
+            if (cursor.leader == leader and !cursor.leader_stale and !cursor.awaiting_position) {
+                try parts.append(arena.allocator(), .{ .pidx = cursor.pidx, .cursor = cursor });
+            }
+        }
         var fetch_opts = opts;
         const since_beat = session.last_heartbeat.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds();
         const until_beat = session.interval -| @as(u64, @intCast(@max(0, since_beat)));
@@ -1432,6 +1443,41 @@ fn fetchLeaderLegacy(
     for (outcomes) |outcome| if (outcome == .retry) return error.RetryFetch;
 }
 
+const FetchRequestCtx = struct {
+    topic: []const u8,
+    parts: []const FetchPart,
+    max_wait_ms: u64,
+    max_bytes: usize,
+    isolation: protocol.Isolation,
+};
+
+fn encodeFetchBody(e: *Encoder, ctx: FetchRequestCtx) protocol.ProtoError!void {
+    const max_bytes: i32 = @intCast(@min(ctx.max_bytes, std.math.maxInt(i32)));
+    try e.i32v(-1);
+    try e.i32v(@intCast(ctx.max_wait_ms));
+    try e.i32v(1);
+    try e.i32v(max_bytes);
+    try e.i8v(@intFromEnum(ctx.isolation));
+    try e.i32v(0);
+    try e.i32v(-1);
+    try e.compactArrayLen(1);
+    try e.compactString(ctx.topic);
+    try e.compactArrayLen(ctx.parts.len);
+    for (ctx.parts) |part| {
+        try e.i32v(part.pidx);
+        try e.i32v(-1);
+        try e.i64v(part.cursor.offset);
+        try e.i32v(-1);
+        try e.i64v(-1);
+        try e.i32v(max_bytes);
+        try e.tagBuffer();
+    }
+    try e.tagBuffer();
+    try e.compactArrayLen(0);
+    try e.compactString("");
+    try e.tagBuffer();
+}
+
 fn fetchLeader(
     c: *client.Client,
     alloc: std.mem.Allocator,
@@ -1444,57 +1490,76 @@ fn fetchLeader(
 ) ![]const FetchOutcome {
     const outcomes = try alloc.alloc(FetchOutcome, parts.len);
     @memset(outcomes, .retry);
-    const Ctx = struct {
-        topic: []const u8,
-        parts: []const FetchPart,
-        max_wait_ms: u64,
-        max_bytes: usize,
-        isolation: protocol.Isolation,
-    };
-    const body = struct {
-        fn f(e: *Encoder, ctx: Ctx) protocol.ProtoError!void {
-            try e.i32v(-1);
-            try e.i32v(@intCast(ctx.max_wait_ms));
-            try e.i32v(1);
-            try e.i32v(@intCast(ctx.max_bytes));
-            try e.i8v(@intFromEnum(ctx.isolation));
-            try e.i32v(0);
-            try e.i32v(-1);
-            try e.compactArrayLen(1);
-            try e.compactString(ctx.topic);
-            try e.compactArrayLen(ctx.parts.len);
-            for (ctx.parts) |part| {
-                try e.i32v(part.pidx);
-                try e.i32v(-1);
-                try e.i64v(part.cursor.offset);
-                try e.i32v(-1);
-                try e.i64v(-1);
-                try e.i32v(1 << 20);
-                try e.tagBuffer();
-            }
-            try e.tagBuffer();
-            try e.compactArrayLen(0);
-            try e.compactString("");
-            try e.tagBuffer();
-        }
-    }.f;
     const leader = parts[0].cursor.leader;
     const conn = c.connFor(leader, client.Client.connKey(leader, 0)) catch {
         c.dropNode(leader);
         return outcomes;
     };
-    const resp = c.sendRequestAlloc(alloc, conn, protocol.api_key.fetch, protocol.version.fetch, Ctx{
+    const resp = c.sendRequestAlloc(alloc, conn, protocol.api_key.fetch, protocol.version.fetch, FetchRequestCtx{
         .topic = opts.topic,
         .parts = parts,
         .max_wait_ms = opts.fetch_wait_ms orelse c.cfg.fetch_max_wait_ms,
         .max_bytes = c.cfg.fetch_max_bytes,
         .isolation = opts.isolation,
-    }, body) catch {
+    }, encodeFetchBody) catch |err| {
         c.dropNode(leader);
-        return outcomes;
+        switch (err) {
+            error.ResponseTooLarge => {
+                c.setErr("fetch from broker {d}: response exceeds {d} byte frame limit", .{ leader, transport.max_response_len });
+                return error.FetchFailed;
+            },
+            error.OutOfMemory => {
+                c.setErr("fetch from broker {d}: out of memory", .{leader});
+                return error.OutOfMemory;
+            },
+            else => return outcomes,
+        }
     };
 
     return decodeFetch(c, alloc, opts, parts, resp.body, outcomes, out, scratch, count, progress);
+}
+
+test "fetch request honors fetch.max.bytes for partition_max_bytes" {
+    const alloc = std.testing.allocator;
+    var cursors = [_]Cursor{
+        .{ .pidx = 0, .leader = 1, .offset = 10 },
+        .{ .pidx = 1, .leader = 1, .offset = 20 },
+    };
+    const parts = [_]FetchPart{
+        .{ .pidx = 0, .cursor = &cursors[0] },
+        .{ .pidx = 1, .cursor = &cursors[1] },
+    };
+    for ([_]usize{ 8 << 20, 24 << 20 }) |budget| {
+        var e = Encoder.init(alloc);
+        defer e.deinit();
+        try encodeFetchBody(&e, .{
+            .topic = "big",
+            .parts = &parts,
+            .max_wait_ms = 500,
+            .max_bytes = budget,
+            .isolation = .read_committed,
+        });
+        var d = Decoder.init(e.written());
+        try std.testing.expectEqual(@as(i32, -1), try d.i32v());
+        try std.testing.expectEqual(@as(i32, 500), try d.i32v());
+        try std.testing.expectEqual(@as(i32, 1), try d.i32v());
+        try std.testing.expectEqual(@as(i32, @intCast(budget)), try d.i32v());
+        _ = try d.i8v();
+        _ = try d.i32v();
+        _ = try d.i32v();
+        try std.testing.expectEqual(@as(i64, 1), try d.compactArrayLen());
+        try std.testing.expectEqualStrings("big", (try d.compactString()).?);
+        try std.testing.expectEqual(@as(i64, 2), try d.compactArrayLen());
+        for (cursors) |cursor| {
+            try std.testing.expectEqual(cursor.pidx, try d.i32v());
+            _ = try d.i32v();
+            try std.testing.expectEqual(cursor.offset, try d.i64v());
+            _ = try d.i32v();
+            _ = try d.i64v();
+            try std.testing.expectEqual(@as(i32, @intCast(budget)), try d.i32v());
+            try d.tagBuffer();
+        }
+    }
 }
 
 fn decodeFetch(
@@ -1914,4 +1979,28 @@ test "text record output honors value and tsv formats" {
     try onRecord(&sink, 5, 0, .{ .value = "at cursor" });
     try std.testing.expectEqualStrings("at cursor\n", w.buffered());
     try std.testing.expectEqual(@as(u64, 5), count);
+}
+
+test "group leave preserves prior err_ctx when leave heartbeat fails" {
+    const alloc = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(alloc);
+    defer env.deinit();
+    const cfg: config.Config = .{ .bootstrap_servers = &.{} };
+    var c = client.Client.init(alloc, std.testing.io, &env, &cfg);
+    defer c.deinit();
+    const now = std.Io.Timestamp.now(c.io, .awake);
+    var session: GroupSession = .{
+        .c = &c,
+        .opts = .{ .topic = "t", .group = "g" },
+        .member = @splat('m'),
+        .epoch = 1,
+        .last_heartbeat = now,
+        .last_record = now,
+    };
+    c.setErr("fetch from broker 1: response exceeds 134217728 byte frame limit", .{});
+    session.leave();
+    try std.testing.expectEqualStrings(
+        "fetch from broker 1: response exceeds 134217728 byte frame limit",
+        c.errDetail(),
+    );
 }

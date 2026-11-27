@@ -9,8 +9,8 @@ pub const Error = error{
 };
 
 /// A malicious broker could send a tiny batch that expands hugely; cap the
-/// decompressed size per batch.
-pub const max_decompressed_len: usize = 64 << 20;
+/// decompressed size per batch to match the transport response frame limit.
+pub const max_decompressed_len: usize = 128 << 20;
 
 pub fn decompress(alloc: std.mem.Allocator, codec: u3, input: []const u8) ![]u8 {
     return decompressWithLimit(alloc, codec, input, max_decompressed_len);

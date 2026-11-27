@@ -30,5 +30,5 @@ redacted). Review dumps before sharing them publicly.
 
 ## Decompression limits
 
-Decompressed record batches are capped at 64 MiB per batch; oversized
+Decompressed record batches are capped at 128 MiB per batch; oversized
 streams fail rather than exhausting memory.
