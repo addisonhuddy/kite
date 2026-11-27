@@ -432,6 +432,8 @@ const JsonRecordResult = union(enum) {
     invalid: []const u8,
 };
 
+const JsonRecordField = enum { key, key_b64, value, value_b64, headers, topic, partition, offset, timestamp };
+
 /// Parse a `--json` input line. A non-string value is forwarded verbatim so
 /// JSON objects can be sent directly; headers may be an object or an array.
 fn jsonRecord(
@@ -442,10 +444,7 @@ fn jsonRecord(
     var sc = json.Scanner{ .src = line, .alloc = alloc };
     var key: ?[]const u8 = null;
     var value: ?[]const u8 = null;
-    var key_seen = false;
-    var key_b64_seen = false;
-    var value_seen = false;
-    var value_b64_seen = false;
+    var seen = std.EnumSet(JsonRecordField).initEmpty();
     var headers: std.ArrayListUnmanaged(protocol.Header) = .empty;
     headers.appendSlice(alloc, static_headers) catch oom();
 
@@ -454,35 +453,36 @@ fn jsonRecord(
     if (!is_obj) return .{ .invalid = "expected a JSON object (" ++ shape ++ ")" };
     var first = true;
     while (sc.nextMember(first) catch |err| return jsonScanError(err)) |m| : (first = false) {
-        if (std.mem.eql(u8, m.key, "value")) {
-            if (value_b64_seen) return .{ .invalid = "use \"value\" or \"value_b64\", not both" };
-            value_seen = true;
+        const field = std.meta.stringToEnum(JsonRecordField, m.key) orelse continue;
+        if (seen.contains(field)) return .{ .invalid = switch (field) {
+            inline else => |f| "duplicate \"" ++ @tagName(f) ++ "\" field",
+        } };
+        seen.insert(field);
+        if (field == .value) {
+            if (seen.contains(.value_b64)) return .{ .invalid = "use \"value\" or \"value_b64\", not both" };
             value = m.value.bytes() orelse return .{ .invalid = "\"value\" must not be null" };
-        } else if (std.mem.eql(u8, m.key, "value_b64")) {
-            if (value_seen) return .{ .invalid = "use \"value\" or \"value_b64\", not both" };
-            value_b64_seen = true;
+        } else if (field == .value_b64) {
+            if (seen.contains(.value)) return .{ .invalid = "use \"value\" or \"value_b64\", not both" };
             const encoded = switch (m.value) {
                 .string => |v| v,
                 else => return .{ .invalid = "\"value_b64\" must be a string" },
             };
             value = decodeJsonBase64(alloc, encoded) orelse return .{ .invalid = "\"value_b64\" is not valid base64" };
-        } else if (std.mem.eql(u8, m.key, "key")) {
-            if (key_b64_seen) return .{ .invalid = "use \"key\" or \"key_b64\", not both" };
-            key_seen = true;
+        } else if (field == .key) {
+            if (seen.contains(.key_b64)) return .{ .invalid = "use \"key\" or \"key_b64\", not both" };
             key = switch (m.value) {
                 .null => null,
                 .string => |v| v,
                 else => return .{ .invalid = "\"key\" must be a string or null" },
             };
-        } else if (std.mem.eql(u8, m.key, "key_b64")) {
-            if (key_seen) return .{ .invalid = "use \"key\" or \"key_b64\", not both" };
-            key_b64_seen = true;
+        } else if (field == .key_b64) {
+            if (seen.contains(.key)) return .{ .invalid = "use \"key\" or \"key_b64\", not both" };
             const encoded = switch (m.value) {
                 .string => |v| v,
                 else => return .{ .invalid = "\"key_b64\" must be a string" },
             };
             key = decodeJsonBase64(alloc, encoded) orelse return .{ .invalid = "\"key_b64\" is not valid base64" };
-        } else if (std.mem.eql(u8, m.key, "headers")) {
+        } else if (field == .headers) {
             switch (m.value) {
                 .null => {},
                 .object => |raw| {
@@ -510,6 +510,7 @@ fn jsonRecord(
                         var efirst = true;
                         while (hs.nextMember(efirst) catch |err| return jsonScanError(err)) |e| : (efirst = false) {
                             if (std.mem.eql(u8, e.key, "key")) {
+                                if (hk_seen) return .{ .invalid = "duplicate \"key\" field in header entry" };
                                 if (hk_b64_seen) return .{ .invalid = "use \"key\" or \"key_b64\", not both, in a header entry" };
                                 hk_seen = true;
                                 hk = switch (e.value) {
@@ -517,6 +518,7 @@ fn jsonRecord(
                                     else => return .{ .invalid = "header \"key\" must be a string" },
                                 };
                             } else if (std.mem.eql(u8, e.key, "key_b64")) {
+                                if (hk_b64_seen) return .{ .invalid = "duplicate \"key_b64\" field in header entry" };
                                 if (hk_seen) return .{ .invalid = "use \"key\" or \"key_b64\", not both, in a header entry" };
                                 hk_b64_seen = true;
                                 const encoded = switch (e.value) {
@@ -525,10 +527,12 @@ fn jsonRecord(
                                 };
                                 hk = decodeJsonBase64(alloc, encoded) orelse return .{ .invalid = "header \"key_b64\" is not valid base64" };
                             } else if (std.mem.eql(u8, e.key, "value")) {
+                                if (hv_seen) return .{ .invalid = "duplicate \"value\" field in header entry" };
                                 if (hv_b64_seen) return .{ .invalid = "use \"value\" or \"value_b64\", not both" };
                                 hv_seen = true;
                                 hv = jsonHeaderValue(e.value) catch return .{ .invalid = "header values must be strings or null" };
                             } else if (std.mem.eql(u8, e.key, "value_b64")) {
+                                if (hv_b64_seen) return .{ .invalid = "duplicate \"value_b64\" field in header entry" };
                                 if (hv_seen) return .{ .invalid = "use \"value\" or \"value_b64\", not both" };
                                 hv_b64_seen = true;
                                 const encoded = switch (e.value) {
@@ -599,6 +603,31 @@ test "JSON header entries decode binary key names and reject invalid definitions
     try std.testing.expectEqualStrings("header \"key_b64\" is not valid base64", invalid_base64.invalid);
     const conflicting = jsonRecord(alloc, "{\"value\":\"x\",\"headers\":[{\"key_b64\":\"/w==\",\"key\":\"h\"}]}", &.{});
     try std.testing.expectEqualStrings("use \"key\" or \"key_b64\", not both, in a header entry", conflicting.invalid);
+}
+
+test "JSON records reject duplicate envelope fields but preserve repeated Kafka headers and payload keys" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const probes = [_]struct { line: []const u8, message: []const u8 }{
+        .{ .line = "{\"value\":1,\"value\":2}", .message = "duplicate \"value\" field" },
+        .{ .line = "{\"value_b64\":\"eA==\",\"value_b64\":\"eQ==\"}", .message = "duplicate \"value_b64\" field" },
+        .{ .line = "{\"value\":0,\"key\":null,\"\\u006bey\":\"k\"}", .message = "duplicate \"key\" field" },
+        .{ .line = "{\"value\":0,\"key_b64\":\"eA==\",\"key_b64\":\"eQ==\"}", .message = "duplicate \"key_b64\" field" },
+        .{ .line = "{\"value\":0,\"headers\":null,\"headers\":[]}", .message = "duplicate \"headers\" field" },
+        .{ .line = "{\"value\":0,\"partition\":0,\"partition\":1}", .message = "duplicate \"partition\" field" },
+        .{ .line = "{\"value\":0,\"headers\":[{\"key\":\"x\",\"key\":\"y\"}]}", .message = "duplicate \"key\" field in header entry" },
+        .{ .line = "{\"value\":0,\"headers\":[{\"key_b64\":\"eA==\",\"key_b64\":\"eQ==\"}]}", .message = "duplicate \"key_b64\" field in header entry" },
+        .{ .line = "{\"value\":0,\"headers\":[{\"key\":\"h\",\"value\":null,\"value\":\"v\"}]}", .message = "duplicate \"value\" field in header entry" },
+        .{ .line = "{\"value\":0,\"headers\":[{\"key\":\"h\",\"value_b64\":\"eA==\",\"value_b64\":\"eQ==\"}]}", .message = "duplicate \"value_b64\" field in header entry" },
+    };
+    for (probes) |probe| {
+        const result = jsonRecord(alloc, probe.line, &.{});
+        try std.testing.expectEqualStrings(probe.message, result.invalid);
+    }
+    const valid = jsonRecord(alloc, "{\"unknown\":1,\"unknown\":2,\"value\":{\"x\":1,\"x\":2},\"headers\":[{\"key\":\"h\"},{\"key\":\"h\"}]}", &.{});
+    try std.testing.expectEqualStrings("{\"x\":1,\"x\":2}", valid.record.value);
+    try std.testing.expectEqual(@as(usize, 2), valid.record.headers.len);
 }
 
 fn note(comptime fmt: []const u8, args: anytype) void {
