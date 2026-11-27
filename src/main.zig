@@ -1064,7 +1064,7 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
                 outw.writeAll(",\"type\":") catch {};
                 json.writeString(outw, g.group_type) catch {};
                 outw.writeAll("}\n") catch {};
-            } else human_rows.append(alloc, .{ g.group, g.state }) catch oom();
+            } else human_rows.append(alloc, .{ groupText(alloc, g.group), groupText(alloc, g.state) }) catch oom();
         }
         if (!as_json) writeGroupTable(2, outw, .{ "GROUP", "STATE" }, human_rows.items, tty) catch {};
         outw.flush() catch {};
@@ -1072,6 +1072,7 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
         std.process.exit(0);
     }
     const group = opts.group.?;
+    const group_text = groupText(alloc, group);
     const described = c.describeGroup(alloc, group) catch |err| switch (err) {
         error.GroupNotFound => c.describeClassicGroup(alloc, group) catch |classic_err| switch (classic_err) {
             error.GroupNotFound => fatalErr(&c, "could not describe group"),
@@ -1104,6 +1105,7 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
     var i: usize = 0;
     while (i < rows.items.len) {
         const topic = rows.items[i].topic;
+        const topic_text = groupText(alloc, topic);
         const available = if (c.refreshMetadata(topic)) |_| true else |err| switch (err) {
             error.TopicNotFound => false,
             else => fatalErr(&c, "could not resolve topic"),
@@ -1121,9 +1123,9 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
             for (cursors) |cursor| if (cursor.pidx == r.partition) {
                 end = cursor.offset;
             };
-            if (end == null) note("warning: {s}/{d} no longer exists; end and lag unavailable", .{ topic, r.partition });
+            if (end == null) note("warning: {s}/{d} no longer exists; end and lag unavailable", .{ topic_text, r.partition });
             if (end) |latest| {
-                if (r.committed > latest) note("warning: {s}/{d} committed offset exceeds end; lag clamped to 0", .{ topic, r.partition });
+                if (r.committed > latest) note("warning: {s}/{d} committed offset exceeds end; lag clamped to 0", .{ topic_text, r.partition });
             }
             const lag = groupLag(r.committed, end);
             if (as_json) {
@@ -1144,26 +1146,55 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
                 outw.writeAll("}\n") catch {};
             } else {
                 human_rows.append(alloc, .{
-                    group,
-                    topic,
+                    group_text,
+                    topic_text,
                     groupNumber(alloc, r.partition),
                     groupNumber(alloc, if (r.committed < 0) null else r.committed),
                     groupNumber(alloc, end),
                     groupNumber(alloc, lag),
-                    if (r.member.len == 0) "-" else r.member,
-                    if (r.client_id.len == 0) "-" else r.client_id,
+                    if (r.member.len == 0) "-" else groupText(alloc, r.member),
+                    if (r.client_id.len == 0) "-" else groupText(alloc, r.client_id),
                 }) catch oom();
             }
         }
     }
     if (!as_json) writeGroupTable(8, outw, .{ "GROUP", "TOPIC", "PARTITION", "COMMITTED", "END", "LAG", "MEMBER_ID", "CLIENT_ID" }, human_rows.items, tty) catch {};
     outw.flush() catch {};
-    if (!opts.common.quiet) note("{s}: {s}, {d} partition(s)", .{ group, described.state, rows.items.len });
+    if (!opts.common.quiet) note("{s}: {s}, {d} partition(s)", .{ group_text, groupText(alloc, described.state), rows.items.len });
     std.process.exit(0);
 }
 
 fn groupNumber(alloc: std.mem.Allocator, value: ?i64) []const u8 {
     return if (value) |number| std.fmt.allocPrint(alloc, "{d}", .{number}) catch oom() else "-";
+}
+
+fn groupText(alloc: std.mem.Allocator, value: []const u8) []const u8 {
+    var len = value.len;
+    for (value) |byte| {
+        if (std.ascii.isControl(byte)) len += 3 else if (byte == '\\') len += 1;
+    }
+    if (len == value.len) return value;
+    const escaped = alloc.alloc(u8, len) catch oom();
+    var writer = std.Io.Writer.fixed(escaped);
+    for (value) |byte| {
+        if (std.ascii.isControl(byte)) {
+            writer.writeAll("\\x") catch unreachable;
+            writer.writeAll(&std.fmt.hex(byte)) catch unreachable;
+        } else if (byte == '\\') {
+            writer.writeAll("\\\\") catch unreachable;
+        } else {
+            writer.writeByte(byte) catch unreachable;
+        }
+    }
+    return escaped;
+}
+
+test "group text escapes row separators and terminal controls but preserves UTF-8" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    try std.testing.expectEqualStrings("café", groupText(alloc, "café"));
+    try std.testing.expectEqualStrings("member\\x09cell\\x0aforged\\x0d\\x1b[2J\\x7f\\\\", groupText(alloc, "member\tcell\nforged\r\x1b[2J\x7f\\"));
 }
 
 fn writeGroupTable(comptime columns: usize, writer: *std.Io.Writer, headers: [columns][]const u8, rows: []const [columns][]const u8, tty: bool) !void {
