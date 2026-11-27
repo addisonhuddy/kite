@@ -1064,12 +1064,14 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             }
         };
         session.beginRound();
-        const since_beat = session.last_heartbeat.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds();
-        const until_beat = session.interval -| @as(u64, @intCast(@max(0, since_beat)));
         const slack = heartbeatSlack(session.interval);
-        if (until_beat <= slack and session.fetched_since_beat) {
-            c.sleep(until_beat);
-            continue;
+        if (session.fetched_since_beat) {
+            const since_beat = session.last_heartbeat.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds();
+            const until_beat = session.interval -| @as(u64, @intCast(@max(0, since_beat)));
+            if (until_beat <= slack) {
+                c.sleep(until_beat);
+                continue;
+            }
         }
         const selected = for (0..session.owned.items.len) |offset| {
             const idx = (leader_index +% offset) % session.owned.items.len;
@@ -1107,6 +1109,8 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             c.sleep(remaining);
             continue;
         }
+        const since_beat = session.last_heartbeat.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds();
+        const until_beat = session.interval -| @as(u64, @intCast(@max(0, since_beat)));
         fetch_opts.fetch_wait_ms = @min(c.cfg.fetch_max_wait_ms, @min(until_beat -| slack, remaining - @min(1000, remaining / 2)));
         if (session.idleReady()) if (opts.idle_ms) |idle| {
             const idle_remaining = idle -| @as(u64, @intCast(@max(0, session.last_record.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds())));
