@@ -1936,9 +1936,17 @@ fn copyRecord(alloc: std.mem.Allocator, rec: protocol.Record) !protocol.Record {
     };
     return .{
         .key = if (rec.key) |k| try alloc.dupe(u8, k) else null,
-        .value = try alloc.dupe(u8, rec.value),
+        .value = if (rec.value) |v| try alloc.dupe(u8, v) else null,
         .headers = headers,
     };
+}
+
+test "copyRecord preserves tombstones and empty values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    try std.testing.expect((try copyRecord(alloc, .{ .value = null })).value == null);
+    try std.testing.expectEqualStrings("", (try copyRecord(alloc, .{ .value = "" })).value.?);
 }
 
 /// Record-batch header (61B) plus slack, charged against batch_size on
