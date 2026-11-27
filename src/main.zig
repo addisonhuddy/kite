@@ -71,7 +71,7 @@ fn abortInterrupted() noreturn {
     if (aborted)
         fatalExit(130, "transaction aborted (interrupted)", .{})
     else
-        fatalExit(130, "transaction abort failed (interrupted)", .{});
+        fatalExit(130, "transaction abort outcome unknown (interrupted)", .{});
 }
 
 /// A per-item error line in fatal()'s format, without exiting — delete

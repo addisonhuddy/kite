@@ -589,7 +589,8 @@ try:
         _, err = p.communicate("invalid-json\n", timeout=30)
         assert p.returncode == 1, (p.returncode, err)
         assert state8["init_count"] >= 2, f"expected KIP-360 InitProducerId epoch bump, got init_count={state8['init_count']} err={err!r}"
-        assert state8["end_txn_aborts"] == 0, f"expected epoch-bump abort rather than plain EndTxn(abort), got {state8['end_txn_aborts']}"
+        assert state8["end_txn_aborts"] == 1, f"expected epoch-checked EndTxn(abort) before epoch bump, got {state8['end_txn_aborts']}"
+        assert "PRODUCER_FENCED" not in err and "outcome unknown" not in err, f"unexpected abort warning on clean epoch bump: {err!r}"
 finally:
     proxy8.close()
 
@@ -659,4 +660,111 @@ finally:
 assert run_kite("consume", "-B", "-n", "1", "--idle", "3s", "--format", "value", t9).stdout == "committed-before-handshake-sigint\n"
 print("PASS txn-fault: SIGINT during stalled reconnect ApiVersions exits promptly without abort")
 
-run_kite("topic", "delete", "-y", t1, t2, t3, t4, t5, t6, t7, t8, t9, check=False)
+
+# Fault 10 (P1 regression): Stale fenced producer with an unsettled Produce must NOT
+# abort a replacement producer's ongoing transaction under the same transactional.id.
+t10 = "kite-txn-fault-replacement-fencing"
+txn10 = "kite-e2e-fault-replacement-fencing"
+run_kite("topic", "delete", "-y", "--if-exists", t10, check=False)
+run_kite("topic", "create", "-p", "1", "-r", "1", t10)
+
+state10_a = {
+    "produce_captured": threading.Event(),
+    "init_count": 0,
+    "end_txn_aborts": 0,
+}
+
+
+class StaleProducerProxy(KafkaFaultProxy):
+    def _handle(self, client):
+        upstream = socket.create_connection((BROKER_HOST, BROKER_PORT), timeout=15)
+        try:
+            while not self.stop_evt.is_set():
+                req = read_frame(client)
+                if req is None:
+                    break
+                api_key, _api_ver, _corr_id = struct.unpack(">hhi", req[:8])
+                if api_key == API_INIT_PRODUCER_ID:
+                    with self.lock:
+                        state10_a["init_count"] += 1
+                elif api_key == API_END_TXN and not parse_end_txn_committed(req):
+                    with self.lock:
+                        state10_a["end_txn_aborts"] += 1
+                elif api_key == API_PRODUCE and not state10_a["produce_captured"].is_set():
+                    state10_a["produce_captured"].set()
+                    break
+                write_frame(upstream, req)
+                resp = read_frame(upstream)
+                if resp is None:
+                    break
+                if api_key in (API_METADATA, API_FIND_COORDINATOR):
+                    resp = resp[:4] + resp[4:].replace(
+                        struct.pack(">I", BROKER_PORT),
+                        struct.pack(">I", self.port),
+                    )
+                write_frame(client, resp)
+        except OSError:
+            pass
+        finally:
+            for s in (client, upstream):
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+
+replacement_acked = threading.Event()
+
+
+def fault10_b(api_key, corr_id, req, resp):
+    if api_key == API_PRODUCE:
+        replacement_acked.set()
+    return None
+
+
+proxy10_a = StaleProducerProxy(lambda *_: None)
+proxy10_b = KafkaFaultProxy(fault10_b)
+try:
+    with subprocess.Popen(
+        [kite, "produce", "--bootstrap", f"{BROKER_HOST}:{proxy10_a.port}", "--txn", txn10, "--json", t10],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    ) as stale_p:
+        try:
+            stale_p.stdin.write('{"key":"k1","value":"stale-unsettled"}\n')
+            stale_p.stdin.flush()
+            assert state10_a["produce_captured"].wait(10), "expected stale producer to dispatch Produce"
+
+            # Start replacement producer with the same transactional.id and hold its txn Ongoing.
+            with subprocess.Popen(
+                [kite, "produce", "--bootstrap", f"{BROKER_HOST}:{proxy10_b.port}", "--txn", txn10, t10],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            ) as repl_p:
+                try:
+                    repl_p.stdin.write("k1\treplacement-committed\n")
+                    repl_p.stdin.flush()
+                    assert replacement_acked.wait(10), "expected replacement producer Produce ack"
+
+                    # Trigger unsettled-Produce cleanup on the stale producer.
+                    _, stale_err = stale_p.communicate("invalid-json\n", timeout=30)
+                    assert stale_p.returncode == 1, (stale_p.returncode, stale_err)
+                    assert state10_a["init_count"] == 1, f"stale producer must not send KIP-360 InitProducerId after fencing, got init_count={state10_a['init_count']} err={stale_err!r}"
+                    assert state10_a["end_txn_aborts"] == 1, f"expected epoch-checked EndTxn(abort) from stale producer, got {state10_a['end_txn_aborts']}"
+                    assert "outcome unknown" in stale_err and "kafka-transactions.sh describe" in stale_err, stale_err
+
+                    # Replacement producer must still commit cleanly.
+                    _, repl_err = repl_p.communicate(timeout=15)
+                    assert repl_p.returncode == 0, f"replacement producer failed to commit: rc={repl_p.returncode} err={repl_err!r}"
+                finally:
+                    if repl_p.poll() is None:
+                        repl_p.kill()
+        finally:
+            if stale_p.poll() is None:
+                stale_p.kill()
+finally:
+    proxy10_a.close()
+    proxy10_b.close()
+
+assert run_kite("consume", "-B", "-n", "1", "--idle", "3s", "--format", "value", t10).stdout == "replacement-committed\n"
+print("PASS txn-fault: stale fenced producer cannot abort replacement transaction")
+
+run_kite("topic", "delete", "-y", t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, check=False)

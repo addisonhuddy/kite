@@ -113,6 +113,9 @@ pub const Client = struct {
     txn_produce_unsettled_until: ?std.Io.Timestamp = null,
     /// Active cancellation flag during EndTxn(commit) discovery/reconnect.
     txn_stop: ?*const std.atomic.Value(bool) = null,
+    /// Set once any transactional RPC reports PRODUCER_FENCED or INVALID_PRODUCER_EPOCH,
+    /// so cleanup never sends KIP-360 InitProducerId after a replacement producer took over.
+    txn_fenced: bool = false,
     last_offset: ?i64 = null,
     /// Highest acked offset per partition (sorted by pidx), for the summary.
     last_offsets: std.ArrayListUnmanaged(PartOffset) = .empty,
@@ -1358,6 +1361,10 @@ pub const Client = struct {
         try c.initProducerIdTxn(txn_id, -1, -1);
     }
 
+    fn isFencedError(code: protocol.ErrorCode) bool {
+        return code == .producer_fenced or code == .invalid_producer_epoch;
+    }
+
     fn initProducerIdTxn(c: *Client, txn_id: []const u8, req_pid: i64, req_epoch: i16) !void {
         const InitArgs = struct { id: []const u8, timeout_ms: i32, pid: i64, epoch: i16 };
         const body = struct {
@@ -1404,6 +1411,7 @@ pub const Client = struct {
                 c.vlog("transactional producer '{s}': id={d} epoch={d}", .{ txn_id, pid, epoch });
                 return;
             }
+            if (isFencedError(code)) c.txn_fenced = true;
             if (isCoordinatorError(code)) c.invalidateTxnCoordinator();
             if ((isCoordinatorError(code) or code.retriable()) and retry.pause(c)) continue;
             c.setErr("InitProducerId (txn '{s}'): {s}", .{ txn_id, code.name() });
@@ -1462,6 +1470,7 @@ pub const Client = struct {
                 } else if (res.code == .operation_not_attempted or res.code.retriable()) {
                     try next.append(c.alloc, res.partition);
                 } else {
+                    if (isFencedError(res.code)) c.txn_fenced = true;
                     c.setErr("AddPartitionsToTxn ({s}[{d}]): {s}", .{ topic, res.partition, res.code.name() });
                     return error.ProduceFailed;
                 }
@@ -1511,18 +1520,13 @@ pub const Client = struct {
         const previous_stop = c.txn_stop;
         c.txn_stop = commit_stop;
         defer c.txn_stop = previous_stop;
-        if (!commit and c.settleProduceBeforeAbort()) {
-            // An already-dispatched Produce could not be confirmed. Bump the
-            // producer epoch via InitProducerId v4 (KIP-360) so the coordinator
-            // aborts the ongoing transaction under the new epoch and partition
-            // leaders fence any straggling Produce batch even when
-            // transaction.partition.verification.enable=false.
-            try c.initProducerIdTxn(txn_id, c.producer_id, c.producer_epoch);
+        const unsettled = if (!commit) c.settleProduceBeforeAbort() else false;
+        if (!commit and c.txn_fenced) {
             c.txn_added_parts.clearRetainingCapacity();
             c.txn_add_attempted = false;
             c.txn_produce_unsettled_until = null;
-            c.vlog("transaction '{s}' aborted via epoch bump", .{txn_id});
-            return;
+            c.setErr("EndTxn (abort '{s}'): producer already fenced", .{txn_id});
+            return error.ProduceFailed;
         }
         var retry: Retry = .{};
         var commit_ambiguous = false;
@@ -1599,12 +1603,25 @@ pub const Client = struct {
                 return error.ProduceFailed;
             };
             if (code == .none) {
+                if (!commit and unsettled and !c.txn_fenced) {
+                    // EndTxn(abort) confirmed we still own the current epoch and moved
+                    // the transaction to PrepareAbort/CompleteAbort. Now bump the epoch
+                    // via InitProducerId v4 (KIP-360) so partition leaders fence any
+                    // straggling Produce batch even when partition verification is off.
+                    c.initProducerIdTxn(txn_id, c.producer_id, c.producer_epoch) catch |err| {
+                        c.txn_added_parts.clearRetainingCapacity();
+                        c.txn_add_attempted = false;
+                        c.txn_produce_unsettled_until = null;
+                        return err;
+                    };
+                }
                 c.txn_added_parts.clearRetainingCapacity();
                 c.txn_add_attempted = false;
                 c.txn_produce_unsettled_until = null;
                 c.vlog("transaction '{s}' {s}", .{ txn_id, if (commit) "committed" else "aborted" });
                 return;
             }
+            if (isFencedError(code)) c.txn_fenced = true;
             if (!commit and c.txn_added_parts.count() == 0 and code == .invalid_txn_state) {
                 // AddPartitionsToTxn was attempted but never opened a transaction on the broker.
                 c.txn_add_attempted = false;
@@ -1633,14 +1650,16 @@ pub const Client = struct {
         if (!c.hasActiveTxn()) return true;
         const saved_err = c.err_ctx;
         defer c.err_ctx = saved_err;
+        const txn_id = c.txn_id.?;
         c.endTransaction(false, null) catch {
             const detail = c.errDetail();
             if (detail.len > 0)
-                std.debug.print("kite: warning: failed to abort transaction: {s}\n", .{detail})
+                std.debug.print("kite: warning: transaction abort outcome unknown ({s}); verify with: kafka-transactions.sh describe --transactional-id '{s}'\n", .{ detail, txn_id })
             else
-                std.debug.print("kite: warning: failed to abort transaction\n", .{});
+                std.debug.print("kite: warning: transaction abort outcome unknown; verify with: kafka-transactions.sh describe --transactional-id '{s}'\n", .{txn_id});
             c.txn_added_parts.clearRetainingCapacity();
             c.txn_add_attempted = false;
+            c.txn_produce_unsettled_until = null;
             return false;
         };
         return true;
@@ -2188,6 +2207,7 @@ pub const Client = struct {
                 _ = try d.compactString(); // error_message
                 try d.tagBuffer(); // partition tags
                 try codes.put(c.alloc, pidx, code);
+                if (isFencedError(code)) c.txn_fenced = true;
                 if (code == .none) {
                     const count = if (outstanding) |o| blk: {
                         for (o.pidx, o.counts) |op, oc| if (op == pidx) break :blk oc;
