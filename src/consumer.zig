@@ -1693,7 +1693,11 @@ fn writeJsonRecord(w: *std.Io.Writer, topic: []const u8, pidx: i32, offset: i64,
         try w.writeByte('}');
     }
     try w.writeAll("],");
-    try writeJsonBytesField(w, "value", "value_b64", rec.value);
+    if (rec.value) |value| {
+        try writeJsonBytesField(w, "value", "value_b64", value);
+    } else {
+        try w.writeAll("\"value\":null");
+    }
     try w.writeByte('}');
 }
 
@@ -1728,7 +1732,7 @@ fn writeTsvRecord(w: *std.Io.Writer, rec: protocol.Record, color: bool) !void {
         if (color) try w.writeAll(term.reset);
         try w.writeByte('\t');
     }
-    try w.writeAll(rec.value);
+    try w.writeAll(rec.value orelse "");
 }
 
 fn writeJsonRecordColored(
@@ -1752,22 +1756,23 @@ fn onRecord(ctx: *RecordSink, offset: i64, timestamp_ms: i64, rec: protocol.Reco
         return;
     };
     if (ctx.stats) |s| s.beforeOutput();
+    const value = rec.value orelse "";
     switch (ctx.format) {
         .json => if (ctx.color)
             try writeJsonRecordColored(ctx.out, ctx.scratch.?, ctx.topic, ctx.pidx, offset, timestamp_ms, rec)
         else
             try writeJsonRecord(ctx.out, ctx.topic, ctx.pidx, offset, timestamp_ms, rec),
-        .value => try ctx.out.writeAll(rec.value),
+        .value => try ctx.out.writeAll(value),
         .tsv => try writeTsvRecord(ctx.out, rec, ctx.color),
         .auto, .csv => if (rec.key == null and rec.headers.len == 0)
-            try ctx.out.writeAll(rec.value)
+            try ctx.out.writeAll(value)
         else
             try writeTsvRecord(ctx.out, rec, ctx.color),
     }
     try ctx.out.writeByte('\n');
     ctx.count.* += 1;
     if (ctx.stats) |s| {
-        s.add(1, rec.value.len + if (rec.key) |key| key.len else 0);
+        s.add(1, value.len + if (rec.key) |key| key.len else 0);
         s.noteOffset(ctx.pidx, offset);
     }
     ctx.range.first = ctx.range.first orelse offset;
@@ -1822,6 +1827,22 @@ test "json record output without key or headers" {
     try writeJsonRecord(&w, "t", 0, 0, -1, .{ .value = "x" });
     try std.testing.expectEqualStrings(
         "{\"topic\":\"t\",\"partition\":0,\"offset\":0,\"timestamp\":-1,\"key\":null,\"headers\":[],\"value\":\"x\"}",
+        w.buffered(),
+    );
+}
+
+test "json record output distinguishes tombstone and empty values" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeJsonRecord(&w, "t", 0, 0, 1, .{ .key = "k", .value = null });
+    try std.testing.expectEqualStrings(
+        "{\"topic\":\"t\",\"partition\":0,\"offset\":0,\"timestamp\":1,\"key\":\"k\",\"headers\":[],\"value\":null}",
+        w.buffered(),
+    );
+    w = .fixed(&buf);
+    try writeJsonRecord(&w, "t", 0, 1, 1, .{ .key = "k", .value = "" });
+    try std.testing.expectEqualStrings(
+        "{\"topic\":\"t\",\"partition\":0,\"offset\":1,\"timestamp\":1,\"key\":\"k\",\"headers\":[],\"value\":\"\"}",
         w.buffered(),
     );
 }

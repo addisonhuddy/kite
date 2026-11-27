@@ -105,6 +105,7 @@ pub const ErrorCode = enum(i16) {
     unknown_leader_epoch = 75,
     unsupported_compression_type = 76,
     offset_not_available = 78,
+    invalid_record = 87,
     unknown_topic_id = 100,
     unknown_member_id = 25,
     group_authorization_failed = 30,
@@ -179,6 +180,7 @@ pub const ErrorCode = enum(i16) {
             .unknown_leader_epoch => "UNKNOWN_LEADER_EPOCH",
             .unsupported_compression_type => "UNSUPPORTED_COMPRESSION_TYPE",
             .offset_not_available => "OFFSET_NOT_AVAILABLE",
+            .invalid_record => "INVALID_RECORD",
             _ => "UNKNOWN_ERROR",
         };
     }
@@ -1133,10 +1135,10 @@ pub const Header = struct {
 /// A topic config name/value pair (--set KEY=VALUE).
 pub const ConfigEntry = struct { name: []const u8, value: []const u8 };
 
-/// One record in a batch. `key` null = unkeyed; `headers` may be empty.
+/// One record in a batch. Null `key` = unkeyed; null `value` = tombstone.
 pub const Record = struct {
     key: ?[]const u8 = null,
-    value: []const u8,
+    value: ?[]const u8,
     headers: []const Header = &.{},
 };
 
@@ -1244,8 +1246,8 @@ pub fn decodeBatches(
                     break;
                 }
                 const value_len = try b.varint();
-                const value: []const u8 = if (value_len < 0)
-                    ""
+                const value: ?[]const u8 = if (value_len < 0)
+                    null
                 else blk: {
                     const n: usize = @intCast(value_len);
                     try b.skip(n);
@@ -1326,8 +1328,12 @@ pub fn encodeRecordBatch(
         } else {
             try r.varint(-1); // key: null
         }
-        try r.varint(@intCast(rec.value.len));
-        try r.raw(rec.value);
+        if (rec.value) |v| {
+            try r.varint(@intCast(v.len));
+            try r.raw(v);
+        } else {
+            try r.varint(-1);
+        }
         try r.varint(@intCast(rec.headers.len));
         for (rec.headers) |h| {
             try r.varint(@intCast(h.key.len));
@@ -1419,6 +1425,39 @@ test "decodes record batch v2" {
     try std.testing.expectEqual(@as(usize, 2), sink.count);
     try std.testing.expectEqual(@as(i64, 1), sink.offset);
     try std.testing.expectEqual(@as(i64, 1000), sink.timestamp);
+}
+
+test "record batch v2 distinguishes tombstone and empty values" {
+    const input = [_]Record{ .{ .key = "k", .value = null }, .{ .key = "k", .value = "" } };
+    var e = Encoder.init(std.testing.allocator);
+    defer e.deinit();
+    try encodeRecordBatch(&e, &input, 1000, -1, -1, -1, false);
+
+    const batch_header_len = 61;
+    var wire = Decoder.init(e.written()[batch_header_len..]);
+    for ([_]u8{ 0x01, 0x00 }) |value_length_byte| {
+        const record_len: usize = @intCast(try wire.varint());
+        const start = wire.pos;
+        try wire.skip(record_len);
+        var body = Decoder.init(wire.data[start..wire.pos]);
+        _ = try body.i8v(); // attributes
+        _ = try body.varlong(); // timestamp delta
+        _ = try body.varint(); // offset delta
+        const key_len: usize = @intCast(try body.varint());
+        try body.skip(key_len);
+        try std.testing.expectEqual(value_length_byte, try body.u8v());
+    }
+
+    const Check = struct {
+        fn record(_: void, offset: i64, _: i64, rec: Record) !void {
+            if (offset == 0) {
+                try std.testing.expect(rec.value == null);
+            } else {
+                try std.testing.expectEqualStrings("", rec.value.?);
+            }
+        }
+    };
+    try std.testing.expectEqual(@as(?i64, 2), try decodeBatches(std.testing.allocator, e.written(), .{}, {}, Check.record));
 }
 
 test "skips control batches and returns next complete offset" {
