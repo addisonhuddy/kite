@@ -750,6 +750,8 @@ try:
                     assert stale_p.returncode == 1, (stale_p.returncode, stale_err)
                     assert state10_a["init_count"] == 1, f"stale producer must not send KIP-360 InitProducerId after fencing, got init_count={state10_a['init_count']} err={stale_err!r}"
                     assert state10_a["end_txn_aborts"] == 1, f"expected epoch-checked EndTxn(abort) from stale producer, got {state10_a['end_txn_aborts']}"
+                    assert "aborted by Kafka" in stale_err, stale_err
+                    assert "PRODUCER_FENCED" in stale_err or "INVALID_PRODUCER_EPOCH" in stale_err, stale_err
                     assert "outcome unknown" not in stale_err, stale_err
 
                     # Replacement producer must still commit cleanly.
@@ -802,12 +804,15 @@ try:
 
             _, err_prod = p_prod.communicate("k1\tafter-timeout\n", timeout=15)
             assert p_prod.returncode == 1, (p_prod.returncode, err_prod)
-            assert "INVALID_PRODUCER_EPOCH" in err_prod, err_prod
+            assert "aborted by Kafka" in err_prod, err_prod
+            assert "INVALID_PRODUCER_EPOCH" in err_prod or "PRODUCER_FENCED" in err_prod, err_prod
             assert "abort outcome unknown" not in err_prod, err_prod
 
             p_int.send_signal(signal.SIGINT)
             _, err_int = p_int.communicate(timeout=15)
             assert p_int.returncode == 130, (p_int.returncode, err_int)
+            assert "aborted by Kafka" in err_int, err_int
+            assert "INVALID_PRODUCER_EPOCH" in err_int or "PRODUCER_FENCED" in err_int, err_int
             assert "transaction aborted (interrupted)" in err_int, err_int
             assert "abort outcome unknown" not in err_int, err_int
         finally:
