@@ -13,6 +13,8 @@ Scope: produce, consume, topic management (list/create/delete/update), consumer 
 
 `kite consume -g GROUP TOPIC` / `--group GROUP` joins a Kafka 4.0 consumer-protocol group, shares partitions, resumes commits, and commits the flushed fetch position (last emitted + 1 when -n stops mid-batch). Commits have a 1s floor, bypassed on revoke/exit. `-B` applies only without an existing commit; otherwise a new partition starts at latest. Conflicts: --offset, --partition. A commit means stdout accepted the record, NOT that the downstream reader processed it. Drain stdout within the session timeout (45s default) to avoid fencing/replay. Failed output rounds are not committed; crashes can replay records. Idle/-n/SIGINT commit flushed progress and leave; broken pipe leaves without committing the failed round. Group idle starts at the first assignment heartbeat, including an empty assignment; zero-partition members exit after the idle window unless --follow. Without -g consume remains independent and never commits. -v logs joins/assignments/commits.
 
+Use one isolation mode per group. Mixing the default with --read-uncommitted can commit past records still hidden from read-committed members and make lag misleading. To replay after switching isolation modes, use a fresh group with -B; existing groups resume committed offsets.
+
 ## Install
 
 curl -fsSL https://raw.githubusercontent.com/addisonhuddy/kite/main/install.sh | sh
@@ -59,13 +61,16 @@ kite topic delete [-y] [--if-exists] TOPIC...   -y required when stderr is not a
 ## Consume
 
 kite consume [OPTIONS] [@CLUSTER] TOPIC   records on stdout
--B, --from-beginning            earliest offset (default: latest)
+-B, --from-beginning            earliest offset (default: latest for the isolation level)
 --offset N  --partition P       start offset / single partition
 -n, --max N                     stop after N records
 -t, --idle DUR                  stop after DUR without records (3s, 500ms, 1m)
 -f, --follow                    never stop on idle
+--read-uncommitted              include open and aborted transactional records
 --json                          UTF-8 JSON per record; invalid UTF-8 key/value/header bytes use sibling *_b64 fields (standard padded base64), safe for jq
 Default when stdout is a pipe or file: stop after 5 s idle, so scripts never hang.
+Default isolation, also with -g: read committed (stop at the last stable offset and skip aborted transactions). --read-uncommitted reads to the high watermark. Neither mode prints transaction markers.
+An open transaction can hold records behind the last stable offset even with -B: consume may exit 0 with no records and an (idle timeout) summary (suppressed by -q). Use --follow instead of --idle to keep waiting for the transaction to resolve.
 
 ## Contract
 

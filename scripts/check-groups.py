@@ -103,6 +103,117 @@ def stop(item):
     assert item[0].wait(timeout=40) == 130, item[2].read_text()
 
 
+def check_transaction_isolation():
+    topic = "kite-transaction-isolation"
+    split_topic = "kite-transaction-split"
+    run("topic", "create", "-p", "1", topic)
+    run("topic", "create", "-p", "1", split_topic)
+    assert run("consume", "--offset", "0", "--idle", "1s", split_topic) == ""
+    empty_out_of_range = subprocess.run(
+        [kite, "consume", "--offset", "1", "--idle", "1s", split_topic],
+        text=True, capture_output=True, timeout=15
+    )
+    assert empty_out_of_range.returncode == 1 and not empty_out_of_range.stdout, empty_out_of_range
+    assert (
+        "offset 1 is out of range for partition 0: log start offset 0; high watermark 0; last stable offset 0"
+    ) in empty_out_of_range.stderr, empty_out_of_range
+    docker = ["docker", "exec", "kite-e2e-kafka"]
+    jar_path = subprocess.check_output(
+        [*docker, "sh", "-c", "echo /opt/kafka/libs/kafka-clients-*.jar"], text=True
+    ).strip()
+    jar = root / Path(jar_path).name
+    subprocess.run(["docker", "cp", f"kite-e2e-kafka:{jar_path}", jar], check=True)
+    source = Path(__file__).with_name("TransactionFixture.java")
+    subprocess.run(["javac", "--release", "17", "-cp", jar, "-d", root, source], check=True)
+    jar.unlink()
+    subprocess.run(["docker", "cp", root / "TransactionFixture.class", "kite-e2e-kafka:/tmp/"], check=True)
+    fixture_log = root / "transactions.out"
+    fixture_errors = root / "transactions.err"
+    latest_log = root / "transactions-latest.err"
+    with fixture_log.open("w") as out, fixture_errors.open("w") as errors:
+        fixture = subprocess.Popen(
+            ["docker", "exec", "-i", "kite-e2e-kafka", "java",
+             "-cp", "/tmp:/opt/kafka/libs/*", "TransactionFixture", topic, split_topic],
+            stdin=subprocess.PIPE, stdout=out, stderr=errors, text=True
+        )
+    latest = None
+    try:
+        def ready():
+            assert fixture.poll() is None, fixture_errors.read_text()
+            return "READY" in fixture_log.read_text()
+
+        wait_for(ready, "open transaction")
+        committed = ["committed"]
+        uncommitted = ["aborted-first", "committed", "aborted-last", "open", "after-open"]
+        for flags, expected, end, boundary_suffix in [
+            ((), committed, 6, "; last stable offset 6"),
+            (("--read-uncommitted",), uncommitted, 8, ""),
+        ]:
+            output = run("consume", "-B", "--format", "value", "--idle", "1s", *flags, topic)
+            assert output.splitlines() == expected, (flags, output)
+            group = f"kite-isolation-{end}"
+            records = consume(group, topic, "-B", "--idle", "2s", *flags)
+            assert [r["value"] for r in records] == expected, (flags, records)
+            description = rows(run("group", "describe", group, "--json"))
+            assert len(description) == 1 and description[0]["committed"] == end, description
+            assert description[0]["end"] == 8, description
+            out_of_range = subprocess.run(
+                [kite, "consume", "--offset", "9", "--idle", "1s", *flags, topic],
+                text=True, capture_output=True, timeout=15
+            )
+            assert out_of_range.returncode == 1 and not out_of_range.stdout, out_of_range
+            assert (
+                "kite: cannot start consuming: offset 9 is out of range for partition 0: "
+                f"log start offset 0; high watermark 8{boundary_suffix}"
+            ) in out_of_range.stderr.splitlines(), out_of_range
+            assert run("consume", "--offset", "8", "--idle", "1s", *flags, topic) == ""
+
+        assert run("consume", "--offset", "7", "--idle", "1s", "--format", "value", topic) == ""
+        assert run("consume", "--offset", "7", "--idle", "1s", "--format", "value",
+                   "--read-uncommitted", topic) == "after-open\n"
+        print("PASS seek between last stable offset and high watermark, and diagnostics above it", flush=True)
+        print("PASS high watermark is a valid seek on empty and nonempty partitions", flush=True)
+
+        # With a one-byte budget Kafka returns one batch at a time for progress.
+        tiny_config = root / "tiny-fetch.properties"
+        tiny_config.write_text("fetch.max.bytes=1\n")
+        tiny_args = ("consume", "--config", str(tiny_config), "--offset", "1", "--json", "--idle", "2s")
+        tiny = subprocess.run(
+            [kite, *tiny_args, "-v", "-n", "1", split_topic], text=True, capture_output=True, timeout=15
+        )
+        assert tiny.returncode == 0, tiny.stderr
+        assert [(r["offset"], r["value"]) for r in rows(tiny.stdout)] == [(4, "committed")], tiny
+        skipped_fetches = [
+            line for line in tiny.stderr.splitlines()
+            if "offsets empty..empty" in line and not line.endswith("records bytes 0")
+        ]
+        assert len(skipped_fetches) == 3, tiny.stderr  # Two aborted batches and their abort marker.
+        tiny_uncommitted = rows(run(*tiny_args, "--read-uncommitted", "-n", "3", split_topic))
+        assert [(r["offset"], r["value"]) for r in tiny_uncommitted] == [
+            (1, "aborted-middle"), (2, "aborted-tail"), (4, "committed"),
+        ], tiny_uncommitted
+        print("PASS seek inside multi-batch abort across small Kafka fetches", flush=True)
+
+        with latest_log.open("w") as errors:
+            latest = subprocess.Popen(
+                [kite, "consume", "-v", "--format", "value", "-n", "1", "--idle", "15s", topic],
+                stdout=subprocess.PIPE, stderr=errors, text=True
+            )
+        wait_for(lambda: "offsets empty..empty" in latest_log.read_text(), "first fetch at latest", seconds=10)
+        fixture.communicate("\n", timeout=30)
+        assert fixture.returncode == 0, fixture_errors.read_text()
+        output, _ = latest.communicate(timeout=20)
+        assert latest.returncode == 0 and output == "open\n", (output, latest_log.read_text())
+    finally:
+        if latest is not None and latest.poll() is None:
+            latest.kill()
+            latest.wait()
+        if fixture.poll() is None:
+            fixture.kill()
+            fixture.wait()
+    print("PASS Kafka transaction isolation, stable latest and group commits", flush=True)
+
+
 try:
     topic = "kite-group-resume"
     run("topic", "create", "-p", "1", topic)
@@ -194,6 +305,8 @@ try:
     assert len(description) == 1 and description[0]["lag"] == 0, description
     assert description[0]["end"] > 20, description
     print("PASS groups transactional control markers commit fetch position and lag zero", flush=True)
+
+    check_transaction_isolation()
 
     result = subprocess.run([
         "docker", "exec", "kite-e2e-kafka", "/opt/kafka/bin/kafka-console-consumer.sh",

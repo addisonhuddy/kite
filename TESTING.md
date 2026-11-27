@@ -32,7 +32,8 @@ script installs the completion file into a temporary `HOME` exactly as the
 README "Shell completions" snippets do, then drives the shell's real
 completion machinery (`_kite` under bash, `compinit` + a zpty-driven widget
 under zsh, `complete -C` under fish) and asserts that `kite consume --fr` offers
-`--from-beginning` and `kite produce --cs` offers `--csv`.
+`--from-beginning`, `kite consume --read` offers `--read-uncommitted`, and
+`kite produce --cs` offers `--csv`.
 
 ## Binary size
 
@@ -67,18 +68,22 @@ creates topics). `smoke.sh` produces
 marked plain and keyed records, consumes them from the beginning with an idle
 timeout, compares the roundtrip, checks a `--json` produce/consume roundtrip
 (key, nested value, headers), and asserts that an out-of-range `--offset`
-fails with the valid range instead of replaying the partition.
+fails with offset diagnostics instead of replaying the partition.
 
 ### Docker harness
 
 `scripts/e2e-docker.sh` runs the full suite against a real broker with no
-setup beyond Docker: it pulls `apache/kafka` (pinned tag), starts a
+setup beyond Docker and JDK 17+ (to compile the transaction fixture). It pulls
+`apache/kafka` (pinned tag), starts a
 single-node KRaft container on `127.0.0.1:9092`, creates a `kite-e2e` topic,
 and runs `smoke.sh` plus broker-dependent edge cases (the README Quickstart on
 a fresh topic, `-n` vs `--idle` stopping behaviour, early pipe closure,
 `/dev/full` write errors, and `kite topic` management: create with
 partitions/configs, `--if-not-exists`, partition growth, `--set`/`--unset`
-verified via `kafka-configs.sh`, delete with `-y`, and `--if-exists`):
+verified via `kafka-configs.sh`, delete with `-y`, and `--if-exists`).
+The suite also verifies that standalone and group consumers skip aborted and
+open transactions by default, that `--read-uncommitted` exposes both without
+outputting markers, and that latest offsets and group commits respect isolation:
 
 ```sh
 zig build

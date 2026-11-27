@@ -67,7 +67,7 @@ _kite() {
         consume | c)
             opts="-b --bootstrap --config --format --json \
                 -g --group -B --from-beginning --offset --partition -n --max -t --idle \
-                -f --follow -q --quiet -v --verbose -h --help"
+                -f --follow --read-uncommitted -q --quiet -v --verbose -h --help"
             ;;
         cluster)
             if [ -z "$sub" ]; then

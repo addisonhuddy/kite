@@ -46,6 +46,10 @@ cmp -s "$TMP/root-help.out" "$TMP/root-short-help.out" || {
     exit 1
 }
 run_case consume-help 0 nonempty empty consume --help
+grep -q -- '--read-uncommitted' "$TMP/consume-help.out" || {
+    echo "FAIL consume help omits --read-uncommitted"
+    exit 1
+}
 run_case consume-short-help 0 nonempty empty consume -h
 cmp -s "$TMP/consume-help.out" "$TMP/consume-short-help.out" || {
     echo "FAIL consume help differs between -h and --help"

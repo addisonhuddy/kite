@@ -124,7 +124,7 @@ def positions_response(broker, node, api, req):
             pos += 33
             limit = 1 if broker.mode == "position-slow-leaders" else (4 if broker.mode == "position-timeout" else 1) if partition == 1 else 0
             records = batch(offset) if offset < limit else b""
-            parts += pack("ihqqq", partition, 0, limit, -1, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
+            parts += pack("ihqqq", partition, 0, limit, limit, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
         return b"\x00" * 10 + b"\x02" + text(b"example") + bytes([count + 1]) + parts + b"\x00\x00"
     if api == 8:
         broker.commits.append(time.monotonic())
@@ -189,7 +189,7 @@ def assignment_response(broker, api, req):
             if records:
                 broker.partition_deliveries.append((partition, offset, time.monotonic()))
                 broker.delivered = broker.delivered or time.monotonic()
-            parts += pack("ihqqq", partition, 0, limit, -1, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
+            parts += pack("ihqqq", partition, 0, limit, limit, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
         time.sleep(0.01)
         return b"\x00" * 10 + b"\x02" + text(b"example") + bytes([count + 1]) + parts + b"\x00\x00"
     if api == 8:
@@ -334,14 +334,16 @@ class Handler(socketserver.StreamRequestHandler):
                         offset, = struct.unpack_from(">q", req, pos + 9)
                         records = batch(offset)
                     broker.delivered = broker.delivered or time.monotonic()
-                    part = pack("ihqqq", self.server.node - 1 if split else 0, fetch_code, 1, -1, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
+                    end = max(1, struct.unpack_from(">q", records)[0] + 1) if records else 1
+                    part = pack("ihqqq", self.server.node - 1 if split else 0, fetch_code, end, end, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
                     response = b"\x00" * 10 + b"\x02" + text(b"example") + b"\x02" + part + b"\x00\x00"
                     if connection_test:
                         parts = b""
                         for p in (0, 1):
                             code = 6 if p == 0 and len(broker.fetches) == 2 else 0
                             records = b"" if code else batch(1 if p == 0 and len(broker.fetches) > 2 else 0)
-                            parts += pack("ihqqq", p, code, 2 if p == 0 else 1, -1, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
+                            end = 2 if p == 0 else 1
+                            parts += pack("ihqqq", p, code, end, end, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
                         response = b"\x00" * 10 + b"\x02" + text(b"example") + b"\x03" + parts + b"\x00\x00"
                         if broker.mode == "request-connection" and len(broker.fetches) == 2:
                             response = pack("ihi", 0, 6, 0) + b"\x01\x00"

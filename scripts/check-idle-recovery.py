@@ -31,7 +31,8 @@ def batch():
 
 
 def fetch_part(part, error=0, records=b""):
-    return pack("ihqqq", part, error, int(bool(records)), -1, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
+    end = int(bool(records))
+    return pack("ihqqq", part, error, end, end, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
 
 
 requests = []

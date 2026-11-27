@@ -341,6 +341,7 @@ kite --version                            Print the version.
 | consume | `-n`, `--max MAX` | Stop after MAX records. |
 | consume | `-t`, `--idle DUR` | Stop after DUR without a record (`3s`, `500ms`, `1m`; bare number = ms). |
 | consume | `-f`, `--follow` | Never stop on idle, even when stdout is a pipe. |
+| consume | `--read-uncommitted` | Include open and aborted transactional records. |
 | all | `-q`, `--quiet` | Suppress the summary and progress lines on stderr. |
 | produce, consume | `-v`, `--verbose` | Connection, retry, and fetch diagnostics on stderr. |
 | all | `-h`, `--help` | Plain-text help for the selected mode. |
@@ -407,6 +408,12 @@ group and shares partitions with its other members. It resumes committed
 offsets; `-B` selects earliest only for partitions without a commit, otherwise
 new groups start at latest. `--offset` and `--partition` cannot be used with
 groups. Without `-g`, consuming remains independent and does not commit.
+
+Use the same isolation mode for every member of a consumer group. Mixing
+the default with `--read-uncommitted` can commit past records still hidden
+from read-committed members and make lag misleading. If you need to replay
+after switching isolation modes, use a fresh group with `-B`; an existing
+group resumes its committed offsets.
 
 Offsets are committed after successful stdout flushes, at most once per second
 (and always on revoke or exit), using the fetch position or the last emitted
@@ -554,12 +561,22 @@ See the full walkthrough in [examples/wing/](examples/wing).
 
 ## Consuming
 
-By default, `kite consume` starts at the latest offset and selects all partitions.
+By default, `kite consume` (including `consume -g`) uses read-committed
+isolation: it skips aborted transactional records and reads only up to the
+last stable offset, holding back records at or after the first open
+transaction in each partition until it completes. Use `--read-uncommitted`
+to read up to the high watermark instead, including open and aborted
+transactional records. Transaction markers never appear on stdout.
+
+By default, `kite consume` starts at the latest offset for its isolation
+level and selects all partitions.
 `-B`/`--from-beginning` starts at the earliest available offset; `--offset N`
-starts at offset N in every selected partition and fails with the valid range
-(`valid offsets are 0..334 (next offset 335)`) if N is outside it, rather
-than silently replaying from the beginning. `--partition P` selects one
-partition.
+starts at offset N in every selected partition. If the broker rejects N as
+out of range, kite reports the log start offset, the high watermark, and (in
+read-committed mode) the last stable offset. The high watermark is a valid
+start position, not necessarily the log end. A read-committed seek past the
+last stable offset can succeed without returning records until the transaction
+resolves. `--partition P` selects one partition.
 
 When the read stops depends on stdout:
 
@@ -582,8 +599,12 @@ For a finite read in automation, give both bounds
 of silence, whichever comes first. Neither flag is an overall deadline; if
 you need one, wrap the command in `timeout`.
 
-An idle-bounded read is not a guarantee of a complete topic snapshot. If the
-downstream process closes the pipe (`kite consume -f events | head`), kite exits
+An idle-bounded read is not a guarantee of a complete topic snapshot. In
+read-committed mode, an open transaction can hold records at or beyond the
+last stable offset (LSO). Even with `-B`, consume can exit 0 with no records
+and an `(idle timeout)` summary (no summary with `-q`). Use `--follow`
+instead of an idle bound if you need to wait for the transaction to resolve.
+If the downstream process closes the pipe (`kite consume -f events | head`), kite exits
 quietly with status 0 instead of dying from SIGPIPE.
 
 ## Input/output format and CSV
@@ -1007,9 +1028,10 @@ First run against a local broker:
 - **Produce fails with `not authorized` or a topic-creation error:** the
   broker disables automatic topic creation or the principal lacks the ACL;
   create the topic with your admin tooling and retry.
-- **Consume prints nothing and exits after the idle timeout:** `-B` was
-  omitted, so the read started at the latest offset, after the record you
-  produced. Add `-B` (or produce again while the consumer is running).
+- **Consume prints nothing and exits after the idle timeout:** Without `-B`,
+  the read may have started after your record. Add `-B` to read existing
+  records. If an open transaction is holding them behind the last stable
+  offset, even `-B` can return nothing; use `--follow` to wait for resolution.
 
 General:
 
@@ -1032,8 +1054,9 @@ General:
   operation on the topic.
 - **`batch of N exceeds the broker's max.message.bytes`:** split the input or
   raise the topic/broker limit.
-- **`offset N is out of range`:** the message shows the valid range and the
-  next offset; use `-B` for the earliest or omit `--offset` for the latest.
+- **`offset N is out of range`:** the message shows the log start offset and
+  high watermark, plus the last stable offset in read-committed mode. Use `-B`
+  for the earliest or omit `--offset` for the latest.
 - **Consumer shows `waiting for records`:** the default starts at latest. Use
   `-B`, `--offset`, or a bounded `--idle` as appropriate.
 - **`kite -c TOPIC` fails with `'-c' is now a command`:** kite 0.2 turned

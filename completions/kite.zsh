@@ -48,6 +48,7 @@ _kite() {
                 '(-n --max)'{-n,--max}'[stop after MAX records]:max:' \
                 '(-t --idle)'{-t,--idle}'[stop after idle duration]:duration:' \
                 '(-f --follow)'{-f,--follow}'[never stop on idle]' \
+                '--read-uncommitted[include open and aborted transactions]' \
                 '*:arg:_kite_at_targets'
             ;;
         cluster)

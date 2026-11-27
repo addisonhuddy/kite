@@ -711,6 +711,7 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
     const consumed = consumer.run(&cli, .{
         .topic = topic_name,
         .group = consume.group,
+        .isolation = consume.isolation,
         .follow = consume.follow,
         .start = consume.start,
         .offset = consume.offset,
@@ -772,8 +773,12 @@ fn runConsume(init: std.process.Init, args: []const []const u8, alloc: std.mem.A
             std.debug.print("{d} record(s) consumed from '{s}'{s}\n", .{ consumed, topic_name, old_reason });
         stats.finish();
     }
-    if (consumed == 0 and consume.start == .latest and !stats.live and !quiet)
-        note("no records arrived; consume starts at the latest offset, use -B to read existing records", .{});
+    if (consumed == 0 and !stats.live and !quiet) {
+        if (consume.start == .latest)
+            note("no records arrived; consume starts at the latest offset, use -B to read existing records", .{});
+        if (std.mem.eql(u8, reason, "idle timeout") and consume.isolation == .read_committed)
+            note("open transactions can hide records even with -B; use --follow to wait for them to resolve", .{});
+    }
     cli.deinit();
     std.process.exit(if (stopped_by_signal) 130 else 0);
 }
@@ -1055,7 +1060,7 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
         };
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
-        if (available) consumer.listOffsets(&c, &arena, topic, cursors, .latest) catch fatalErr(&c, "could not fetch end offsets");
+        if (available) consumer.listOffsets(&c, &arena, topic, cursors, .latest, .read_uncommitted) catch fatalErr(&c, "could not fetch end offsets");
         while (i < rows.items.len and std.mem.eql(u8, topic, rows.items[i].topic)) : (i += 1) {
             const r = rows.items[i];
             var end: ?i64 = null;
