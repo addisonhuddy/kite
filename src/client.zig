@@ -199,9 +199,14 @@ pub const Client = struct {
         try c.last_offsets.insert(c.alloc, i, .{ .pidx = pidx, .offset = off });
     }
 
-    fn produceErr(c: *Client, topic: []const u8, pidx: i32, code: protocol.ErrorCode, batch_len: usize) void {
+    const ProduceResult = struct {
+        code: protocol.ErrorCode = .none,
+        message: ?[]const u8 = null,
+    };
+
+    fn produceErr(c: *Client, topic: []const u8, pidx: i32, result: ProduceResult, batch_len: usize) void {
         var size_buf: [32]u8 = undefined;
-        switch (code) {
+        switch (result.code) {
             .message_too_large => c.setErr(
                 "produce to {s}[{d}]: batch of {s} exceeds the broker's max.message.bytes (split the input or raise the topic/broker limit)",
                 .{ topic, pidx, stats.fmtBytes(batch_len, &size_buf) },
@@ -210,7 +215,17 @@ pub const Client = struct {
                 "produce to {s}: not authorized to write (check ACLs for this principal)",
                 .{topic},
             ),
-            else => c.setErr("produce to {s}[{d}]: {s}", .{ topic, pidx, code.name() }),
+            .invalid_record => c.setErr(
+                "produce to {s}[{d}]: INVALID_RECORD (compacted topics require a key, including for tombstones)",
+                .{ topic, pidx },
+            ),
+            else => c.setErr("produce to {s}[{d}]: {s}", .{ topic, pidx, result.code.name() }),
+        }
+        if (result.message) |message| {
+            const prefix = c.errDetail().len;
+            const suffix = c.err_ctx[prefix..];
+            if (message.len > 0 and suffix.len > 3)
+                _ = std.fmt.bufPrintZ(suffix, ": {s}", .{message[0..@min(message.len, suffix.len - 3)]}) catch unreachable;
         }
     }
 
@@ -1693,16 +1708,17 @@ pub const Client = struct {
                 continue;
             }
             conn.setReadDeadline(deadline);
-            var codes: std.AutoHashMapUnmanaged(i32, protocol.ErrorCode) = .empty;
-            defer codes.deinit(c.alloc);
-            c.produceRecv(conn, o.corr, &codes, null, null) catch {
+            var results: std.AutoHashMapUnmanaged(i32, ProduceResult) = .empty;
+            defer results.deinit(c.alloc);
+            const frame = c.produceRecv(conn, o.corr, &results, null, null) catch {
                 conn.setReadDeadline(null);
                 unsettled = true;
                 c.dropConn(o.ckey);
                 continue;
             };
+            defer c.alloc.free(frame);
             conn.setReadDeadline(null);
-            if (!codes.contains(o.pidx[0])) {
+            if (!results.contains(o.pidx[0])) {
                 unsettled = true;
                 c.dropConn(o.ckey);
                 continue;
@@ -1913,13 +1929,15 @@ pub const Client = struct {
             c.outstanding_bytes -= o.bytes;
             c.releaseConn(o.pidx[0]);
             if (o.corr >= 0 and c.conns.contains(o.ckey)) {
-                var codes = std.AutoHashMapUnmanaged(i32, protocol.ErrorCode).empty;
-                defer codes.deinit(c.alloc);
-                if (c.produceRecv(c.conns.get(o.ckey).?, o.corr, &codes, o, null)) |_| {
+                var results: std.AutoHashMapUnmanaged(i32, ProduceResult) = .empty;
+                defer results.deinit(c.alloc);
+                if (c.produceRecv(c.conns.get(o.ckey).?, o.corr, &results, o, null)) |frame| {
+                    defer c.alloc.free(frame);
                     o.corr = -1;
                     c.recordAck(o.sent);
                     for (o.pidx, o.batches, o.counts) |pi, b, count| {
-                        const code = codes.get(pi) orelse .none;
+                        const result = results.get(pi) orelse ProduceResult{};
+                        const code = result.code;
                         switch (code) {
                             // duplicate_sequence_number: broker already
                             // appended this batch — dedup success.
@@ -1928,7 +1946,7 @@ pub const Client = struct {
                                 c.dropConn(o.ckey);
                                 try retry.append(c.alloc, .{ .pidx = pi, .batch = b, .count = count });
                             } else {
-                                c.produceErr(topic, pi, code, b.len);
+                                c.produceErr(topic, pi, result, b.len);
                                 return error.ProduceFailed;
                             },
                         }
@@ -1982,17 +2000,19 @@ pub const Client = struct {
                     continue;
                 };
                 const sent = std.Io.Timestamp.now(c.io, .awake);
-                var codes = std.AutoHashMapUnmanaged(i32, protocol.ErrorCode).empty;
-                defer codes.deinit(c.alloc);
-                c.produceRecv(conn, corr, &codes, null, pp.count) catch {
+                var results: std.AutoHashMapUnmanaged(i32, ProduceResult) = .empty;
+                defer results.deinit(c.alloc);
+                const frame = c.produceRecv(conn, corr, &results, null, pp.count) catch {
                     c.markProduceUnsettled();
                     c.dropConn(claim.key);
                     c.releaseConn(pp.pidx);
                     try retry.append(c.alloc, pp);
                     continue;
                 };
+                defer c.alloc.free(frame);
                 c.recordAck(sent);
-                const code = codes.get(pp.pidx) orelse .none;
+                const result = results.get(pp.pidx) orelse ProduceResult{};
+                const code = result.code;
                 switch (code) {
                     .none, .duplicate_sequence_number => c.releaseConn(pp.pidx),
                     else => if (code.retriable()) {
@@ -2000,7 +2020,7 @@ pub const Client = struct {
                         c.releaseConn(pp.pidx);
                         try retry.append(c.alloc, pp);
                     } else {
-                        c.produceErr(topic, pp.pidx, code, pp.batch.len);
+                        c.produceErr(topic, pp.pidx, result, pp.batch.len);
                         return error.ProduceFailed;
                     },
                 }
@@ -2162,18 +2182,18 @@ pub const Client = struct {
         return protocol.lastCorrelationId();
     }
 
-    /// Read the ProduceResponse for correlation id `corr`; fills `codes`
-    /// with partition_index -> error code.
+    /// Read the ProduceResponse for correlation id `corr`. The caller owns
+    /// the returned frame, which holds the per-partition result messages.
     fn produceRecv(
         c: *Client,
         conn: *Conn,
         corr: i32,
-        codes: *std.AutoHashMapUnmanaged(i32, protocol.ErrorCode),
+        results: *std.AutoHashMapUnmanaged(i32, ProduceResult),
         outstanding: ?*const Outstanding,
         retry_count: ?u32,
-    ) !void {
+    ) ![]u8 {
         const resp = try transport.recv(conn, c.alloc, corr, true);
-        defer c.alloc.free(resp.frame);
+        errdefer c.alloc.free(resp.frame);
 
         var d = Decoder.init(resp.body);
         const ntopics = try d.compactArrayLen();
@@ -2195,9 +2215,9 @@ pub const Client = struct {
                     _ = try d.compactString();
                     try d.tagBuffer();
                 }
-                _ = try d.compactString(); // error_message
+                const message = try d.compactString();
                 try d.tagBuffer(); // partition tags
-                try codes.put(c.alloc, pidx, code);
+                try results.put(c.alloc, pidx, .{ .code = code, .message = message });
                 if (isFencedError(code)) c.txn_fenced = true;
                 if (code == .none) {
                     const count = if (outstanding) |o| blk: {
@@ -2222,6 +2242,7 @@ pub const Client = struct {
                 std.debug.print("kite: broker throttled produce {d}ms\n", .{throttle});
         }
         try d.tagBuffer();
+        return resp.frame;
     }
 };
 

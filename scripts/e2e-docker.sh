@@ -94,6 +94,14 @@ TOMBSTONE_SRC="kite-tombstone-src-$(date +%s)-$RANDOM"
 TOMBSTONE_DST="kite-tombstone-dst-$(date +%s)-$RANDOM"
 printf '%s\n' '{"key":"k","value":null}' '{"key":"k","value":""}' '{"key":"k","value_b64":null}' \
     | zig-out/bin/kite produce --json "$TOMBSTONE_SRC"
+timeout 30s docker exec "$NAME" /opt/kafka/bin/kafka-console-consumer.sh \
+    --bootstrap-server localhost:9092 --topic "$TOMBSTONE_SRC" --from-beginning --max-messages 3 \
+    --property print.key=true --property print.value=true --property null.literal=null \
+    >"$TMP/tombstones-console.out"
+printf 'k\tnull\nk\t\nk\tnull\n' >"$TMP/tombstones-console.expected"
+diff -u "$TMP/tombstones-console.expected" "$TMP/tombstones-console.out" \
+    || fail "json-tombstones: Kafka console output did not distinguish tombstones and empty values"
+echo "PASS json-tombstones Kafka console consumer"
 zig-out/bin/kite consume -B -n 3 --idle 3s --json "$TOMBSTONE_SRC" 2>/dev/null \
     | jq -c . \
     | tee "$TMP/tombstones.jsonl" \
@@ -104,6 +112,16 @@ for records in "$TMP/tombstones.jsonl" "$TMP/tombstones-copy.jsonl"; do
     [ "$got" = '[["k",null],["k",""],["k",null]]' ] || fail "json-tombstones: unexpected records: $got"
 done
 echo "PASS json-tombstones jq roundtrip"
+
+TOMBSTONE_COMPACT="kite-tombstone-compact-$(date +%s)-$RANDOM"
+zig-out/bin/kite topic create -p 1 -r 1 --set cleanup.policy=compact "$TOMBSTONE_COMPACT"
+if printf '%s\n' '{"value":null}' | zig-out/bin/kite produce --json "$TOMBSTONE_COMPACT" 2>"$TMP/invalid-record.err"; then
+    fail "json-tombstones: compacted topic accepted a keyless tombstone"
+fi
+grep -Fq 'INVALID_RECORD (compacted topics require a key, including for tombstones)' "$TMP/invalid-record.err" \
+    && grep -Fiq 'Compacted topic cannot accept message without key' "$TMP/invalid-record.err" \
+    || { cat "$TMP/invalid-record.err"; fail "json-tombstones: missing INVALID_RECORD hint or broker detail"; }
+echo "PASS json-tombstones compacted topic diagnostics"
 
 expect_json_produce_error() {
     local input=$1 expected=$2 label=$3 rc

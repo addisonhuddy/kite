@@ -105,6 +105,7 @@ pub const ErrorCode = enum(i16) {
     unknown_leader_epoch = 75,
     unsupported_compression_type = 76,
     offset_not_available = 78,
+    invalid_record = 87,
     unknown_topic_id = 100,
     unknown_member_id = 25,
     group_authorization_failed = 30,
@@ -179,6 +180,7 @@ pub const ErrorCode = enum(i16) {
             .unknown_leader_epoch => "UNKNOWN_LEADER_EPOCH",
             .unsupported_compression_type => "UNSUPPORTED_COMPRESSION_TYPE",
             .offset_not_available => "OFFSET_NOT_AVAILABLE",
+            .invalid_record => "INVALID_RECORD",
             _ => "UNKNOWN_ERROR",
         };
     }
@@ -1430,6 +1432,21 @@ test "record batch v2 distinguishes tombstone and empty values" {
     var e = Encoder.init(std.testing.allocator);
     defer e.deinit();
     try encodeRecordBatch(&e, &input, 1000, -1, -1, -1, false);
+
+    const batch_header_len = 61;
+    var wire = Decoder.init(e.written()[batch_header_len..]);
+    for ([_]u8{ 0x01, 0x00 }) |value_length_byte| {
+        const record_len: usize = @intCast(try wire.varint());
+        const start = wire.pos;
+        try wire.skip(record_len);
+        var body = Decoder.init(wire.data[start..wire.pos]);
+        _ = try body.i8v(); // attributes
+        _ = try body.varlong(); // timestamp delta
+        _ = try body.varint(); // offset delta
+        const key_len: usize = @intCast(try body.varint());
+        try body.skip(key_len);
+        try std.testing.expectEqual(value_length_byte, try body.u8v());
+    }
 
     const Check = struct {
         fn record(_: void, offset: i64, _: i64, rec: Record) !void {
