@@ -143,6 +143,23 @@ destination_bytes=$(zig-out/bin/kite consume -B -n 1 --idle 3s --json "$B64_DST"
 [ "$destination_bytes" = "$source_bytes" ] || fail "json-base64: bytes changed across consume | jq | produce"
 echo "PASS json-base64 jq roundtrip"
 
+HEADER_SRC="kite-header-src-$(date +%s)-$RANDOM"
+HEADER_DST="kite-header-dst-$(date +%s)-$RANDOM"
+HEADER_NAME=$'h\xff\\name'
+HEADER_B64=$(printf '%s' "$HEADER_NAME" | base64)
+printf 'payload\n' | zig-out/bin/kite produce -H "$HEADER_NAME: header-value" "$HEADER_SRC"
+zig-out/bin/kite consume -B -n 1 --idle 3s --json "$HEADER_SRC" \
+    | zig-out/bin/kite produce --json "$HEADER_DST"
+zig-out/bin/kite consume -B -n 1 --idle 3s --json "$HEADER_SRC" \
+    | jq -c . \
+    | zig-out/bin/kite produce --json "$HEADER_DST-jq"
+for destination in "$HEADER_DST" "$HEADER_DST-jq"; do
+    headers=$(zig-out/bin/kite consume -B -n 1 --idle 3s --json "$destination" | jq -c '.headers')
+    [ "$headers" = "[{\"key_b64\":\"$HEADER_B64\",\"value\":\"header-value\"}]" ] \
+        || fail "json-binary-header: header name changed on $destination: [$headers]"
+done
+echo "PASS JSON binary header-name roundtrip (direct and through jq)"
+
 TOMBSTONE_SRC="kite-tombstone-src-$(date +%s)-$RANDOM"
 TOMBSTONE_DST="kite-tombstone-dst-$(date +%s)-$RANDOM"
 printf '%s\n' '{"key":"k","value":null}' '{"key":"k","value":""}' '{"key":"k","value_b64":null}' \
@@ -196,6 +213,50 @@ expect_json_produce_error '{"value":"x","headers":[{"key":"h","value":"x","value
     'line 1: use "value" or "value_b64", not both' conflicting-header-fields
 expect_json_produce_error '{"key":"k"}' 'JSON object has no "value" or "value_b64" field' missing-json-value
 echo "PASS json-base64 input errors"
+
+expect_json_produce_error '{"value":tru}' 'kite: line 1: invalid JSON' invalid-json-literal
+expect_json_produce_error '{"value":{"x":}}' 'kite: line 1: invalid JSON' invalid-json-object-value
+expect_json_produce_error '{"value":[1,]}' 'kite: line 1: invalid JSON' invalid-json-array
+expect_json_produce_error '{"value":01}' 'kite: line 1: invalid JSON' invalid-json-number
+expect_json_produce_error $'\n\t\n{"value":tru}' 'kite: line 3: invalid JSON' invalid-json-line-number
+if grep -Fq 'broker acknowledged' "$TMP/invalid-json-literal.err" "$TMP/invalid-json-line-number.err"; then
+    fail "malformed JSON without prior records should not report an acknowledgment count"
+fi
+echo "PASS malformed JSON input errors"
+
+JSON_PARTIAL="kite-json-partial-$(date +%s)-$RANDOM"
+zig-out/bin/kite topic create "$JSON_PARTIAL" >/dev/null
+set +e
+printf '%s\n' '{"value":1}' '{"value":2}' '{"value":tru}' '{"value":3}' \
+    | zig-out/bin/kite produce --json "$JSON_PARTIAL" 2>"$TMP/json-partial.err"
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "json-partial: malformed produce exited $rc, want 1"
+grep -Eq 'kite: line 3: invalid JSON .*broker acknowledged 2 of 2 earlier record\(s\)' "$TMP/json-partial.err" \
+    || fail "json-partial: missing malformed line or broker acknowledgment count"
+got=$(zig-out/bin/kite consume -B -n 3 --idle 1s --format value "$JSON_PARTIAL")
+[ "$got" = $'1\n2' ] || fail "json-partial: expected only the records before the malformed line, got [$got]"
+echo "PASS malformed JSON preserves prior nontransactional records"
+
+expect_partial_produce_error() {
+    local format=$1 input=$2 expected_error=$3 expected_records=$4
+    local topic="kite-$format-partial-$(date +%s)-$RANDOM" rc got
+    zig-out/bin/kite topic create "$topic" >/dev/null
+    set +e
+    printf '%s' "$input" | zig-out/bin/kite produce --format "$format" "$topic" 2>"$TMP/$format-partial.err"
+    rc=$?
+    set -e
+    [ "$rc" -eq 1 ] || fail "$format-partial: malformed produce exited $rc, want 1"
+    grep -Fq "$expected_error; broker acknowledged 2 of 2 earlier record(s)" "$TMP/$format-partial.err" \
+        || fail "$format-partial: missing malformed record or broker acknowledgment count"
+    got=$(zig-out/bin/kite consume -B -n 3 --idle 1s --format value "$topic")
+    [ "$got" = "$expected_records" ] || fail "$format-partial: expected only earlier records, got [$got]"
+    echo "PASS malformed $format preserves prior nontransactional records"
+}
+expect_partial_produce_error csv $'k,v\na,1\nb,2\n"c,3\n' \
+    'kite: csv row 3: unterminated quoted field' $'{"k":"a","v":"1"}\n{"k":"b","v":"2"}'
+expect_partial_produce_error tsv $'k\t1\nk\t2\nk\tbad\t3\nk\t4\n' \
+    "kite: line 3: malformed header 'bad' (want 'name: value')" $'1\n2'
 
 # Stopping bounds: `-n 1` on an empty topic bounds records, not time, so it
 # must still be running after 3s; `-n 1 --idle 500ms` must stop on its own.
@@ -444,6 +505,26 @@ rc_want=$(printf 'sentinel-a\nsentinel-b')
 ru_out=$(zig-out/bin/kite consume -B --read-uncommitted -n 4 --idle 3s --format value "$TXN_ABORT" 2>/dev/null | sort)
 ru_want=$(printf 'before-err-1\nbefore-err-2\nsentinel-a\nsentinel-b')
 [ "$ru_out" = "$ru_want" ] || fail "txn: read_uncommitted did not see aborted + sentinel records: [$ru_out]"
+
+TXN_INVALID_JSON="kite-txn-invalid-json-$(date +%s)-$RANDOM"
+TXN_INVALID_ID="kite-e2e-invalid-json-$RANDOM"
+zig-out/bin/kite topic create "$TXN_INVALID_JSON" >/dev/null
+printf 'bootstrap.servers=%s\nbatch.size=1\n' "$BOOTSTRAP_SERVERS" >"$TMP/txn-invalid-json.properties"
+set +e
+printf '%s\n' '{"value":42}' '{"value":tru}' '{"value":{"x":}}' \
+    | zig-out/bin/kite produce --config "$TMP/txn-invalid-json.properties" \
+        --txn "$TXN_INVALID_ID" --json "$TXN_INVALID_JSON" 2>"$TMP/txn-invalid-json.err"
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "txn: malformed JSON produce exited $rc, want 1"
+grep -Fq 'kite: line 2: invalid JSON' "$TMP/txn-invalid-json.err" \
+    || fail "txn: malformed JSON produce did not report the invalid line"
+wait_complete_abort "$TXN_INVALID_ID"
+got=$(zig-out/bin/kite consume -B --read-uncommitted -n 2 --idle 1s --format value "$TXN_INVALID_JSON")
+[ "$got" = 42 ] || fail "txn: expected only the flushed record before malformed JSON, got [$got]"
+got=$(zig-out/bin/kite consume -B -n 1 --idle 1s --format value "$TXN_INVALID_JSON")
+[ -z "$got" ] || fail "txn: malformed JSON committed records: [$got]"
+echo "PASS malformed JSON aborts an already-sent record (CompleteAbort)"
 
 # Aborted run on SIGINT after records flushed: read_committed sees only later sentinels.
 TXN_INT=kite-txn-sigint-e2e

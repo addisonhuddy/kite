@@ -1747,8 +1747,8 @@ fn writeJsonRecord(w: *std.Io.Writer, topic: []const u8, pidx: i32, offset: i64,
     try w.writeAll(",\"headers\":[");
     for (rec.headers, 0..) |header, i| {
         if (i > 0) try w.writeByte(',');
-        try w.writeAll("{\"key\":");
-        try json.writeString(w, header.key);
+        try w.writeByte('{');
+        try writeJsonBytesField(w, "key", "key_b64", header.key);
         if (header.value) |value| {
             try w.writeByte(',');
             try writeJsonBytesField(w, "value", "value_b64", value);
@@ -1938,6 +1938,17 @@ test "json record output keeps valid UTF-8 and control bytes plain" {
     });
     try std.testing.expectEqualStrings(
         "{\"topic\":\"t\",\"partition\":0,\"offset\":1,\"timestamp\":2,\"key\":\"é😀\",\"headers\":[{\"key\":\"h\",\"value\":\"é😀\\u0001\\t\\n\"}],\"value\":\"é😀\\u0001\\t\\n\"}",
+        w.buffered(),
+    );
+}
+
+test "json record output base64-encodes binary header names" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const headers = [_]protocol.Header{.{ .key = "\xff", .value = "v" }};
+    try writeJsonRecord(&w, "t", 0, 1, 2, .{ .value = "x", .headers = &headers });
+    try std.testing.expectEqualStrings(
+        "{\"topic\":\"t\",\"partition\":0,\"offset\":1,\"timestamp\":2,\"key\":null,\"headers\":[{\"key_b64\":\"/w==\",\"value\":\"v\"}],\"value\":\"x\"}",
         w.buffered(),
     );
 }

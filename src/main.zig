@@ -115,32 +115,41 @@ fn parseLine(
     alloc: std.mem.Allocator,
     line: []const u8,
     static_headers: []const protocol.Header,
-    lineno: u64,
-) protocol.Record {
+) RecordParseResult {
     if (std.mem.indexOfScalar(u8, line, '\t') == null)
-        return .{ .value = line, .headers = static_headers };
+        return .{ .record = .{ .value = line, .headers = static_headers } };
 
     var it = std.mem.splitScalar(u8, line, '\t');
     const keyf = it.next().?;
     var headers: std.ArrayListUnmanaged(protocol.Header) = .empty;
-    headers.appendSlice(alloc, static_headers) catch fatal("out of memory", .{});
+    headers.appendSlice(alloc, static_headers) catch oom();
     var value: []const u8 = "";
     while (it.next()) |f| {
         if (it.peek() == null) {
             value = f;
         } else {
-            if (std.mem.indexOfScalar(u8, f, ':') == null)
-                fatal("line {d}: malformed header '{s}' (want 'name: value')", .{ lineno, f });
-            headers.append(alloc, cli_args.parseHeaderArg(f) catch
-                fatal("line {d}: malformed header '{s}' (want 'name: value')", .{ lineno, f })) catch
-                fatal("out of memory", .{});
+            const header = cli_args.parseHeaderArg(f) catch return .{
+                .invalid = std.fmt.allocPrint(alloc, "malformed header '{s}' (want 'name: value')", .{f}) catch oom(),
+            };
+            headers.append(alloc, header) catch oom();
         }
     }
-    return .{
+    return .{ .record = .{
         .key = if (keyf.len == 0) null else keyf,
         .value = value,
         .headers = headers.items,
-    };
+    } };
+}
+
+test "TSV record parsing returns malformed header diagnostics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const valid = parseLine(alloc, "k\th: v\tdata", &.{});
+    try std.testing.expectEqualStrings("h", valid.record.headers[0].key);
+    try std.testing.expectEqualStrings("data", valid.record.value.?);
+    const invalid = parseLine(alloc, "k\tbad\tdata", &.{});
+    try std.testing.expectEqualStrings("malformed header 'bad' (want 'name: value')", invalid.invalid);
 }
 
 /// Per-partition pending record buffer.
@@ -251,6 +260,9 @@ pub fn main(init: std.process.Init) !void {
 
     var rr: usize = 0; // round-robin cursor for unkeyed records
     var total: u64 = 0;
+    var input_lineno: u64 = 0;
+    var input_error: ?[]const u8 = null;
+    const input_location = if (csv_mode) "csv row" else "line";
     var pending_bytes: usize = 0;
     const pending_budget = 8 << 20;
     const inflight_budget = 32 << 20;
@@ -302,24 +314,34 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        var rec = if (csv_mode) blk: {
+        const parsed_record: RecordParseResult = if (csv_mode) blk: {
             const row = csv.nextRow(r, batch_alloc) catch {
                 if (produce.txn != null and interrupted.load(.acquire)) abortInterrupted();
                 fatal("failed reading stdin", .{});
             } orelse break :read_loop;
-            break :blk csvRecord(batch_alloc, row, cols, key_idx, static_headers, total + 1);
+            input_lineno += 1;
+            break :blk csvRecord(batch_alloc, row, cols, key_idx, static_headers);
         } else blk: {
             const owned = nextLine(r, batch_alloc) catch {
                 if (produce.txn != null and interrupted.load(.acquire)) abortInterrupted();
                 fatal("failed reading stdin", .{});
             } orelse break :read_loop;
+            input_lineno += 1;
             if (json_mode) {
-                if (std.mem.trim(u8, owned, " \t").len == 0) continue;
-                break :blk jsonRecord(batch_alloc, owned, static_headers, total + 1);
+                if (std.mem.trim(u8, owned, " \t\r").len == 0) continue;
+                break :blk jsonRecord(batch_alloc, owned, static_headers);
             }
             if (value_mode)
-                break :blk protocol.Record{ .value = owned, .headers = static_headers };
-            break :blk parseLine(batch_alloc, owned, static_headers, total + 1);
+                break :blk .{ .record = .{ .value = owned, .headers = static_headers } };
+            break :blk parseLine(batch_alloc, owned, static_headers);
+        };
+        var rec = switch (parsed_record) {
+            .record => |record| record,
+            .invalid => |message| {
+                if (produce.txn != null) fatal("{s} {d}: {s}", .{ input_location, input_lineno, message });
+                input_error = alloc.dupe(u8, message) catch oom();
+                break :read_loop;
+            },
         };
         t_read += timer.lap();
         total += 1;
@@ -360,8 +382,27 @@ pub fn main(init: std.process.Init) !void {
 
     if (produce.txn != null and interrupted.load(.acquire))
         abortInterrupted();
-    flushAll(&cli, topic, pend, &batch_arena) catch |err| produceFatal(&cli, err);
-    cli.produceDrain(topic) catch |err| produceFatal(&cli, err);
+    if (input_error) |message| {
+        if (total == 0) fatal("{s} {d}: {s}", .{ input_location, input_lineno, message });
+    }
+    const flushed: anyerror!void = blk: {
+        flushAll(&cli, topic, pend, &batch_arena) catch |err| break :blk err;
+        break :blk cli.produceDrain(topic);
+    };
+    flushed catch |err| {
+        if (input_error) |message| {
+            stats.clearLine();
+            note("{s} {d}: {s}; broker acknowledged {d} of {d} earlier record(s)", .{
+                input_location, input_lineno, message, cli.acked_records, total,
+            });
+        }
+        produceFatal(&cli, err);
+    };
+    if (input_error) |message| {
+        fatal("{s} {d}: {s}; broker acknowledged {d} of {d} earlier record(s)", .{
+            input_location, input_lineno, message, cli.acked_records, total,
+        });
+    }
     if (produce.txn != null) {
         if (interrupted.load(.acquire))
             abortInterrupted();
@@ -433,118 +474,145 @@ fn produceSummary(cli: *client.Client, stats: *stats_mod.Stats, total: u64, npar
     }
 }
 
+const RecordParseResult = union(enum) {
+    record: protocol.Record,
+    invalid: []const u8,
+};
+
+const JsonRecordField = enum { key, key_b64, value, value_b64, headers, topic, partition, offset, timestamp };
+
 /// Parse a `--json` input line. A non-string value is forwarded verbatim so
 /// JSON objects can be sent directly; headers may be an object or an array.
 fn jsonRecord(
     alloc: std.mem.Allocator,
     line: []const u8,
     static_headers: []const protocol.Header,
-    lineno: u64,
-) protocol.Record {
+) RecordParseResult {
     var sc = json.Scanner{ .src = line, .alloc = alloc };
     var key: ?[]const u8 = null;
     var value: ?[]const u8 = null;
-    var key_seen = false;
-    var key_b64_seen = false;
-    var value_seen = false;
-    var value_b64_seen = false;
+    var seen = std.EnumSet(JsonRecordField).initEmpty();
     var headers: std.ArrayListUnmanaged(protocol.Header) = .empty;
-    headers.appendSlice(alloc, static_headers) catch fatal("out of memory", .{});
+    headers.appendSlice(alloc, static_headers) catch oom();
 
     const shape = "want {\"key\":..,\"value\":..,\"headers\":{..}}";
-    const is_obj = sc.beginObject() catch jsonFatal(lineno, shape);
-    if (!is_obj) fatal("line {d}: expected a JSON object ({s})", .{ lineno, shape });
+    const is_obj = sc.beginObject() catch |err| return jsonScanError(err);
+    if (!is_obj) return .{ .invalid = "expected a JSON object (" ++ shape ++ ")" };
     var first = true;
-    while (sc.nextMember(first) catch jsonFatal(lineno, shape)) |m| : (first = false) {
-        if (std.mem.eql(u8, m.key, "value")) {
-            if (value_b64_seen) fatal("line {d}: use \"value\" or \"value_b64\", not both", .{lineno});
-            value_seen = true;
+    while (sc.nextMember(first) catch |err| return jsonScanError(err)) |m| : (first = false) {
+        const field = std.meta.stringToEnum(JsonRecordField, m.key) orelse continue;
+        if (seen.contains(field)) return .{ .invalid = switch (field) {
+            inline else => |f| "duplicate \"" ++ @tagName(f) ++ "\" field",
+        } };
+        seen.insert(field);
+        if (field == .value) {
+            if (seen.contains(.value_b64)) return .{ .invalid = "use \"value\" or \"value_b64\", not both" };
             value = m.value.bytes();
-        } else if (std.mem.eql(u8, m.key, "value_b64")) {
-            if (value_seen) fatal("line {d}: use \"value\" or \"value_b64\", not both", .{lineno});
-            value_b64_seen = true;
+        } else if (field == .value_b64) {
+            if (seen.contains(.value)) return .{ .invalid = "use \"value\" or \"value_b64\", not both" };
             value = switch (m.value) {
                 .null => null,
-                .string => |v| decodeJsonBase64(alloc, v, "value_b64", lineno),
-                else => fatal("line {d}: \"value_b64\" must be a string or null", .{lineno}),
+                .string => |v| decodeJsonBase64(alloc, v) orelse return .{ .invalid = "\"value_b64\" is not valid base64" },
+                else => return .{ .invalid = "\"value_b64\" must be a string or null" },
             };
-        } else if (std.mem.eql(u8, m.key, "key")) {
-            if (key_b64_seen) fatal("line {d}: use \"key\" or \"key_b64\", not both", .{lineno});
-            key_seen = true;
+        } else if (field == .key) {
+            if (seen.contains(.key_b64)) return .{ .invalid = "use \"key\" or \"key_b64\", not both" };
             key = switch (m.value) {
                 .null => null,
                 .string => |v| v,
-                else => fatal("line {d}: \"key\" must be a string or null", .{lineno}),
+                else => return .{ .invalid = "\"key\" must be a string or null" },
             };
-        } else if (std.mem.eql(u8, m.key, "key_b64")) {
-            if (key_seen) fatal("line {d}: use \"key\" or \"key_b64\", not both", .{lineno});
-            key_b64_seen = true;
+        } else if (field == .key_b64) {
+            if (seen.contains(.key)) return .{ .invalid = "use \"key\" or \"key_b64\", not both" };
             key = switch (m.value) {
                 .null => null,
-                .string => |v| decodeJsonBase64(alloc, v, "key_b64", lineno),
-                else => fatal("line {d}: \"key_b64\" must be a string or null", .{lineno}),
+                .string => |v| decodeJsonBase64(alloc, v) orelse return .{ .invalid = "\"key_b64\" is not valid base64" },
+                else => return .{ .invalid = "\"key_b64\" must be a string or null" },
             };
-        } else if (std.mem.eql(u8, m.key, "headers")) {
+        } else if (field == .headers) {
             switch (m.value) {
                 .null => {},
                 .object => |raw| {
                     var hs = json.Scanner{ .src = raw, .alloc = alloc };
                     _ = hs.beginObject() catch unreachable;
                     var hfirst = true;
-                    while (hs.nextMember(hfirst) catch jsonFatal(lineno, shape)) |h| : (hfirst = false) {
-                        headers.append(alloc, .{ .key = h.key, .value = jsonHeaderValue(h.value, lineno) }) catch
-                            fatal("out of memory", .{});
+                    while (hs.nextMember(hfirst) catch |err| return jsonScanError(err)) |h| : (hfirst = false) {
+                        const hv = jsonHeaderValue(h.value) catch return .{ .invalid = "header values must be strings or null" };
+                        headers.append(alloc, .{ .key = h.key, .value = hv }) catch oom();
                     }
                 },
                 .array => |raw| {
                     var hs = json.Scanner{ .src = raw, .alloc = alloc };
                     _ = hs.beginArray() catch unreachable;
                     var hfirst = true;
-                    while (hs.nextElement(hfirst) catch jsonFatal(lineno, shape)) : (hfirst = false) {
-                        const is_entry = hs.beginObject() catch jsonFatal(lineno, shape);
-                        if (!is_entry) fatal("line {d}: header entries must be {{\"key\",\"value\"}} objects", .{lineno});
+                    while (hs.nextElement(hfirst) catch |err| return jsonScanError(err)) : (hfirst = false) {
+                        const is_entry = hs.beginObject() catch |err| return jsonScanError(err);
+                        if (!is_entry) return .{ .invalid = "header entries must be objects with \"key\" or \"key_b64\"" };
                         var hk: ?[]const u8 = null;
+                        var hk_seen = false;
+                        var hk_b64_seen = false;
                         var hv: ?[]const u8 = null;
                         var hv_seen = false;
                         var hv_b64_seen = false;
                         var efirst = true;
-                        while (hs.nextMember(efirst) catch jsonFatal(lineno, shape)) |e| : (efirst = false) {
+                        while (hs.nextMember(efirst) catch |err| return jsonScanError(err)) |e| : (efirst = false) {
                             if (std.mem.eql(u8, e.key, "key")) {
+                                if (hk_seen) return .{ .invalid = "duplicate \"key\" field in header entry" };
+                                if (hk_b64_seen) return .{ .invalid = "use \"key\" or \"key_b64\", not both, in a header entry" };
+                                hk_seen = true;
                                 hk = switch (e.value) {
                                     .string => |v| v,
-                                    else => fatal("line {d}: header \"key\" must be a string", .{lineno}),
+                                    else => return .{ .invalid = "header \"key\" must be a string" },
                                 };
+                            } else if (std.mem.eql(u8, e.key, "key_b64")) {
+                                if (hk_b64_seen) return .{ .invalid = "duplicate \"key_b64\" field in header entry" };
+                                if (hk_seen) return .{ .invalid = "use \"key\" or \"key_b64\", not both, in a header entry" };
+                                hk_b64_seen = true;
+                                const encoded = switch (e.value) {
+                                    .string => |v| v,
+                                    else => return .{ .invalid = "header \"key_b64\" must be a string" },
+                                };
+                                hk = decodeJsonBase64(alloc, encoded) orelse return .{ .invalid = "header \"key_b64\" is not valid base64" };
                             } else if (std.mem.eql(u8, e.key, "value")) {
-                                if (hv_b64_seen) fatal("line {d}: use \"value\" or \"value_b64\", not both", .{lineno});
+                                if (hv_seen) return .{ .invalid = "duplicate \"value\" field in header entry" };
+                                if (hv_b64_seen) return .{ .invalid = "use \"value\" or \"value_b64\", not both" };
                                 hv_seen = true;
-                                hv = jsonHeaderValue(e.value, lineno);
+                                hv = jsonHeaderValue(e.value) catch return .{ .invalid = "header values must be strings or null" };
                             } else if (std.mem.eql(u8, e.key, "value_b64")) {
-                                if (hv_seen) fatal("line {d}: use \"value\" or \"value_b64\", not both", .{lineno});
+                                if (hv_b64_seen) return .{ .invalid = "duplicate \"value_b64\" field in header entry" };
+                                if (hv_seen) return .{ .invalid = "use \"value\" or \"value_b64\", not both" };
                                 hv_b64_seen = true;
                                 hv = switch (e.value) {
                                     .null => null,
-                                    .string => |v| decodeJsonBase64(alloc, v, "value_b64", lineno),
-                                    else => fatal("line {d}: header \"value_b64\" must be a string or null", .{lineno}),
+                                    .string => |v| decodeJsonBase64(alloc, v) orelse return .{ .invalid = "\"value_b64\" is not valid base64" },
+                                    else => return .{ .invalid = "header \"value_b64\" must be a string or null" },
                                 };
                             }
                         }
                         headers.append(alloc, .{
-                            .key = hk orelse fatal("line {d}: header entry has no \"key\"", .{lineno}),
+                            .key = hk orelse return .{ .invalid = "header entry has no \"key\" or \"key_b64\"" },
                             .value = hv,
-                        }) catch fatal("out of memory", .{});
+                        }) catch oom();
                     }
                 },
-                else => fatal("line {d}: \"headers\" must be an object or array", .{lineno}),
+                else => return .{ .invalid = "\"headers\" must be an object or array" },
             }
         }
     }
-    if (!sc.atEnd()) jsonFatal(lineno, shape);
-    if (!value_seen and !value_b64_seen)
-        fatal("line {d}: JSON object has no \"value\" or \"value_b64\" field", .{lineno});
-    return .{
+    if (!sc.atEnd()) return jsonScanError(error.Malformed);
+    if (!seen.contains(.value) and !seen.contains(.value_b64))
+        return .{ .invalid = "JSON object has no \"value\" or \"value_b64\" field" };
+    return .{ .record = .{
         .key = key,
         .value = value,
         .headers = headers.items,
+    } };
+}
+
+fn decodeJsonBase64(alloc: std.mem.Allocator, encoded: []const u8) ?[]const u8 {
+    return json.decodeBase64(alloc, encoded) catch |err| switch (err) {
+        error.OutOfMemory => oom(),
+        error.InvalidBase64 => null,
     };
 }
 
@@ -552,12 +620,12 @@ test "JSON produce distinguishes tombstones from empty values" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const tombstone = jsonRecord(alloc, "{\"key\":\"k\",\"value\":null}", &.{}, 1);
+    const tombstone = jsonRecord(alloc, "{\"key\":\"k\",\"value\":null}", &.{}).record;
     try std.testing.expectEqualStrings("k", tombstone.key.?);
     try std.testing.expect(tombstone.value == null);
-    try std.testing.expect(jsonRecord(alloc, "{\"value_b64\":null}", &.{}, 1).value == null);
-    try std.testing.expectEqualStrings("", jsonRecord(alloc, "{\"value\":\"\"}", &.{}, 1).value.?);
-    try std.testing.expectEqualStrings("", jsonRecord(alloc, "{\"value_b64\":\"\"}", &.{}, 1).value.?);
+    try std.testing.expect(jsonRecord(alloc, "{\"value_b64\":null}", &.{}).record.value == null);
+    try std.testing.expectEqualStrings("", jsonRecord(alloc, "{\"value\":\"\"}", &.{}).record.value.?);
+    try std.testing.expectEqualStrings("", jsonRecord(alloc, "{\"value_b64\":\"\"}", &.{}).record.value.?);
 }
 
 test "JSON produce distinguishes null and empty Base64 keys and header values" {
@@ -565,29 +633,77 @@ test "JSON produce distinguishes null and empty Base64 keys and header values" {
     defer arena.deinit();
     const rec = jsonRecord(arena.allocator(),
         \\{"key_b64":null,"value":"x","headers":[{"key":"null","value_b64":null},{"key":"empty","value_b64":""}]}
-    , &.{}, 1);
+    , &.{}).record;
     try std.testing.expect(rec.key == null);
     try std.testing.expectEqual(@as(usize, 2), rec.headers.len);
     try std.testing.expect(rec.headers[0].value == null);
     try std.testing.expectEqualStrings("", rec.headers[1].value.?);
-    try std.testing.expectEqualStrings("", jsonRecord(arena.allocator(), "{\"key_b64\":\"\",\"value\":\"x\"}", &.{}, 1).key.?);
+    try std.testing.expectEqualStrings("", jsonRecord(arena.allocator(), "{\"key_b64\":\"\",\"value\":\"x\"}", &.{}).record.key.?);
 }
 
-fn decodeJsonBase64(alloc: std.mem.Allocator, encoded: []const u8, field: []const u8, lineno: u64) []const u8 {
-    return json.decodeBase64(alloc, encoded) catch
-        fatal("line {d}: \"{s}\" is not valid base64", .{ lineno, field });
+fn jsonScanError(err: json.Error) RecordParseResult {
+    return switch (err) {
+        error.Malformed => .{ .invalid = "invalid JSON (want {\"key\":..,\"value\":..,\"headers\":{..}})" },
+        error.OutOfMemory => oom(),
+    };
 }
 
-fn jsonFatal(lineno: u64, shape: []const u8) noreturn {
-    fatal("line {d}: invalid JSON ({s})", .{ lineno, shape });
-}
-
-fn jsonHeaderValue(v: json.Value, lineno: u64) ?[]const u8 {
+fn jsonHeaderValue(v: json.Value) error{InvalidHeaderValue}!?[]const u8 {
     return switch (v) {
         .null => null,
         .string, .object, .array => v.bytes(),
-        .other => fatal("line {d}: header values must be strings or null", .{lineno}),
+        .other => error.InvalidHeaderValue,
     };
+}
+
+test "JSON record parsing returns a diagnostic without exiting" {
+    const alloc = std.testing.allocator;
+    const valid = jsonRecord(alloc, "{\"value\":42}", &.{});
+    try std.testing.expectEqualStrings("42", valid.record.value.?);
+    const invalid = jsonRecord(alloc, "{\"value\":tru}", &.{});
+    try std.testing.expect(std.mem.startsWith(u8, invalid.invalid, "invalid JSON"));
+    const invalid_header = jsonRecord(alloc, "{\"value\":42,\"headers\":{\"x\":false}}", &.{});
+    try std.testing.expectEqualStrings("header values must be strings or null", invalid_header.invalid);
+}
+
+test "JSON header entries decode binary key names and reject invalid definitions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const valid = jsonRecord(alloc, "{\"value\":\"x\",\"headers\":[{\"key_b64\":\"/w==\",\"value\":\"v\"}]}", &.{});
+    try std.testing.expectEqualStrings("\xff", valid.record.headers[0].key);
+    try std.testing.expectEqualStrings("v", valid.record.headers[0].value.?);
+    const invalid_base64 = jsonRecord(alloc, "{\"value\":\"x\",\"headers\":[{\"key_b64\":\"!!!!\"}]}", &.{});
+    try std.testing.expectEqualStrings("header \"key_b64\" is not valid base64", invalid_base64.invalid);
+    const conflicting = jsonRecord(alloc, "{\"value\":\"x\",\"headers\":[{\"key_b64\":\"/w==\",\"key\":\"h\"}]}", &.{});
+    try std.testing.expectEqualStrings("use \"key\" or \"key_b64\", not both, in a header entry", conflicting.invalid);
+}
+
+test "JSON records reject duplicate envelope fields but preserve repeated Kafka headers and payload keys" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const probes = [_]struct { line: []const u8, message: []const u8 }{
+        .{ .line = "{\"value\":1,\"value\":2}", .message = "duplicate \"value\" field" },
+        .{ .line = "{\"value\":null,\"value\":2}", .message = "duplicate \"value\" field" },
+        .{ .line = "{\"value_b64\":null,\"value\":2}", .message = "use \"value\" or \"value_b64\", not both" },
+        .{ .line = "{\"value_b64\":\"eA==\",\"value_b64\":\"eQ==\"}", .message = "duplicate \"value_b64\" field" },
+        .{ .line = "{\"value\":0,\"key\":null,\"\\u006bey\":\"k\"}", .message = "duplicate \"key\" field" },
+        .{ .line = "{\"value\":0,\"key_b64\":\"eA==\",\"key_b64\":\"eQ==\"}", .message = "duplicate \"key_b64\" field" },
+        .{ .line = "{\"value\":0,\"headers\":null,\"headers\":[]}", .message = "duplicate \"headers\" field" },
+        .{ .line = "{\"value\":0,\"partition\":0,\"partition\":1}", .message = "duplicate \"partition\" field" },
+        .{ .line = "{\"value\":0,\"headers\":[{\"key\":\"x\",\"key\":\"y\"}]}", .message = "duplicate \"key\" field in header entry" },
+        .{ .line = "{\"value\":0,\"headers\":[{\"key_b64\":\"eA==\",\"key_b64\":\"eQ==\"}]}", .message = "duplicate \"key_b64\" field in header entry" },
+        .{ .line = "{\"value\":0,\"headers\":[{\"key\":\"h\",\"value\":null,\"value\":\"v\"}]}", .message = "duplicate \"value\" field in header entry" },
+        .{ .line = "{\"value\":0,\"headers\":[{\"key\":\"h\",\"value_b64\":\"eA==\",\"value_b64\":\"eQ==\"}]}", .message = "duplicate \"value_b64\" field in header entry" },
+    };
+    for (probes) |probe| {
+        const result = jsonRecord(alloc, probe.line, &.{});
+        try std.testing.expectEqualStrings(probe.message, result.invalid);
+    }
+    const valid = jsonRecord(alloc, "{\"unknown\":1,\"unknown\":2,\"value\":{\"x\":1,\"x\":2},\"headers\":[{\"key\":\"h\"},{\"key\":\"h\"}]}", &.{});
+    try std.testing.expectEqualStrings("{\"x\":1,\"x\":2}", valid.record.value.?);
+    try std.testing.expectEqual(@as(usize, 2), valid.record.headers.len);
 }
 
 fn note(comptime fmt: []const u8, args: anytype) void {
@@ -1953,19 +2069,38 @@ fn csvRecord(
     cols: []const []const u8,
     key_idx: ?usize,
     static_headers: []const protocol.Header,
-    rowno: u64,
-) protocol.Record {
-    const fields = csv.splitFields(alloc, row) catch
-        fatal("csv row {d}: unterminated quoted field", .{rowno});
-    if (fields.len != cols.len)
-        fatal("csv row {d}: expected {d} field(s), got {d}", .{ rowno, cols.len, fields.len });
+) RecordParseResult {
+    const fields = csv.splitFields(alloc, row) catch |err| switch (err) {
+        error.MalformedCsv => return .{ .invalid = "unterminated quoted field" },
+        error.OutOfMemory => oom(),
+    };
+    if (fields.len != cols.len) return .{
+        .invalid = std.fmt.allocPrint(alloc, "expected {d} field(s), got {d}", .{ cols.len, fields.len }) catch oom(),
+    };
     var jw = std.Io.Writer.Allocating.init(alloc);
-    csv.rowJson(&jw.writer, cols, fields) catch fatal("out of memory", .{});
-    return .{
+    csv.rowJson(&jw.writer, cols, fields) catch oom();
+    return .{ .record = .{
         .key = if (key_idx) |ki| fields[ki] else null,
         .value = jw.written(),
         .headers = static_headers,
-    };
+    } };
+}
+
+test "CSV record parsing returns quote and field-count diagnostics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const cols = &.{ "k", "v" };
+    var good = "a,1".*;
+    const valid = csvRecord(alloc, &good, cols, 0, &.{});
+    try std.testing.expectEqualStrings("a", valid.record.key.?);
+    try std.testing.expectEqualStrings("{\"k\":\"a\",\"v\":\"1\"}", valid.record.value.?);
+    var bad_quote = "\"c,3".*;
+    const invalid_quote = csvRecord(alloc, &bad_quote, cols, null, &.{});
+    try std.testing.expectEqualStrings("unterminated quoted field", invalid_quote.invalid);
+    var bad_count = "c".*;
+    const invalid_count = csvRecord(alloc, &bad_count, cols, null, &.{});
+    try std.testing.expectEqualStrings("expected 2 field(s), got 1", invalid_count.invalid);
 }
 
 /// Estimated encoded size of a record: key + value + header bytes plus

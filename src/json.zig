@@ -58,6 +58,13 @@ pub const Value = union(enum) {
 
 pub const Member = struct { key: []const u8, value: Value };
 
+fn isWhitespace(c: u8) bool {
+    return switch (c) {
+        ' ', '\t', '\r', '\n' => true,
+        else => false,
+    };
+}
+
 /// Cursor over a JSON document. Strings are unescaped into `alloc` only when
 /// they contain a backslash; otherwise the source slice is returned.
 pub const Scanner = struct {
@@ -66,7 +73,7 @@ pub const Scanner = struct {
     alloc: std.mem.Allocator,
 
     fn skipWs(s: *Scanner) void {
-        while (s.pos < s.src.len and std.ascii.isWhitespace(s.src[s.pos])) s.pos += 1;
+        while (s.pos < s.src.len and isWhitespace(s.src[s.pos])) s.pos += 1;
     }
 
     fn peek(s: *Scanner) ?u8 {
@@ -93,18 +100,8 @@ pub const Scanner = struct {
 
     /// Next `"key": value` pair, or null once the closing brace is consumed.
     pub fn nextMember(s: *Scanner, first: bool) Error!?Member {
-        switch (s.peek() orelse return error.Malformed) {
-            '}' => {
-                s.pos += 1;
-                return null;
-            },
-            ',' => {
-                if (first) return error.Malformed;
-                s.pos += 1;
-            },
-            else => if (!first) return error.Malformed,
-        }
-        const key = try s.string();
+        if (!try s.nextEntry(first, '}')) return null;
+        const key = try s.string(true);
         try s.expect(':');
         return .{ .key = key, .value = try s.value() };
     }
@@ -118,17 +115,17 @@ pub const Scanner = struct {
 
     /// True while another element follows; consumes separators and `]`.
     pub fn nextElement(s: *Scanner, first: bool) Error!bool {
-        switch (s.peek() orelse return error.Malformed) {
-            ']' => {
-                s.pos += 1;
-                return false;
-            },
-            ',' => {
-                if (first) return error.Malformed;
-                s.pos += 1;
-            },
-            else => if (!first) return error.Malformed,
+        return s.nextEntry(first, ']');
+    }
+
+    fn nextEntry(s: *Scanner, first: bool, close: u8) Error!bool {
+        const c = s.peek() orelse return error.Malformed;
+        if (c == close) {
+            s.pos += 1;
+            return false;
         }
+        if ((c == ',') == first) return error.Malformed;
+        if (!first) s.pos += 1;
         return true;
     }
 
@@ -136,49 +133,66 @@ pub const Scanner = struct {
         const c = s.peek() orelse return error.Malformed;
         const start = s.pos;
         switch (c) {
-            '"' => return .{ .string = try s.string() },
+            '"' => return .{ .string = try s.string(true) },
             '{' => {
-                try s.skipNested('{', '}');
+                try s.skipNested('}');
                 return .{ .object = s.src[start..s.pos] };
             },
             '[' => {
-                try s.skipNested('[', ']');
+                try s.skipNested(']');
                 return .{ .array = s.src[start..s.pos] };
             },
-            else => {
-                while (s.pos < s.src.len) : (s.pos += 1) {
-                    switch (s.src[s.pos]) {
-                        ',', '}', ']', ' ', '\t', '\n', '\r' => break,
-                        else => {},
-                    }
-                }
-                const raw = s.src[start..s.pos];
-                if (std.mem.eql(u8, raw, "null")) return .null;
-                if (raw.len == 0) return error.Malformed;
-                return .{ .other = raw };
-            },
+            else => return s.primitive(),
         }
     }
 
-    fn skipNested(s: *Scanner, open: u8, close: u8) Error!void {
-        var depth: usize = 0;
+    fn primitive(s: *Scanner) Error!Value {
+        const start = s.pos;
         while (s.pos < s.src.len) {
             const c = s.src[s.pos];
-            if (c == '"') {
-                _ = try s.string();
-                continue;
-            }
+            if (c == ',' or c == '}' or c == ']' or isWhitespace(c)) break;
             s.pos += 1;
-            if (c == open) depth += 1;
-            if (c == close) {
-                depth -= 1;
-                if (depth == 0) return;
-            }
         }
-        return error.Malformed;
+        const raw = s.src[start..s.pos];
+        if (std.mem.eql(u8, raw, "null")) return .null;
+        if (!std.mem.eql(u8, raw, "true") and !std.mem.eql(u8, raw, "false") and !isNumber(raw))
+            return error.Malformed;
+        return .{ .other = raw };
     }
 
-    fn string(s: *Scanner) Error![]const u8 {
+    fn skipNested(s: *Scanner, initial_close: u8) Error!void {
+        var scratch = std.heap.stackFallback(64, s.alloc);
+        const alloc = scratch.get();
+        var closes: std.ArrayList(u8) = .empty;
+        defer closes.deinit(alloc);
+        try closes.append(alloc, initial_close);
+        s.pos += 1;
+        var first = true;
+        while (closes.items.len != 0) {
+            const close = closes.items[closes.items.len - 1];
+            if (!try s.nextEntry(first, close)) {
+                _ = closes.pop();
+                first = false;
+                continue;
+            }
+            if (close == '}') {
+                _ = try s.string(false);
+                try s.expect(':');
+            }
+            first = false;
+            switch (s.peek() orelse return error.Malformed) {
+                '{', '[' => |open| {
+                    try closes.append(alloc, if (open == '{') '}' else ']');
+                    s.pos += 1;
+                    first = true;
+                },
+                '"' => _ = try s.string(false),
+                else => _ = try s.primitive(),
+            }
+        }
+    }
+
+    fn string(s: *Scanner, decode: bool) Error![]const u8 {
         try s.expect('"');
         const start = s.pos;
         var escaped = false;
@@ -187,12 +201,14 @@ pub const Scanner = struct {
                 '"' => {
                     const raw = s.src[start..s.pos];
                     s.pos += 1;
-                    return if (escaped) try unescape(s.alloc, raw) else raw;
+                    if (!std.unicode.utf8ValidateSlice(raw)) return error.Malformed;
+                    return if (escaped) try unescape(s.alloc, raw, decode) else raw;
                 },
                 '\\' => {
                     escaped = true;
                     s.pos += 1;
                 },
+                0...31 => return error.Malformed,
                 else => {},
             }
         }
@@ -200,30 +216,62 @@ pub const Scanner = struct {
     }
 };
 
-fn unescape(alloc: std.mem.Allocator, raw: []const u8) Error![]const u8 {
-    var out = try std.ArrayListUnmanaged(u8).initCapacity(alloc, raw.len);
+fn isNumber(raw: []const u8) bool {
+    var i: usize = 0;
+    if (i < raw.len and raw[i] == '-') i += 1;
+    if (i == raw.len or !std.ascii.isDigit(raw[i])) return false;
+    if (raw[i] == '0') {
+        i += 1;
+    } else {
+        while (i < raw.len and std.ascii.isDigit(raw[i])) i += 1;
+    }
+    if (i < raw.len and raw[i] == '.') {
+        i += 1;
+        const start = i;
+        while (i < raw.len and std.ascii.isDigit(raw[i])) i += 1;
+        if (i == start) return false;
+    }
+    if (i < raw.len and (raw[i] == 'e' or raw[i] == 'E')) {
+        i += 1;
+        if (i < raw.len and (raw[i] == '+' or raw[i] == '-')) i += 1;
+        const start = i;
+        while (i < raw.len and std.ascii.isDigit(raw[i])) i += 1;
+        if (i == start) return false;
+    }
+    return i == raw.len;
+}
+
+fn hexQuad(raw: *const [4]u8) Error!u16 {
+    var cp: u16 = 0;
+    for (raw) |c| cp = (cp << 4) | (std.fmt.charToDigit(c, 16) catch return error.Malformed);
+    return cp;
+}
+
+fn unescape(alloc: std.mem.Allocator, raw: []const u8, decode: bool) Error![]const u8 {
+    var out: std.ArrayList(u8) = if (decode) try .initCapacity(alloc, raw.len) else .empty;
+    errdefer out.deinit(alloc);
     var i: usize = 0;
     while (i < raw.len) : (i += 1) {
         const c = raw[i];
         if (c != '\\') {
-            out.appendAssumeCapacity(c);
+            if (decode) out.appendAssumeCapacity(c);
             continue;
         }
         i += 1;
         if (i >= raw.len) return error.Malformed;
-        switch (raw[i]) {
-            '"', '\\', '/' => |e| out.appendAssumeCapacity(e),
-            'n' => out.appendAssumeCapacity('\n'),
-            'r' => out.appendAssumeCapacity('\r'),
-            't' => out.appendAssumeCapacity('\t'),
-            'b' => out.appendAssumeCapacity(8),
-            'f' => out.appendAssumeCapacity(12),
+        const byte = switch (raw[i]) {
+            '"', '\\', '/' => |e| e,
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'b' => 8,
+            'f' => 12,
             'u' => {
                 if (i + 4 >= raw.len) return error.Malformed;
-                var cp: u21 = std.fmt.parseInt(u16, raw[i + 1 .. i + 5], 16) catch return error.Malformed;
+                var cp: u21 = try hexQuad(raw[i + 1 ..][0..4]);
                 i += 4;
                 if (cp >= 0xD800 and cp < 0xDC00 and i + 6 < raw.len and raw[i + 1] == '\\' and raw[i + 2] == 'u') {
-                    const lo = std.fmt.parseInt(u16, raw[i + 3 .. i + 7], 16) catch return error.Malformed;
+                    const lo = try hexQuad(raw[i + 3 ..][0..4]);
                     if (lo >= 0xDC00 and lo < 0xE000) {
                         cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                         i += 6;
@@ -231,12 +279,14 @@ fn unescape(alloc: std.mem.Allocator, raw: []const u8) Error![]const u8 {
                 }
                 var buf: [4]u8 = undefined;
                 const n = std.unicode.utf8Encode(cp, &buf) catch return error.Malformed;
-                try out.appendSlice(alloc, buf[0..n]);
+                if (decode) out.appendSliceAssumeCapacity(buf[0..n]);
+                continue;
             },
             else => return error.Malformed,
-        }
+        };
+        if (decode) out.appendAssumeCapacity(byte);
     }
-    return out.items;
+    return if (decode) out.items else raw;
 }
 
 test "scanner: flat object with strings, null and nested values" {
@@ -284,6 +334,49 @@ test "scanner: unescapes \\u sequences and rejects malformed input" {
         }
         try std.testing.expect(failed);
     }
+}
+
+test "scanner: valid JSON values are preserved verbatim" {
+    for ([_][]const u8{
+        "true",  "false", "0",           "-0",                      "123456789012345678901234567890",
+        "-0.25", "1e9",   "-10.5E+0002", "1e-99999999999999999999",
+        "{\"é\\u0021\" : [true, false, null, {}, [], \"\\t\\ud83d\\ude00\", -0.5e+2]}",
+    }) |raw| {
+        var s = Scanner{ .src = raw, .alloc = std.testing.allocator };
+        try std.testing.expectEqualStrings(raw, (try s.value()).bytes().?);
+        try std.testing.expect(s.atEnd());
+    }
+}
+
+test "scanner: rejects invalid tokens, containers and strings" {
+    for ([_][]const u8{
+        "tru",      "truefalse",   "False",                 "nul",          "null1",                 "undefined",
+        "-",        "+1",          "01",                    "-01",          ".2",                    "1.",
+        "1e",       "1e+",         "1e-",                   "0x1",          "1_000",                 "NaN",
+        "Infinity", "{\"x\":}",    "{\"x\" 1}",             "{\"x\":1,}",   "{\"x\":1 \"y\":2}",     "{x:1}",
+        "[,1]",     "[1,]",        "[1,,2]",                "[1 2]",        "[}",                    "{]",
+        "[",        "[[[]]",       "{\"x\":[{\"y\":tru}]}", "[{\"x\":01}]", "[true\x0c]",            "\x0btrue",
+        "\"a\tb\"", "\"\\u+01f\"", "\"\\u0_01\"",           "\"\\q\"",      "{\"x\":[\"\\ud800\"]}", "{\"\\q\":1}",
+    }) |raw| {
+        var s = Scanner{ .src = raw, .alloc = std.testing.allocator };
+        try std.testing.expectError(error.Malformed, s.value());
+    }
+}
+
+test "scanner: rejects non-Unicode strings in both decoded and verbatim values" {
+    for ([_][]const u8{ "\"\xff\"", "\"\\ud800\"", "{\"x\":\"\xff\"}", "[\"\\udc00\"]" }) |raw| {
+        var s = Scanner{ .src = raw, .alloc = std.testing.allocator };
+        try std.testing.expectError(error.Malformed, s.value());
+    }
+}
+
+test "scanner: deeply nested JSON uses a growable stack" {
+    var raw: [2048]u8 = undefined;
+    @memset(raw[0..1024], '[');
+    @memset(raw[1024..], ']');
+    var s = Scanner{ .src = &raw, .alloc = std.testing.allocator };
+    try std.testing.expectEqualStrings(&raw, (try s.value()).array);
+    try std.testing.expect(s.atEnd());
 }
 
 test "standard padded base64 decoder preserves bytes" {
