@@ -215,13 +215,11 @@ pub const Client = struct {
                 "produce to {s}: not authorized to write (check ACLs for this principal)",
                 .{topic},
             ),
-            .invalid_record => c.setErr(
-                "produce to {s}[{d}]: INVALID_RECORD (compacted topics require a key, including for tombstones)",
-                .{ topic, pidx },
-            ),
             else => c.setErr("produce to {s}[{d}]: {s}", .{ topic, pidx, result.code.name() }),
         }
         if (result.message) |message| c.appendProduceErr(": ", message);
+        if (result.code == .invalid_record)
+            c.appendProduceErr("; ", "if the topic is compacted, records need a non-null key");
     }
 
     fn appendProduceErr(c: *Client, separator: []const u8, detail: []const u8) void {
@@ -2431,6 +2429,22 @@ test "produce error sanitizes and bounds broker detail" {
     const detail = c.errDetail();
     try std.testing.expectEqual(c.err_ctx.len - 1, detail.len);
     try std.testing.expectEqual(@as(u8, '?'), detail[detail.len - 1]);
+}
+
+test "invalid record reports the broker reason before the conditional compaction hint" {
+    var c: Client = undefined;
+    c.err_ctx = @splat(0);
+    c.produceErr("topic", 0, .{ .code = .invalid_record, .message = "schema ID validation failed" }, 0);
+    try std.testing.expectEqualStrings(
+        "produce to topic[0]: INVALID_RECORD: schema ID validation failed; if the topic is compacted, records need a non-null key",
+        c.errDetail(),
+    );
+
+    c.produceErr("topic", 0, .{ .code = .invalid_record }, 0);
+    try std.testing.expectEqualStrings(
+        "produce to topic[0]: INVALID_RECORD; if the topic is compacted, records need a non-null key",
+        c.errDetail(),
+    );
 }
 
 test "dropping a produce socket invalidates only its outstanding responses" {

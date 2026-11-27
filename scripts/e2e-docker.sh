@@ -118,8 +118,8 @@ zig-out/bin/kite topic create -p 1 -r 1 --set cleanup.policy=compact "$TOMBSTONE
 if printf '%s\n' '{"value":null}' | zig-out/bin/kite produce --json "$TOMBSTONE_COMPACT" 2>"$TMP/invalid-record.err"; then
     fail "json-tombstones: compacted topic accepted a keyless tombstone"
 fi
-grep -Fq 'INVALID_RECORD (compacted topics require a key, including for tombstones)' "$TMP/invalid-record.err" \
-    && grep -Fiq 'Compacted topic cannot accept message without key' "$TMP/invalid-record.err" \
+grep -Eiq 'INVALID_RECORD: .*Compacted topic cannot accept message without key.*; if the topic is compacted, records need a non-null key' \
+    "$TMP/invalid-record.err" \
     || { cat "$TMP/invalid-record.err"; fail "json-tombstones: missing INVALID_RECORD hint or broker detail"; }
 echo "PASS json-tombstones compacted topic diagnostics"
 
