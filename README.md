@@ -417,11 +417,13 @@ without commits. Deleted topics or partitions retain committed offsets but show
 unavailable end/lag (`-`, or JSON null). Negative lag after truncation is clamped
 to zero with a warning.
 Lag uses the high watermark (`read_uncommitted`), like the stock tools, not
-the last stable offset used by `read_committed` consumers. If a topic's ACL
-denies describe access, `group describe` skips that topic, warns on stderr,
-and still exits successfully with the remaining rows on stdout, including
-with `--json`. Group listing warns and returns partial results when some
-brokers are unreachable.
+the last stable offset used by `read_committed` consumers. If an active classic
+member is assigned a topic the caller cannot describe, `group describe` skips
+the topic, warns on stderr, and exits successfully with the remaining rows on
+stdout, including with `--json`. Kafka can silently omit denied topics from
+committed offset results. For an inactive group, `--json` can therefore exit
+successfully with no output and no warning. Group listing warns and returns
+partial results when some brokers are unreachable.
 
 `consume -g GROUP` (or `--group GROUP`) joins a Kafka 4.0 consumer-protocol
 group and shares partitions with its other members. It resumes committed
