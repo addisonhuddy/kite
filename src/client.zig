@@ -764,10 +764,14 @@ pub const Client = struct {
     }
 
     pub fn describeGroup(c: *Client, alloc: std.mem.Allocator, group: []const u8) !protocol.DescribedGroup {
-        return c.describeGroupOnCoordinator(alloc, group, false);
-    }
-
-    pub fn describeClassicGroup(c: *Client, alloc: std.mem.Allocator, group: []const u8) !protocol.DescribedGroup {
+        if (c.checkVersion(protocol.api_key.consumer_group_describe, protocol.version.consumer_group_describe)) {
+            if (c.describeGroupOnCoordinator(alloc, group, false)) |result| {
+                return result;
+            } else |err| switch (err) {
+                error.GroupNotFound, error.ConsumerGroupDescribeUnsupported => {},
+                else => return err,
+            }
+        }
         return c.describeGroupOnCoordinator(alloc, group, true);
     }
 
@@ -781,6 +785,7 @@ pub const Client = struct {
             const resp = try c.groupRequest(alloc, group, key, ver, api, group, protocol.describeGroupRequest);
             var d = Decoder.init(resp.body);
             const result = try decode(&d, alloc);
+            if (!classic and result.code == .unsupported_version) return error.ConsumerGroupDescribeUnsupported;
             if (isCoordinatorError(result.code)) {
                 c.invalidateCoordinator();
                 if (retry.pause(c)) continue;
@@ -2231,7 +2236,7 @@ pub const Client = struct {
     }
 };
 
-test "classic describe uses only the cached coordinator for empty groups and errors" {
+test "classic describe uses the cached coordinator when consumer describe is unavailable" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     var env: std.process.Environ.Map = .init(alloc);
@@ -2252,40 +2257,53 @@ test "classic describe uses only the cached coordinator for empty groups and err
     defer peer.close(io);
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    for (0..3) |case| {
+    for (0..4) |case| {
+        const unsupported = case == 3;
+        const next_corr = protocol.lastCorrelationId() + 1;
+        var buffer: [128]u8 = undefined;
+        var writer = peer.writer(io, &buffer);
+        if (unsupported) {
+            try c.api_ranges.put(alloc, protocol.api_key.consumer_group_describe, .{ .min = 0, .max = 0 });
+            const body = "\x00\x00\x00\x00\x02\x00\x23\x00\x02g\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x01\x80\x00\x00\x00\x00\x00";
+            var header: [8]u8 = undefined;
+            std.mem.writeInt(u32, header[0..4], 5 + body.len, .big);
+            std.mem.writeInt(i32, header[4..8], next_corr, .big);
+            try writer.interface.writeAll(&header);
+            try writer.interface.writeByte(0);
+            try writer.interface.writeAll(body);
+        }
         var response = Encoder.init(alloc);
         defer response.deinit();
-        try response.i32v(protocol.lastCorrelationId() + 1);
+        try response.i32v(next_corr + @as(i32, @intFromBool(unsupported)));
         try response.tagBuffer();
         try response.i32v(0);
         try response.compactArrayLen(1);
         try response.i16v(switch (case) {
-            0 => 0,
+            0, 3 => 0,
             1 => @intFromEnum(protocol.ErrorCode.group_id_not_found),
             else => @intFromEnum(protocol.ErrorCode.group_authorization_failed),
         });
         try response.compactString(null);
-        for ([_][]const u8{ "g", if (case == 0) "Empty" else "", "", "" }) |field| try response.compactString(field);
+        for ([_][]const u8{ "g", if (case == 0 or unsupported) "Empty" else "", "", "" }) |field| try response.compactString(field);
         try response.compactArrayLen(0);
         try response.i32v(std.math.minInt(i32));
         try response.tagBuffer();
         try response.tagBuffer();
-        var buffer: [128]u8 = undefined;
-        var writer = peer.writer(io, &buffer);
         var length: [4]u8 = undefined;
         std.mem.writeInt(u32, &length, @intCast(response.written().len), .big);
         try writer.interface.writeAll(&length);
         try writer.interface.writeAll(response.written());
         try writer.interface.flush();
         switch (case) {
-            0 => {
-                const group = try c.describeClassicGroup(arena.allocator(), "g");
+            0, 3 => {
+                const group = try c.describeGroup(arena.allocator(), "g");
                 try std.testing.expectEqualStrings("Empty", group.state);
                 try std.testing.expectEqual(@as(usize, 0), group.partitions.len);
             },
-            1 => try std.testing.expectError(error.GroupNotFound, c.describeClassicGroup(arena.allocator(), "g")),
-            else => try std.testing.expectError(error.GroupFailed, c.describeClassicGroup(arena.allocator(), "g")),
+            1 => try std.testing.expectError(error.GroupNotFound, c.describeGroup(arena.allocator(), "g")),
+            else => try std.testing.expectError(error.GroupFailed, c.describeGroup(arena.allocator(), "g")),
         }
+        try std.testing.expectEqual(next_corr + @as(i32, @intFromBool(unsupported)), protocol.lastCorrelationId());
         try std.testing.expect(c.control == null);
         try std.testing.expectEqual(@as(u32, 1), c.conns.count());
     }

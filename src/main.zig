@@ -1073,13 +1073,7 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
     }
     const group = opts.group.?;
     const group_text = groupText(alloc, group);
-    const described = c.describeGroup(alloc, group) catch |err| switch (err) {
-        error.GroupNotFound => c.describeClassicGroup(alloc, group) catch |classic_err| switch (classic_err) {
-            error.GroupNotFound => fatalErr(&c, "could not describe group"),
-            else => fatalErr(&c, "could not describe classic group"),
-        },
-        else => fatalErr(&c, "could not describe group"),
-    };
+    const described = c.describeGroup(alloc, group) catch fatalErr(&c, "could not describe group");
     const fetched = c.fetchGroupOffsets(alloc, .{ .group = group }) catch fatalErr(&c, "could not fetch group offsets");
     const Row = struct { topic: []const u8, partition: i32, committed: i64 = -1, member: []const u8 = "", client_id: []const u8 = "" };
     var rows: std.ArrayList(Row) = .empty;
