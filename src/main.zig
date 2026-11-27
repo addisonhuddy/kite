@@ -246,6 +246,7 @@ pub fn main(init: std.process.Init) !void {
 
     var rr: usize = 0; // round-robin cursor for unkeyed records
     var total: u64 = 0;
+    var json_lineno: u64 = 0;
     const timing = init.environ_map.get("KITE_TIME") != null;
     var t_read: u64 = 0;
     var t_flush: u64 = 0;
@@ -289,8 +290,9 @@ pub fn main(init: std.process.Init) !void {
                 fatal("failed reading stdin", .{});
             } orelse break :read_loop;
             if (json_mode) {
-                if (std.mem.trim(u8, owned, " \t").len == 0) continue;
-                break :blk jsonRecord(alloc, owned, static_headers, total + 1);
+                json_lineno += 1;
+                if (std.mem.trim(u8, owned, " \t\r").len == 0) continue;
+                break :blk jsonRecord(alloc, owned, static_headers, json_lineno);
             }
             if (value_mode)
                 break :blk protocol.Record{ .value = owned, .headers = static_headers };

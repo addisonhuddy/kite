@@ -111,6 +111,13 @@ expect_json_produce_error '{"value":"x","headers":[{"key":"h","value":"x","value
 expect_json_produce_error '{"key":"k"}' 'JSON object has no "value" or "value_b64" field' missing-json-value
 echo "PASS json-base64 input errors"
 
+expect_json_produce_error '{"value":tru}' 'kite: line 1: invalid JSON' invalid-json-literal
+expect_json_produce_error '{"value":{"x":}}' 'kite: line 1: invalid JSON' invalid-json-object-value
+expect_json_produce_error '{"value":[1,]}' 'kite: line 1: invalid JSON' invalid-json-array
+expect_json_produce_error '{"value":01}' 'kite: line 1: invalid JSON' invalid-json-number
+expect_json_produce_error $'\n\t\n{"value":tru}' 'kite: line 3: invalid JSON' invalid-json-line-number
+echo "PASS malformed JSON input errors"
+
 # Stopping bounds: `-n 1` on an empty topic bounds records, not time, so it
 # must still be running after 3s; `-n 1 --idle 500ms` must stop on its own.
 EMPTY_TOPIC="kite-empty-$(date +%s)-$RANDOM"
@@ -358,6 +365,20 @@ rc_want=$(printf 'sentinel-a\nsentinel-b')
 ru_out=$(zig-out/bin/kite consume -B --read-uncommitted -n 4 --idle 3s --format value "$TXN_ABORT" 2>/dev/null | sort)
 ru_want=$(printf 'before-err-1\nbefore-err-2\nsentinel-a\nsentinel-b')
 [ "$ru_out" = "$ru_want" ] || fail "txn: read_uncommitted did not see aborted + sentinel records: [$ru_out]"
+
+TXN_INVALID_JSON="kite-txn-invalid-json-$(date +%s)-$RANDOM"
+zig-out/bin/kite topic create "$TXN_INVALID_JSON" >/dev/null
+set +e
+printf '%s\n' '{"value":42}' '{"value":tru}' '{"value":{"x":}}' \
+    | zig-out/bin/kite produce --txn kite-e2e-invalid-json --json "$TXN_INVALID_JSON" 2>"$TMP/txn-invalid-json.err"
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "txn: malformed JSON produce exited $rc, want 1"
+grep -Fq 'kite: line 2: invalid JSON' "$TMP/txn-invalid-json.err" \
+    || fail "txn: malformed JSON produce did not report the invalid line"
+got=$(zig-out/bin/kite consume -B -n 1 --idle 1s --format value "$TXN_INVALID_JSON")
+[ -z "$got" ] || fail "txn: malformed JSON committed records: [$got]"
+echo "PASS malformed JSON is not committed"
 
 # Aborted run on SIGINT after records flushed: read_committed sees only later sentinels.
 TXN_INT=kite-txn-sigint-e2e
