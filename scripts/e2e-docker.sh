@@ -74,6 +74,46 @@ export BOOTSTRAP_SERVERS=127.0.0.1:9092
 echo "== smoke.sh =="
 scripts/smoke.sh "$TOPIC"
 
+# Stream more input than the producer's address space limit and check the
+# entire single-partition roundtrip (bytes, count, and order).
+STREAM_TOPIC="kite-stream-$(date +%s)-$RANDOM"
+docker exec "$NAME" /opt/kafka/bin/kafka-topics.sh \
+    --bootstrap-server localhost:9092 --create --topic "$STREAM_TOPIC" \
+    --partitions 1 --replication-factor 1 >/dev/null
+stream_fixture() {
+    python3 - <<'PY'
+import sys
+for i in range(5000):
+    sys.stdout.write(f"{i:05d}" + "x" * (32768 - 5) + "\n")
+PY
+}
+stream_fixture | (ulimit -v 131072; exec timeout 60s zig-out/bin/kite produce --format value "$STREAM_TOPIC") \
+    || fail "stream-produce: could not produce 5000 x 32 KiB under a 128 MiB limit"
+timeout 60s zig-out/bin/kite consume -B --idle 2s --format value "$STREAM_TOPIC" | cmp - <(stream_fixture) \
+    || fail "stream-produce: consumed records differ from input"
+echo "PASS stream-produce: 5000 x 32 KiB under a 128 MiB limit, exact roundtrip"
+
+WIDE_TOPIC="$STREAM_TOPIC-wide"
+docker exec "$NAME" /opt/kafka/bin/kafka-topics.sh \
+    --bootstrap-server localhost:9092 --create --topic "$WIDE_TOPIC" \
+    --partitions 16 --replication-factor 1 >/dev/null
+printf 'enable.idempotence=false\n' >"$TMP/stream.properties"
+stream_fixture | (ulimit -v 131072; exec timeout 60s zig-out/bin/kite produce \
+    --config "$TMP/stream.properties" --format value "$WIDE_TOPIC") \
+    || fail "stream-produce: in-flight batches exceeded the memory limit"
+timeout 60s zig-out/bin/kite consume -B --idle 2s --format value "$WIDE_TOPIC" | python3 -c '
+import sys
+tail = b"x" * (32768 - 5) + b"\n"
+next_record = list(range(16))
+for line in sys.stdin.buffer:
+    i = int(line[:5])
+    partition = i % 16
+    assert i == next_record[partition] and line[5:] == tail, i
+    next_record[partition] += 16
+assert sorted(next_record) == list(range(5000, 5016)), next_record
+' || fail "stream-produce: missing, corrupt, or out-of-order records across 16 partitions"
+echo "PASS stream-produce: 16 partitions with idempotence disabled under a 128 MiB limit"
+
 # README Quickstart, verbatim apart from the topic name: a fresh topic is
 # auto-created by produce, and `-B -n 1 --idle 3s --json | jq -r .value` must print
 # exactly the record just produced (a consume without -B starts at latest and
@@ -520,6 +560,7 @@ ru_want=$(printf 'before-int-1\nbefore-int-2\nsentinel-int-1\nsentinel-int-2')
 [ "$ru_out" = "$ru_want" ] || fail "txn: read_uncommitted did not see SIGINT-aborted + sentinel records: [$ru_out]"
 
 python3 scripts/check-txn-faults.py "$PWD/zig-out/bin/kite" "$NAME"
+timeout 180s python3 scripts/check-txn-streaming.py "$PWD/zig-out/bin/kite"
 
 zig-out/bin/kite topic delete -y "$TXN_TOPIC" "$TXN_ABORT" "$TXN_INT" >/dev/null 2>&1 || true
 echo "PASS txn"
