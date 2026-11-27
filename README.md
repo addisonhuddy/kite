@@ -351,14 +351,15 @@ kite --version                            Print the version.
 `kite consume --help`, `kite topic --help`, and `kite cluster --help`
 print the full pages.
 
-For transactional produce, kite settles in-flight Produce requests before
-aborting. If a Produce outcome cannot be confirmed within its request deadline,
-kite closes that connection and bumps the producer epoch via `InitProducerId`
-v4 (KIP-360) so the coordinator aborts the transaction under a new epoch and
-partition leaders fence any straggling Produce batch even when
-`transaction.partition.verification.enable=false`. Keeping broker-side
-transaction partition verification enabled (KIP-890; default in Apache Kafka
-3.6+) is still recommended as defense in depth.
+For transactional produce, kite requires broker-side transaction partition
+verification (`transaction.partition.verification.enable=true`, enabled by
+default in Apache Kafka 3.6+). Before aborting, kite settles in-flight Produce
+requests up to their request deadline and then sends an epoch-checked
+`EndTxn(abort)` so a fenced process cannot affect a replacement producer. If an
+in-flight Produce cannot be confirmed within its deadline, kite closes that
+connection, aborts the transaction, and warns on stderr with the
+`kafka-transactions.sh describe` check (and `kafka-transactions.sh abort`
+remediation) in case partition verification is disabled on the broker.
 
 ## Topics
 

@@ -588,39 +588,13 @@ try:
         assert state8["produce_captured"].wait(10), "expected linger to dispatch Produce"
         _, err = p.communicate("invalid-json\n", timeout=30)
         assert p.returncode == 1, (p.returncode, err)
-        assert state8["init_count"] >= 2, f"expected KIP-360 InitProducerId epoch bump, got init_count={state8['init_count']} err={err!r}"
-        assert state8["end_txn_aborts"] == 1, f"expected epoch-checked EndTxn(abort) before epoch bump, got {state8['end_txn_aborts']}"
-        assert "PRODUCER_FENCED" not in err and "outcome unknown" not in err, f"unexpected abort warning on clean epoch bump: {err!r}"
+        assert state8["init_count"] == 1, f"cleanup must not send InitProducerId, got init_count={state8['init_count']} err={err!r}"
+        assert state8["end_txn_aborts"] == 1, f"expected epoch-checked EndTxn(abort), got {state8['end_txn_aborts']}"
+        assert "kafka-transactions.sh describe" in err and "PRODUCER_FENCED" not in err, f"expected unsettled-produce warning without PRODUCER_FENCED: {err!r}"
 finally:
     proxy8.close()
 
-def wait_empty_bumped_epoch(txn_id, timeout=15.0):
-    deadline = time.monotonic() + timeout
-    last = ""
-    while (remaining := deadline - time.monotonic()) > 0:
-        try:
-            res = subprocess.run(
-                [
-                    "docker", "exec", container,
-                    "/opt/kafka/bin/kafka-transactions.sh",
-                    "--bootstrap-server", "localhost:9092",
-                    "describe", "--transactional-id", txn_id,
-                ],
-                text=True, capture_output=True, timeout=remaining,
-            )
-        except subprocess.TimeoutExpired:
-            break
-        last = res.stdout + res.stderr
-        if res.returncode == 0:
-            for line in res.stdout.splitlines()[1:]:
-                cols = line.split()
-                if len(cols) >= 5 and cols[1] == txn_id and cols[4] == "Empty" and int(cols[3]) >= 1:
-                    return
-        time.sleep(max(0, min(0.2, deadline - time.monotonic())))
-    raise AssertionError(f"{txn_id} did not reach Empty with epoch >= 1 within {timeout}s:\n{last}")
-
-
-wait_empty_bumped_epoch(txn8)
+wait_complete_abort(txn8)
 # Now release the straggling Produce frame directly to Kafka AFTER CompleteAbort.
 late_conn = socket.create_connection((BROKER_HOST, BROKER_PORT), timeout=15)
 try:
@@ -633,7 +607,7 @@ finally:
 run_kite("produce", "--txn", "kite-e2e-fault8-sentinel", t8, data="k1\tsentinel-after-epoch-bump\n")
 assert run_kite("consume", "-B", "-n", "1", "--idle", "3s", "--format", "value", t8).stdout == "sentinel-after-epoch-bump\n"
 assert run_kite("consume", "-B", "--read-uncommitted", "-n", "1", "--idle", "3s", "--format", "value", t8).stdout == "sentinel-after-epoch-bump\n"
-print("PASS txn-fault: unsettled Produce aborts via KIP-360 epoch bump and fences late straggler")
+print("PASS txn-fault: unsettled Produce warns on abort and broker partition verification fences late straggler")
 
 
 # Fault 9 (R4 P2): SIGINT during withheld ApiVersions on coordinator reconnect exits promptly.

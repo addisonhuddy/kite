@@ -1603,21 +1603,12 @@ pub const Client = struct {
                 return error.ProduceFailed;
             };
             if (code == .none) {
-                if (!commit and unsettled and !c.txn_fenced) {
-                    // EndTxn(abort) confirmed we still own the current epoch and moved
-                    // the transaction to PrepareAbort/CompleteAbort. Now bump the epoch
-                    // via InitProducerId v4 (KIP-360) so partition leaders fence any
-                    // straggling Produce batch even when partition verification is off.
-                    c.initProducerIdTxn(txn_id, c.producer_id, c.producer_epoch) catch |err| {
-                        c.txn_added_parts.clearRetainingCapacity();
-                        c.txn_add_attempted = false;
-                        c.txn_produce_unsettled_until = null;
-                        return err;
-                    };
-                }
                 c.txn_added_parts.clearRetainingCapacity();
                 c.txn_add_attempted = false;
                 c.txn_produce_unsettled_until = null;
+                if (!commit and unsettled) {
+                    std.debug.print("kite: warning: in-flight produce was unconfirmed before abort; if broker partition verification is disabled, verify with: kafka-transactions.sh describe --transactional-id '{s}'\n", .{txn_id});
+                }
                 c.vlog("transaction '{s}' {s}", .{ txn_id, if (commit) "committed" else "aborted" });
                 return;
             }
