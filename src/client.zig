@@ -308,7 +308,8 @@ pub const Client = struct {
             try c.loadCa()
         else
             null;
-        const conn = transport.connect(c.io, c.alloc, c.env, host, port, ca, if (c.group_deadline != null) remaining else null) catch |err| {
+        const conn = transport.connectWithHook(c.io, c.alloc, c.env, host, port, ca, if (c.group_deadline != null) remaining else null, c.hedge_watch_hook) catch |err| {
+            if (err == error.WaitHookAborted) return error.WaitHookAborted;
             switch (err) {
                 error.TlsHandshakeAuthFailed => c.setErr(
                     "TLS certificate verification failed for {s}:{d} (check ssl.truststore.location)",
@@ -823,6 +824,13 @@ pub const Client = struct {
         if (c.coordinator_node == node) c.coordinator_node = -1;
     }
 
+    fn isEpochFenceHeartbeat(body: []const u8) bool {
+        var d = Decoder.init(body);
+        _ = d.i32v() catch return false;
+        const code: protocol.ErrorCode = @enumFromInt(d.i16v() catch return false);
+        return code == .fenced_member_epoch or code == .stale_member_epoch;
+    }
+
     fn finishFrame(io: std.Io, conn: *Conn, acc: *transport.FrameAccumulator, alloc: std.mem.Allocator, corr: i32, deadline: std.Io.Timestamp) !Resp {
         while (true) {
             if (try acc.step(conn, alloc, corr, true)) |resp| return resp;
@@ -938,29 +946,60 @@ pub const Client = struct {
         var acc2: transport.FrameAccumulator = .{};
         defer acc2.deinit(alloc);
         var hedge_alive = true;
+        var deferred_fence: ?Resp = null;
+        var deferred_fence_from_hedge = false;
+        defer if (deferred_fence) |f| alloc.free(f.frame);
         while (conn_alive or hedge_alive) {
             const pick: u1 = if (conn_alive and hedge_alive)
-                transport.waitEitherReadable(c.io, conn, hedge, deadline) orelse return error.IoTimedOut
+                transport.waitEitherReadable(c.io, conn, hedge, deadline) orelse break
             else if (conn_alive) blk: {
                 const left = std.Io.Timestamp.now(c.io, .awake).durationTo(deadline).toMilliseconds();
-                if (left <= 0 or !transport.waitReadable(conn, @intCast(left))) return error.IoTimedOut;
+                if (left <= 0 or !transport.waitReadable(conn, @intCast(left))) break;
                 break :blk 0;
             } else blk: {
                 const left = std.Io.Timestamp.now(c.io, .awake).durationTo(deadline).toMilliseconds();
-                if (left <= 0 or !transport.waitReadable(hedge, @intCast(left))) return error.IoTimedOut;
+                if (left <= 0 or !transport.waitReadable(hedge, @intCast(left))) break;
                 break :blk 1;
             };
             if (pick == 0) {
                 if (acc1.step(conn, alloc, corr1, true)) |maybe_resp| {
-                    if (maybe_resp) |resp| return .{ .resp = resp, .overlapped = true };
+                    if (maybe_resp) |resp| {
+                        if (hedge_alive and isEpochFenceHeartbeat(resp.body)) {
+                            if (deferred_fence) |old| alloc.free(old.frame);
+                            deferred_fence = resp;
+                            deferred_fence_from_hedge = false;
+                            conn_alive = false;
+                            continue;
+                        }
+                        return .{ .resp = resp, .overlapped = true };
+                    }
                 } else |err| {
                     if (err == error.OutOfMemory) return err;
                     conn_alive = false;
-                    if (!hedge_alive) return err;
+                    if (!hedge_alive) {
+                        if (deferred_fence) |f| {
+                            deferred_fence = null;
+                            if (deferred_fence_from_hedge) {
+                                const slot_key = connKey(node, 0xFFFF_FFFD);
+                                c.dropConn(slot_key);
+                                c.conns.put(c.alloc, slot_key, hedge) catch return .{ .resp = f, .overlapped = true };
+                                keep_hedge = true;
+                            }
+                            return .{ .resp = f, .overlapped = true };
+                        }
+                        return err;
+                    }
                 }
             } else {
                 if (acc2.step(hedge, alloc, corr2, true)) |maybe_resp| {
                     if (maybe_resp) |resp| {
+                        if (conn_alive and isEpochFenceHeartbeat(resp.body)) {
+                            if (deferred_fence) |old| alloc.free(old.frame);
+                            deferred_fence = resp;
+                            deferred_fence_from_hedge = true;
+                            hedge_alive = false;
+                            continue;
+                        }
                         const slot_key = connKey(node, 0xFFFF_FFFD);
                         c.dropConn(slot_key);
                         c.conns.put(c.alloc, slot_key, hedge) catch return .{ .resp = resp, .overlapped = true };
@@ -970,9 +1009,25 @@ pub const Client = struct {
                 } else |err| {
                     if (err == error.OutOfMemory) return err;
                     hedge_alive = false;
-                    if (!conn_alive) return err;
+                    if (!conn_alive) {
+                        if (deferred_fence) |f| {
+                            deferred_fence = null;
+                            return .{ .resp = f, .overlapped = true };
+                        }
+                        return err;
+                    }
                 }
             }
+        }
+        if (deferred_fence) |f| {
+            deferred_fence = null;
+            if (deferred_fence_from_hedge) {
+                const slot_key = connKey(node, 0xFFFF_FFFD);
+                c.dropConn(slot_key);
+                c.conns.put(c.alloc, slot_key, hedge) catch return .{ .resp = f, .overlapped = true };
+                keep_hedge = true;
+            }
+            return .{ .resp = f, .overlapped = true };
         }
         return error.IoTimedOut;
     }
@@ -1023,18 +1078,27 @@ pub const Client = struct {
         var retry: Retry = .{};
         var request = req;
         var pending_assignment: ?[]protocol.TopicAssignment = null;
+        var reconciling = false;
         while (true) {
-            const res = try c.groupRequest(alloc, req.group, protocol.api_key.consumer_group_heartbeat, protocol.version.consumer_group_heartbeat, "ConsumerGroupHeartbeat", request, protocol.heartbeatRequest);
+            const res = c.groupRequest(alloc, req.group, protocol.api_key.consumer_group_heartbeat, protocol.version.consumer_group_heartbeat, "ConsumerGroupHeartbeat", request, protocol.heartbeatRequest) catch |err| {
+                if (reconciling) return error.HeartbeatUnreconciled;
+                return err;
+            };
             var d = Decoder.init(res.resp.body);
-            var result = try protocol.heartbeatResponse(&d, alloc);
+            var result = protocol.heartbeatResponse(&d, alloc) catch |err| {
+                if (reconciling) return error.HeartbeatUnreconciled;
+                return err;
+            };
             if (isCoordinatorError(result.code)) {
                 c.invalidateCoordinatorEndpoint(res.node, 0xFFFF_FFFD);
                 request = request.forRetry();
                 if (try retry.pauseOrAbort(c)) continue;
+                if (reconciling) return error.HeartbeatUnreconciled;
                 _ = try c.groupRemainingMs();
             }
             if (res.overlapped and result.code == .none and request.member_epoch > 0) {
                 if (result.assignment != null) pending_assignment = result.assignment;
+                reconciling = true;
                 var reconcile = request.forRetry();
                 reconcile.member_epoch = result.member_epoch;
                 reconcile.hedge_ms = null;

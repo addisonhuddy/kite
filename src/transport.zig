@@ -213,9 +213,9 @@ pub const Conn = struct {
 };
 
 /// Connect TCP to host:port. host may be DNS or IP literal.
-fn tcpConnect(io: std.Io, host: []const u8, port: u16, timeout_ms: ?u64) !std.Io.net.Stream {
+fn tcpConnect(io: std.Io, host: []const u8, port: u16, timeout_ms: ?u64, wait_hook: ?WaitHook) !std.Io.net.Stream {
     const hn = std.Io.net.HostName.init(host) catch return error.HostNotFound;
-    const s = if (timeout_ms) |ms| try connectBounded(io, hn, port, ms) else hn.connect(io, port, .{ .mode = .stream }) catch |err| return switch (err) {
+    const s = if (timeout_ms) |ms| try connectBounded(io, hn, port, ms, wait_hook) else if (wait_hook != null) try connectBounded(io, hn, port, 15000, wait_hook) else hn.connect(io, port, .{ .mode = .stream }) catch |err| return switch (err) {
         error.ConnectionRefused => error.ConnectionRefused,
         error.Timeout, error.HostUnreachable, error.NetworkUnreachable => error.ConnectTimedOut,
         error.UnknownHostName, error.NameServerFailure, error.NoAddressReturned => error.HostNotFound,
@@ -232,18 +232,19 @@ fn tcpConnect(io: std.Io, host: []const u8, port: u16, timeout_ms: ?u64) !std.Io
     return s;
 }
 
-fn connectBounded(io: std.Io, host: std.Io.net.HostName, port: u16, timeout_ms: u64) !std.Io.net.Stream {
+fn connectBounded(io: std.Io, host: std.Io.net.HostName, port: u16, timeout_ms: u64, wait_hook: ?WaitHook) !std.Io.net.Stream {
     const deadline = std.Io.Timestamp.now(io, .awake).addDuration(.fromMilliseconds(@intCast(timeout_ms)));
     var buffer: [32]std.Io.net.HostName.LookupResult = undefined;
     var addresses: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&buffer);
     host.lookup(io, &addresses, .{ .port = port }) catch return error.HostNotFound;
-    var last_error: error{ HostNotFound, ConnectTimedOut, ConnectFailed, ConnectionRefused } = error.HostNotFound;
+    var last_error: error{ HostNotFound, ConnectTimedOut, ConnectFailed, ConnectionRefused, WaitHookAborted } = error.HostNotFound;
     while (addresses.getOne(io)) |result| switch (result) {
         .canonical_name => {},
         .address => |address| {
             const remaining = std.Io.Timestamp.now(io, .awake).durationTo(deadline).toMilliseconds();
             if (remaining <= 0) return error.ConnectTimedOut;
-            return connectAddress(io, address, @intCast(remaining)) catch |err| {
+            return connectAddress(io, address, @intCast(remaining), wait_hook) catch |err| {
+                if (err == error.WaitHookAborted) return err;
                 last_error = err;
                 continue;
             };
@@ -252,7 +253,7 @@ fn connectBounded(io: std.Io, host: std.Io.net.HostName, port: u16, timeout_ms: 
     return last_error;
 }
 
-fn connectAddress(io: std.Io, address: std.Io.net.IpAddress, timeout_ms: u64) !std.Io.net.Stream {
+fn connectAddress(io: std.Io, address: std.Io.net.IpAddress, timeout_ms: u64, wait_hook: ?WaitHook) !std.Io.net.Stream {
     const p = std.posix;
     const raw_fd = p.system.socket(std.Io.Threaded.posixAddressFamily(&address), p.SOCK.STREAM, p.IPPROTO.TCP);
     if (p.errno(raw_fd) != .SUCCESS) return error.ConnectFailed;
@@ -269,8 +270,32 @@ fn connectAddress(io: std.Io, address: std.Io.net.IpAddress, timeout_ms: u64) !s
         .SUCCESS => {},
         .CONNREFUSED => return error.ConnectionRefused,
         .INPROGRESS, .AGAIN => {
-            var pollfds = [_]p.pollfd{.{ .fd = fd, .events = p.POLL.OUT, .revents = 0 }};
-            if ((p.poll(&pollfds, @intCast(timeout_ms)) catch return error.ConnectFailed) == 0) return error.ConnectTimedOut;
+            const deadline = std.Io.Timestamp.now(io, .awake).addDuration(.fromMilliseconds(@intCast(timeout_ms)));
+            while (true) {
+                const remaining = std.Io.Timestamp.now(io, .awake).durationTo(deadline).toMilliseconds();
+                if (remaining <= 0) return error.ConnectTimedOut;
+                var poll_limit: u64 = @intCast(remaining);
+                var hook_due = false;
+                if (wait_hook) |hook| {
+                    if (hook.next_due(hook.ctx)) |due| {
+                        const until = std.Io.Timestamp.now(hook.io, .awake).durationTo(due).toMilliseconds();
+                        if (until <= 0) {
+                            hook_due = true;
+                            poll_limit = 0;
+                        } else {
+                            poll_limit = @min(poll_limit, @as(u64, @intCast(until)));
+                        }
+                    }
+                }
+                var pollfds = [_]p.pollfd{.{ .fd = fd, .events = p.POLL.OUT, .revents = 0 }};
+                const rc = p.poll(&pollfds, @intCast(@min(poll_limit, std.math.maxInt(i32)))) catch return error.ConnectFailed;
+                if (rc > 0) break;
+                if (hook_due) {
+                    if (wait_hook.?.tick(wait_hook.?.ctx)) return error.WaitHookAborted;
+                    continue;
+                }
+                if (std.Io.Timestamp.now(io, .awake).durationTo(deadline).toMilliseconds() <= 0) return error.ConnectTimedOut;
+            }
             var socket_error: u32 = 0;
             var size: p.socklen_t = @sizeOf(u32);
             if (p.errno(p.system.getsockopt(fd, p.SOL.SOCKET, p.SO.ERROR, std.mem.asBytes(&socket_error), &size)) != .SUCCESS) return error.ConnectFailed;
@@ -383,10 +408,41 @@ test "bounded group connections succeed and report refused sockets" {
     const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try addr.listen(std.testing.io, .{});
     const bound = server.socket.address;
-    const stream = try connectAddress(std.testing.io, bound, 100);
+    const stream = try connectAddress(std.testing.io, bound, 100, null);
     stream.close(std.testing.io);
     server.deinit(std.testing.io);
-    try std.testing.expectError(error.ConnectionRefused, connectAddress(std.testing.io, bound, 100));
+    try std.testing.expectError(error.ConnectionRefused, connectAddress(std.testing.io, bound, 100, null));
+}
+
+test "connectWithHook aborts stalled TLS handshake when wait hook fires" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(alloc);
+    defer env.deinit();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+    var ca: std.crypto.Certificate.Bundle = .empty;
+    defer ca.deinit(alloc);
+    const HookState = struct {
+        due: std.Io.Timestamp,
+        fired: bool = false,
+        fn nextDue(ctx: *anyopaque) ?std.Io.Timestamp {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            return s.due;
+        }
+        fn tick(ctx: *anyopaque) bool {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            s.fired = true;
+            return true;
+        }
+    };
+    const started = std.Io.Timestamp.now(io, .awake);
+    var state: HookState = .{ .due = started.addDuration(.fromMilliseconds(15)) };
+    const hook: WaitHook = .{ .io = io, .ctx = &state, .next_due = HookState.nextDue, .tick = HookState.tick };
+    try std.testing.expectError(error.WaitHookAborted, connectWithHook(io, alloc, &env, "127.0.0.1", server.socket.address.getPort(), &ca, 1000, hook));
+    try std.testing.expect(state.fired);
+    try std.testing.expect(started.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds() < 200);
 }
 
 /// Establish a connection: TCP, then TLS if `ca` is set (SNI + verification on).
@@ -399,8 +455,23 @@ pub fn connect(
     ca: ?*std.crypto.Certificate.Bundle,
     timeout_ms: ?u64,
 ) TransportError!*Conn {
-    const stream = tcpConnect(io, host, port, timeout_ms) catch |err| return switch (err) {
-        error.ConnectionRefused, error.ConnectTimedOut, error.HostNotFound => err,
+    return connectWithHook(io, alloc, env, host, port, ca, timeout_ms, null);
+}
+
+/// Establish a connection with an optional wait hook that can abort slow TCP
+/// connect or TLS handshake waits.
+pub fn connectWithHook(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+    host: []const u8,
+    port: u16,
+    ca: ?*std.crypto.Certificate.Bundle,
+    timeout_ms: ?u64,
+    wait_hook: ?WaitHook,
+) TransportError!*Conn {
+    const stream = tcpConnect(io, host, port, timeout_ms, wait_hook) catch |err| return switch (err) {
+        error.ConnectionRefused, error.ConnectTimedOut, error.HostNotFound, error.WaitHookAborted => err,
         else => error.ConnectFailed,
     };
     errdefer stream.close(io);
@@ -432,6 +503,8 @@ pub fn connect(
     if (timeout_ms) |ms| setTimeout(c, ms);
 
     if (ca) |bundle| {
+        c.net_reader.wait_hook = wait_hook;
+        defer c.net_reader.wait_hook = null;
         var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
         io.randomSecure(&entropy) catch io.random(&entropy);
         const client = std.crypto.tls.Client.init(c.input, c.output, .{
@@ -442,6 +515,7 @@ pub fn connect(
             .entropy = &entropy,
             .realtime_now = .now(io, .real),
         }) catch |err| {
+            if (c.net_reader.err != null and c.net_reader.err.? == error.WaitHookAborted) return error.WaitHookAborted;
             // errdefers above close the stream and free `c`.
             if (c.debug)
                 std.debug.print("tls init: {s}\n", .{@errorName(err)});

@@ -323,7 +323,7 @@ const GroupSession = struct {
 
     fn recoverEpoch(s: *GroupSession, err: anyerror) bool {
         const failure = switch (err) {
-            error.MetadataFailed, error.MetadataUnavailable => error.GroupDeadlineExceeded,
+            error.MetadataFailed, error.MetadataUnavailable, error.HeartbeatUnreconciled => error.GroupDeadlineExceeded,
             else => err,
         };
         switch (failure) {
