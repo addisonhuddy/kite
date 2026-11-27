@@ -81,9 +81,11 @@ a fresh topic, `-n` vs `--idle` stopping behaviour, early pipe closure,
 `/dev/full` write errors, and `kite topic` management: create with
 partitions/configs, `--if-not-exists`, partition growth, `--set`/`--unset`
 verified via `kafka-configs.sh`, delete with `-y`, and `--if-exists`).
-The suite also verifies that standalone and group consumers skip aborted and
-open transactions by default, that `--read-uncommitted` exposes both without
-outputting markers, and that latest offsets and group commits respect isolation:
+The suite also verifies transactional produce (`--txn` commit, empty stdin,
+reuse, and abort on mid-stream error or SIGINT), and that standalone and group
+consumers skip aborted and open transactions by default, that
+`--read-uncommitted` exposes both without outputting markers, and that latest
+offsets and group commits respect isolation:
 
 ```sh
 zig build

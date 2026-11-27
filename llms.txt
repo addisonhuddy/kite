@@ -48,6 +48,7 @@ kite produce [OPTIONS] [@CLUSTER] TOPIC   one stdin line = one record
 --json                          JSON records; non-string value sent verbatim; key_b64/value_b64 and array-header value_b64 decode padded standard base64
 --csv [--key COL]               RFC 4180 CSV rows -> JSON object values, optional key column
 -H 'name: value'                header on every record (repeatable)
+--txn ID                        produce all of stdin atomically under transactional ID (commits on EOF, aborts on error or interrupt before commit; if interrupted after commit is sent, exits 130 reporting unknown outcome instead of aborting; requires enable.idempotence=true and broker transaction.partition.verification.enable=true, default in Kafka 3.6+)
 Produce is batched and idempotent by default. stdout is never written.
 
 ## Topics

@@ -113,6 +113,9 @@ run_case missing-header 1 empty "kite: -H requires a value" produce -H
 run_case malformed-header 1 empty "kite: malformed header 'nocolon'" produce -H nocolon demo
 run_case missing-key 1 empty "kite: --key requires a value" produce --key
 run_case key-without-csv 1 empty "kite: --key requires --csv" produce --key id demo
+run_case missing-txn 1 empty "kite: --txn requires a value" produce --txn
+run_case empty-txn 1 empty "kite: --txn must not be empty" produce --txn= demo
+run_case txn-in-consume 1 empty "kite: '--txn' is a produce option; use 'kite produce [OPTIONS] TOPIC'" consume --txn tx1 demo
 run_case extra-topic 1 empty "kite: unexpected argument 'b'" produce a b
 run_case offset-text 1 empty "kite: --offset: 'abc' is not a non-negative integer" consume --offset abc demo
 run_case offset-negative 1 empty "kite: --offset: '-1' is not a non-negative integer" consume --offset -1 demo

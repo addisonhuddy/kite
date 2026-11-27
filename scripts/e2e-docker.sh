@@ -289,6 +289,114 @@ zig-out/bin/kite topic delete -y "$TT" >/dev/null 2>&1 || true
 rm -f "$TERR"
 echo "PASS topic"
 
+echo "== transactional produce =="
+TXN_TOPIC=kite-txn-e2e
+zig-out/bin/kite topic delete -y --if-exists "$TXN_TOPIC" >/dev/null 2>&1 || true
+zig-out/bin/kite topic create -p 3 -r 1 "$TXN_TOPIC" >/dev/null 2>&1 \
+    || fail "txn: create $TXN_TOPIC failed"
+
+printf 'k1\tv1\nk2\tv2\nk3\tv3\nk4\tv4\nk5\tv5\nk6\tv6\n' \
+    | zig-out/bin/kite produce --txn kite-e2e-tx1 "$TXN_TOPIC" 2>/dev/null \
+    || fail "txn: committed produce failed"
+got=$(zig-out/bin/kite consume -B -n 6 --idle 3s --format value "$TXN_TOPIC" 2>/dev/null | sort)
+want=$(printf 'v1\nv2\nv3\nv4\nv5\nv6')
+[ "$got" = "$want" ] || fail "txn: committed consume mismatch: got=[$got]"
+
+# Empty stdin with --txn succeeds cleanly.
+zig-out/bin/kite produce --txn kite-e2e-tx1 "$TXN_TOPIC" </dev/null 2>/dev/null \
+    || fail "txn: empty stdin failed"
+
+# Reusing the same transactional ID commits a second transaction.
+printf 'k7\tv7\n' \
+    | zig-out/bin/kite produce --txn kite-e2e-tx1 "$TXN_TOPIC" 2>/dev/null \
+    || fail "txn: second run with same --txn ID failed"
+got=$(zig-out/bin/kite consume -B -n 7 --idle 3s --format value "$TXN_TOPIC" 2>/dev/null | sort)
+want=$(printf 'v1\nv2\nv3\nv4\nv5\nv6\nv7')
+[ "$got" = "$want" ] || fail "txn: second commit mismatch: got=[$got]"
+
+# Aborted run (mid-stream parse error after linger flushes first batch):
+# read_committed sees nothing; --read-uncommitted sees the flushed records.
+TXN_ABORT=kite-txn-abort-e2e
+zig-out/bin/kite topic delete -y --if-exists "$TXN_ABORT" >/dev/null 2>&1 || true
+zig-out/bin/kite topic create -p 3 -r 1 "$TXN_ABORT" >/dev/null 2>&1 \
+    || fail "txn: create $TXN_ABORT failed"
+set +e
+(
+    printf '{"key":"a","value":"before-err-1"}\n{"key":"b","value":"before-err-2"}\n'
+    sleep 0.3
+    printf 'not-valid-json\n'
+) | zig-out/bin/kite produce --txn kite-e2e-abort --json "$TXN_ABORT" 2>/dev/null
+rc=$?
+set -e
+wait_complete_abort() {
+    local tid=$1
+    local desc=""
+    local deadline=$(( $(date +%s%3N) + 15000 ))
+    local remaining duration
+    while (( (remaining = deadline - $(date +%s%3N)) > 0 )); do
+        printf -v duration '%d.%03ds' "$((remaining / 1000))" "$((remaining % 1000))"
+        desc=$(timeout -s KILL "$duration" docker exec "$NAME" /opt/kafka/bin/kafka-transactions.sh --bootstrap-server localhost:9092 describe --transactional-id "$tid" 2>/dev/null || true)
+        if echo "$desc" | grep -q "CompleteAbort"; then
+            return 0
+        fi
+        (( (remaining = deadline - $(date +%s%3N)) > 0 )) || break
+        (( remaining <= 200 )) || remaining=200
+        printf -v duration '0.%03ds' "$remaining"
+        sleep "$duration"
+    done
+    fail "txn: $tid did not reach CompleteAbort: [$desc]"
+}
+
+[ "$rc" -eq 1 ] || fail "txn: aborted produce exited $rc, want 1"
+wait_complete_abort kite-e2e-abort
+printf '{"key":"a","value":"sentinel-a"}\n{"key":"b","value":"sentinel-b"}\n' \
+    | zig-out/bin/kite produce --txn kite-e2e-abort-sentinel --json "$TXN_ABORT" >/dev/null 2>&1 \
+    || fail "txn: committed sentinel produce to $TXN_ABORT failed"
+rc_out=$(zig-out/bin/kite consume -B -n 2 --idle 3s --format value "$TXN_ABORT" 2>/dev/null | sort)
+rc_want=$(printf 'sentinel-a\nsentinel-b')
+[ "$rc_out" = "$rc_want" ] || fail "txn: read_committed did not see only sentinels after abort: [$rc_out]"
+ru_out=$(zig-out/bin/kite consume -B --read-uncommitted -n 4 --idle 3s --format value "$TXN_ABORT" 2>/dev/null | sort)
+ru_want=$(printf 'before-err-1\nbefore-err-2\nsentinel-a\nsentinel-b')
+[ "$ru_out" = "$ru_want" ] || fail "txn: read_uncommitted did not see aborted + sentinel records: [$ru_out]"
+
+# Aborted run on SIGINT after records flushed: read_committed sees only later sentinels.
+TXN_INT=kite-txn-sigint-e2e
+zig-out/bin/kite topic delete -y --if-exists "$TXN_INT" >/dev/null 2>&1 || true
+zig-out/bin/kite topic create -p 3 -r 1 "$TXN_INT" >/dev/null 2>&1 \
+    || fail "txn: create $TXN_INT failed"
+TXN_FIFO=$(mktemp -u)
+mkfifo "$TXN_FIFO"
+zig-out/bin/kite produce --txn kite-e2e-sigint "$TXN_INT" <"$TXN_FIFO" 2>/dev/null &
+TXN_PID=$!
+exec 3>"$TXN_FIFO"
+printf 'k1\tbefore-int-1\nk2\tbefore-int-2\n' >&3
+sleep 0.3
+printf 'k3\tpartial-without-newline' >&3
+sleep 0.1
+kill -INT "$TXN_PID" 2>/dev/null || true
+set +e
+wait "$TXN_PID"
+rc=$?
+set -e
+exec 3>&-
+rm -f "$TXN_FIFO"
+[ "$rc" -eq 130 ] || fail "txn: SIGINT produce exited $rc, want 130"
+wait_complete_abort kite-e2e-sigint
+printf 'k1\tsentinel-int-1\nk2\tsentinel-int-2\n' \
+    | zig-out/bin/kite produce --txn kite-e2e-sigint-sentinel "$TXN_INT" >/dev/null 2>&1 \
+    || fail "txn: committed sentinel produce to $TXN_INT failed"
+rc_out=$(zig-out/bin/kite consume -B -n 2 --idle 3s --format value "$TXN_INT" 2>/dev/null | sort)
+rc_want=$(printf 'sentinel-int-1\nsentinel-int-2')
+[ "$rc_out" = "$rc_want" ] || fail "txn: read_committed did not see only sentinels after SIGINT abort: [$rc_out]"
+ru_out=$(zig-out/bin/kite consume -B --read-uncommitted -n 4 --idle 3s --format value "$TXN_INT" 2>/dev/null | sort)
+ru_want=$(printf 'before-int-1\nbefore-int-2\nsentinel-int-1\nsentinel-int-2')
+[ "$ru_out" = "$ru_want" ] || fail "txn: read_uncommitted did not see SIGINT-aborted + sentinel records: [$ru_out]"
+
+python3 scripts/check-txn-faults.py "$PWD/zig-out/bin/kite" "$NAME"
+
+zig-out/bin/kite topic delete -y "$TXN_TOPIC" "$TXN_ABORT" "$TXN_INT" >/dev/null 2>&1 || true
+echo "PASS txn"
+
 echo "== consumer groups =="
 GROUP_LOG=${KITE_GROUP_LOG_DIR:-$HOME/kite-group-e2e-$(date +%s)}
 mkdir -p "$GROUP_LOG"

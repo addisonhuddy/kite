@@ -73,6 +73,7 @@ _kite() {
                 '-H[add a name: value header]:header:' \
                 '--csv[read RFC 4180 CSV (same as --format csv)]' \
                 '--key[use CSV column as record key]:column:' \
+                '--txn[produce stdin atomically under transactional ID]:id:' \
                 '*:arg:_kite_at_targets'
             ;;
         update)

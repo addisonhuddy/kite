@@ -22,6 +22,7 @@ pub const ProduceArgs = struct {
     topic: []const u8,
     common: Common = .{},
     key_col: ?[]const u8 = null,
+    txn: ?[]const u8 = null,
     headers: []const protocol.Header,
 
     pub fn isCsv(a: ProduceArgs) bool {
@@ -344,6 +345,13 @@ pub const produce_help =
     "  --key COL             Use CSV column COL as the record key; requires --csv.\n" ++
     "  --format FMT          Record shape: value, tsv, json (default: auto; see\n" ++
     "                        below). --json is short for --format json.\n" ++
+    "  --txn ID              Produce all of stdin atomically under transactional\n" ++
+    "                        ID (commits on EOF, aborts on error or interrupt;\n" ++
+    "                        if interrupted after commit is sent, exits 130 with\n" ++
+    "                        an unknown-outcome message instead of aborting;\n" ++
+    "                        requires broker partition verification enabled:\n" ++
+    "                        transaction.partition.verification.enable=true,\n" ++
+    "                        default in Apache Kafka 3.6+).\n" ++
     "  -q, --quiet           Suppress the summary and progress lines on stderr.\n" ++
     "  -v, --verbose         Write connection and retry diagnostics to stderr.\n" ++
     "  -h, --help            Show this help and exit.\n" ++
@@ -360,6 +368,7 @@ pub const produce_help =
     "  kite produce -H 'source: import' events < examples/data/headers.tsv\n" ++
     "  kite produce --csv --key user_id events < examples/data/events.csv\n" ++
     "  kite produce @prod events < examples/data/lines.txt\n" ++
+    "  kite produce --txn import-1 events < examples/data/lines.txt\n" ++
     "  kite consume --json src | kite produce --json dst\n" ++
     "\n" ++
     config_help;
@@ -628,10 +637,10 @@ pub fn parseHeaderArg(s: []const u8) !protocol.Header {
     return .{ .key = name, .value = std.mem.trim(u8, s[colon + 1 ..], " \t") };
 }
 
-const produce_only = [_][]const u8{ "-H", "--csv", "--key" };
+const produce_only = [_][]const u8{ "-H", "--csv", "--key", "--txn" };
 const consume_only = [_][]const u8{ "-g", "--group", "-B", "--from-beginning", "--offset", "--partition", "-n", "--max", "-t", "--idle", "-f", "--follow", "--read-uncommitted" };
 
-const produce_options = [_][]const u8{ "--bootstrap", "--config", "--format", "--json", "--csv", "--key", "--quiet", "--verbose", "--help" };
+const produce_options = [_][]const u8{ "--bootstrap", "--config", "--format", "--json", "--csv", "--key", "--txn", "--quiet", "--verbose", "--help" };
 const consume_options = [_][]const u8{ "--bootstrap", "--config", "--group", "--from-beginning", "--offset", "--partition", "--max", "--idle", "--follow", "--read-uncommitted", "--format", "--json", "--quiet", "--verbose", "--help" };
 const cluster_options = [_][]const u8{ "--config", "--json", "--format", "--quiet", "--verbose", "--help" };
 const update_options = [_][]const u8{"--help"};
@@ -850,6 +859,7 @@ pub fn parseProduce(alloc: std.mem.Allocator, args: []const []const u8) Result(P
     var topic: ?[]const u8 = null;
     var common: Common = .{};
     var key_col: ?[]const u8 = null;
+    var txn: ?[]const u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -878,6 +888,12 @@ pub fn parseProduce(alloc: std.mem.Allocator, args: []const []const u8) Result(P
             key_col = args[i];
         } else if (std.mem.startsWith(u8, arg, "--key=")) {
             key_col = arg["--key=".len..];
+        } else if (std.mem.eql(u8, arg, "--txn")) {
+            i += 1;
+            if (i >= args.len) return errorResult(ProduceArgs, alloc, "--txn requires a value", .{});
+            txn = args[i];
+        } else if (std.mem.startsWith(u8, arg, "--txn=")) {
+            txn = arg["--txn=".len..];
         } else if (arg.len > 0 and arg[0] == '-') {
             return .{ .err = unknownOption(alloc, .produce, arg) };
         } else if (topic == null) {
@@ -890,11 +906,13 @@ pub fn parseProduce(alloc: std.mem.Allocator, args: []const []const u8) Result(P
     const topic_name = topic orelse return errorResult(ProduceArgs, alloc, "missing TOPIC", .{});
     if (topic_name.len == 0) return errorResult(ProduceArgs, alloc, "TOPIC must not be empty", .{});
     if (key_col != null and common.format != .csv) return errorResult(ProduceArgs, alloc, "--key requires --csv", .{});
+    if (txn) |t| if (t.len == 0) return errorResult(ProduceArgs, alloc, "--txn must not be empty", .{});
     if (finishCommon(common)) |m| return .{ .err = m };
     return .{ .ok = .{
         .topic = topic_name,
         .common = common,
         .key_col = key_col,
+        .txn = txn,
         .headers = headers.items,
     } };
 }
@@ -1658,6 +1676,12 @@ test "parser reports exact argument errors" {
     try expectErr(ProduceArgs, parseProduce(alloc, &.{ "-H", "nocolon", "demo" }), "malformed header 'nocolon' (want 'name: value')");
     try expectErr(ProduceArgs, parseProduce(alloc, &.{"--key"}), "--key requires a value");
     try expectErr(ProduceArgs, parseProduce(alloc, &.{ "--key", "id", "demo" }), "--key requires --csv");
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{"--txn"}), "--txn requires a value");
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{ "--txn=", "demo" }), "--txn must not be empty");
+    try expectErr(ProduceArgs, parseProduce(alloc, &.{ "--txn", "", "demo" }), "--txn must not be empty");
+    try std.testing.expectEqualStrings("tx-1", parseProduce(alloc, &.{ "--txn", "tx-1", "demo" }).ok.txn.?);
+    try std.testing.expectEqualStrings("tx-2", parseProduce(alloc, &.{ "--txn=tx-2", "demo" }).ok.txn.?);
+    try expectErr(ConsumeArgs, parseConsume(alloc, &.{ "--txn", "tx-1", "demo" }), "'--txn' is a produce option; use 'kite produce [OPTIONS] TOPIC'");
     try expectErr(ProduceArgs, parseProduce(alloc, &.{ "--csv", "--json", "demo" }), "--csv cannot be combined with --json");
     try expectErr(ProduceArgs, parseProduce(alloc, &.{ "a", "b" }), "unexpected argument 'b'");
     try expectErr(ConsumeArgs, parseConsume(alloc, &.{ "a", "b" }), "unexpected argument 'b'");

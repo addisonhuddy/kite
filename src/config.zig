@@ -18,6 +18,8 @@ pub const Config = struct {
     /// Idempotent produce: InitProducerId handshake + per-partition sequence
     /// numbers so broker-side retries/dedup can never duplicate records.
     enable_idempotence: bool = true,
+    /// Transaction timeout sent in InitProducerId for `produce --txn`.
+    transaction_timeout_ms: i32 = 60_000,
     /// Verbose diagnostics on stderr (-v / --verbose flag).
     verbose: bool = false,
 
@@ -92,6 +94,7 @@ pub const Key = enum {
     fetch_max_bytes,
     fetch_max_wait_ms,
     enable_idempotence,
+    transaction_timeout_ms,
 };
 
 pub const Origin = enum { default, file, env, flag, target };
@@ -119,6 +122,7 @@ pub const key_names = std.EnumArray(Key, []const u8).init(.{
     .fetch_max_bytes = "fetch.max.bytes",
     .fetch_max_wait_ms = "fetch.max.wait.ms",
     .enable_idempotence = "enable.idempotence",
+    .transaction_timeout_ms = "transaction.timeout.ms",
 });
 
 fn keyFromName(name: []const u8) ?Key {
@@ -148,6 +152,7 @@ pub fn valueString(cfg: *const Config, alloc: std.mem.Allocator, key: Key) ![]co
         .fetch_max_bytes => return fmtInt(alloc, cfg.fetch_max_bytes),
         .fetch_max_wait_ms => return fmtInt(alloc, cfg.fetch_max_wait_ms),
         .enable_idempotence => return if (cfg.enable_idempotence) "true" else "false",
+        .transaction_timeout_ms => return fmtInt(alloc, @intCast(cfg.transaction_timeout_ms)),
     }
 }
 
@@ -667,6 +672,17 @@ fn applyKey(cfg: *Config, alloc: std.mem.Allocator, source: *Source, origin: Ori
             warn("invalid enable.idempotence '{s}' ignored", .{val});
             return;
         },
+        .transaction_timeout_ms => {
+            const parsed = std.fmt.parseInt(i32, val, 10) catch {
+                warn("invalid transaction.timeout.ms '{s}' ignored", .{val});
+                return;
+            };
+            if (parsed <= 0) {
+                warn("invalid transaction.timeout.ms '{s}' ignored", .{val});
+                return;
+            }
+            cfg.transaction_timeout_ms = parsed;
+        },
     }
     source.origins.set(k, origin);
 }
@@ -921,4 +937,19 @@ test "origins track the highest-precedence writer" {
     try std.testing.expectEqualStrings("from-env", cfg.sasl_username.?);
     try applyKey(&cfg, arena.allocator(), &src, .flag, "bootstrap.servers", "h:1");
     try std.testing.expectEqual(Origin.flag, src.origins.get(.bootstrap_servers));
+}
+
+test "transaction.timeout.ms parses positive ints and ignores invalid values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg: Config = .{ .bootstrap_servers = &.{} };
+    var src: Source = .{};
+    try std.testing.expectEqual(@as(i32, 60_000), cfg.transaction_timeout_ms);
+    try applyKey(&cfg, arena.allocator(), &src, .file, "transaction.timeout.ms", "15000");
+    try std.testing.expectEqual(@as(i32, 15_000), cfg.transaction_timeout_ms);
+    try std.testing.expectEqual(Origin.file, src.origins.get(.transaction_timeout_ms));
+    try applyKey(&cfg, arena.allocator(), &src, .file, "transaction.timeout.ms", "0");
+    try std.testing.expectEqual(@as(i32, 15_000), cfg.transaction_timeout_ms);
+    try applyKey(&cfg, arena.allocator(), &src, .file, "transaction.timeout.ms", "-5");
+    try std.testing.expectEqual(@as(i32, 15_000), cfg.transaction_timeout_ms);
 }

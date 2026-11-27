@@ -335,6 +335,7 @@ kite --version                            Print the version.
 | produce | `-H 'name: value'` | Add a header to every record (repeatable). |
 | produce | `--csv` | Read RFC 4180 CSV; each row becomes a JSON object value. |
 | produce | `--key COL` | Use CSV column `COL` as the record key (requires `--csv`). |
+| produce | `--txn ID` | Produce all of stdin atomically under transactional `ID` (commits on EOF, aborts on error or interrupt before commit; if interrupted after commit is sent, exits 130 reporting unknown outcome instead of aborting; requires `enable.idempotence=true`). |
 | consume | `-B`, `--from-beginning` | Start at the earliest offset. |
 | consume | `--offset N` | Start at offset N in every selected partition; errors if N is out of range. |
 | consume | `--partition P` | Read one partition only. |
@@ -349,6 +350,18 @@ kite --version                            Print the version.
 `kite --help` prints the command overview; `kite produce --help`,
 `kite consume --help`, `kite topic --help`, and `kite cluster --help`
 print the full pages.
+
+For transactional produce, kite requires broker-side transaction partition
+verification (`transaction.partition.verification.enable=true`, enabled by
+default in Apache Kafka 3.6+). Before aborting, kite settles in-flight Produce
+requests up to their request deadline and then sends an epoch-checked
+`EndTxn(abort)` so a fenced process cannot affect a replacement producer. If an
+in-flight Produce cannot be confirmed within its deadline, kite closes that
+connection, aborts the transaction, and warns on stderr with the partition-level
+recovery commands (`kafka-transactions.sh --bootstrap-server <host:port>
+find-hanging --topic <topic> --partition <p> --max-transaction-timeout 0`
+followed by `abort --topic <topic> --partition <p> --start-offset <n>`) in case
+partition verification is disabled on the broker.
 
 ## Topics
 
@@ -711,6 +724,7 @@ replaced by `_`, so `bootstrap.servers` becomes `BOOTSTRAP_SERVERS`.
 | `fetch.max.bytes` | — | `8388608` | Maximum bytes requested per fetch. |
 | `fetch.max.wait.ms` | — | `500` | Maximum broker wait for a fetch. |
 | `enable.idempotence` | — | `true` | Broker deduplicates retried producer batches. |
+| `transaction.timeout.ms` | — | `60000` | Transaction timeout in milliseconds for `produce --txn`. |
 
 Templates are in [`examples/config/`](examples/config). Idempotence means
 broker deduplication of retried batches, not end-to-end exactly-once
