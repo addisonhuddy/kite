@@ -24,9 +24,9 @@ const rbuf_len = std.crypto.tls.Client.min_buffer_len + 4096;
 // are amortized — ciphertext only reaches the wire on explicit flush.
 const wbuf_len = 512 * 1024;
 const tls_plain_len = 32 * 1024;
-/// Kafka brokers never need a response larger than this for the requests we
-/// send (metadata for one topic, produce acks).
-const max_response_len = 16 << 20;
+/// Maximum Kafka response frame size (128 MiB): large enough for oversized
+/// Fetch responses while bounding allocation against corrupt length prefixes.
+pub const max_response_len: usize = 128 << 20;
 
 const SocketReader = struct {
     interface: std.Io.Reader,
