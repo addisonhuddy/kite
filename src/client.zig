@@ -97,6 +97,7 @@ pub const Client = struct {
     /// Queue of sent-but-unacknowledged ProduceRequests; drained by
     /// produceDrain(). Lets callers keep filling batches while responses fly.
     outstanding: std.ArrayListUnmanaged(Outstanding),
+    /// Memory reserved by queued encoders and their per-request buffers.
     outstanding_bytes: usize,
     /// Idempotent produce state: issued by InitProducerId (-1 = none/off).
     producer_id: i64 = -1,
@@ -949,11 +950,11 @@ pub const Client = struct {
                 c.setErr("CreateTopics request failed", .{});
                 return error.AdminFailed;
             };
+            defer c.alloc.free(resp.frame);
             var d = Decoder.init(resp.body);
             _ = try d.i32v(); // throttle
             const n = try d.compactArrayLen();
             if (n < 1) {
-                c.alloc.free(resp.frame);
                 c.setErr("CreateTopics: empty topics array", .{});
                 return error.AdminFailed;
             }
@@ -963,7 +964,6 @@ pub const Client = struct {
             const msg = try d.compactString();
             const nparts = try d.i32v();
             const rf = try d.i16v();
-            c.alloc.free(resp.frame);
             switch (code) {
                 .not_controller => {
                     // Our controller id was stale or we never learned it;
@@ -1927,7 +1927,8 @@ pub const Client = struct {
             o.pidx[0] = pidx;
             o.batches[0] = be.written();
             o.counts[0] = @intCast(sets[i].len);
-            o.bytes = be.written().len;
+            const page_size = std.heap.pageSize();
+            o.bytes = std.mem.alignForward(usize, be.aw.writer.buffer.len, page_size) + 4 * page_size;
             try c.outstanding.ensureUnusedCapacity(c.alloc, 1);
             c.outstanding_bytes += o.bytes;
             if (c.claimConn(pidx)) |claim| {
@@ -1961,7 +1962,7 @@ pub const Client = struct {
     /// Receive responses for the oldest outstanding requests while
     /// outstanding_bytes exceeds `floor` (floor 0 drains all), then retry
     /// retriable partitions. Requests left outstanding stay in flight so the
-    /// caller can keep a steady window of bytes on the wire.
+    /// caller can keep a steady window of batches in flight.
     pub fn produceDrainUntil(c: *Client, topic: []const u8, floor: usize) !void {
         return c.produceDrainStop(topic, .{ .bytes_floor = floor });
     }
@@ -1996,6 +1997,7 @@ pub const Client = struct {
                 o.encoders.deinit(c.alloc);
                 c.alloc.free(o.pidx);
                 c.alloc.free(o.batches);
+                c.alloc.free(o.counts);
             }
             const rest = c.outstanding.items.len - done;
             std.mem.copyForwards(Outstanding, c.outstanding.items[0..rest], c.outstanding.items[done..]);

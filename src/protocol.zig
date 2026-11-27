@@ -1380,6 +1380,8 @@ pub fn encodeRecordBatch(
 ) ProtoError!void {
     var body = Encoder.init(e.aw.allocator);
     defer body.deinit();
+    var r = Encoder.init(e.aw.allocator);
+    defer r.deinit();
 
     // attributes: no compression, ts=CreateTime, bit 4 = transactional
     try body.i16v(if (transactional) 0x10 else 0);
@@ -1391,8 +1393,7 @@ pub fn encodeRecordBatch(
     try body.i32v(base_sequence);
     try body.i32v(@intCast(records.len)); // record count
     for (records, 0..) |rec, idx| {
-        var r = Encoder.init(e.aw.allocator);
-        defer r.deinit();
+        r.reset();
         try r.u8v(0); // record attributes
         try r.varlong(0); // timestamp delta
         try r.varint(@intCast(idx)); // offset delta
