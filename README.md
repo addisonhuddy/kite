@@ -665,13 +665,17 @@ record key while retaining it in the JSON value. Quoted commas, escaped
 quotes, embedded newlines, CRLF endings, and a UTF-8 BOM are supported; all
 JSON fields are strings.
 
+If a TSV or CSV record is malformed, produce stops reading input. Without
+`--txn` it sends the prior valid records and reports how many the broker
+acknowledged; with `--txn` it aborts the transaction instead.
+
 ### JSON records (`--json`, i.e. `--format json`)
 
 `kite consume --json` writes one object per record with full metadata, so bytes
 containing TABs or newlines and null-vs-empty distinctions survive. Valid
 UTF-8 fields remain strings; fields containing invalid UTF-8 bytes use a
-sibling `*_b64` field with standard padded Base64 instead. Header names remain
-plain strings. The output is valid UTF-8 JSON and safe to pass through `jq`:
+sibling `*_b64` field with standard padded Base64 instead. The output is valid
+UTF-8 JSON and safe to pass through `jq`:
 
 ```json
 {"topic":"events","partition":1,"offset":7,"timestamp":1789579403024,"key":null,"headers":[{"key":"h","value":"v"}],"value":"line one"}

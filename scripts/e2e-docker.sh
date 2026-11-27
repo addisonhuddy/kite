@@ -149,6 +149,26 @@ got=$(zig-out/bin/kite consume -B -n 3 --idle 1s --format value "$JSON_PARTIAL")
 [ "$got" = $'1\n2' ] || fail "json-partial: expected only the records before the malformed line, got [$got]"
 echo "PASS malformed JSON preserves prior nontransactional records"
 
+expect_partial_produce_error() {
+    local format=$1 input=$2 expected_error=$3 expected_records=$4
+    local topic="kite-$format-partial-$(date +%s)-$RANDOM" rc got
+    zig-out/bin/kite topic create "$topic" >/dev/null
+    set +e
+    printf '%s' "$input" | zig-out/bin/kite produce --format "$format" "$topic" 2>"$TMP/$format-partial.err"
+    rc=$?
+    set -e
+    [ "$rc" -eq 1 ] || fail "$format-partial: malformed produce exited $rc, want 1"
+    grep -Fq "$expected_error; broker acknowledged 2 of 2 earlier record(s)" "$TMP/$format-partial.err" \
+        || fail "$format-partial: missing malformed record or broker acknowledgment count"
+    got=$(zig-out/bin/kite consume -B -n 3 --idle 1s --format value "$topic")
+    [ "$got" = "$expected_records" ] || fail "$format-partial: expected only earlier records, got [$got]"
+    echo "PASS malformed $format preserves prior nontransactional records"
+}
+expect_partial_produce_error csv $'k,v\na,1\nb,2\n"c,3\n' \
+    'kite: csv row 3: unterminated quoted field' $'{"k":"a","v":"1"}\n{"k":"b","v":"2"}'
+expect_partial_produce_error tsv $'k\t1\nk\t2\nk\tbad\t3\nk\t4\n' \
+    "kite: line 3: malformed header 'bad' (want 'name: value')" $'1\n2'
+
 # Stopping bounds: `-n 1` on an empty topic bounds records, not time, so it
 # must still be running after 3s; `-n 1 --idle 500ms` must stop on its own.
 EMPTY_TOPIC="kite-empty-$(date +%s)-$RANDOM"

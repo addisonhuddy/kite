@@ -115,32 +115,41 @@ fn parseLine(
     alloc: std.mem.Allocator,
     line: []const u8,
     static_headers: []const protocol.Header,
-    lineno: u64,
-) protocol.Record {
+) RecordParseResult {
     if (std.mem.indexOfScalar(u8, line, '\t') == null)
-        return .{ .value = line, .headers = static_headers };
+        return .{ .record = .{ .value = line, .headers = static_headers } };
 
     var it = std.mem.splitScalar(u8, line, '\t');
     const keyf = it.next().?;
     var headers: std.ArrayListUnmanaged(protocol.Header) = .empty;
-    headers.appendSlice(alloc, static_headers) catch fatal("out of memory", .{});
+    headers.appendSlice(alloc, static_headers) catch oom();
     var value: []const u8 = "";
     while (it.next()) |f| {
         if (it.peek() == null) {
             value = f;
         } else {
-            if (std.mem.indexOfScalar(u8, f, ':') == null)
-                fatal("line {d}: malformed header '{s}' (want 'name: value')", .{ lineno, f });
-            headers.append(alloc, cli_args.parseHeaderArg(f) catch
-                fatal("line {d}: malformed header '{s}' (want 'name: value')", .{ lineno, f })) catch
-                fatal("out of memory", .{});
+            const header = cli_args.parseHeaderArg(f) catch return .{
+                .invalid = std.fmt.allocPrint(alloc, "malformed header '{s}' (want 'name: value')", .{f}) catch oom(),
+            };
+            headers.append(alloc, header) catch oom();
         }
     }
-    return .{
+    return .{ .record = .{
         .key = if (keyf.len == 0) null else keyf,
         .value = value,
         .headers = headers.items,
-    };
+    } };
+}
+
+test "TSV record parsing returns malformed header diagnostics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const valid = parseLine(alloc, "k\th: v\tdata", &.{});
+    try std.testing.expectEqualStrings("h", valid.record.headers[0].key);
+    try std.testing.expectEqualStrings("data", valid.record.value);
+    const invalid = parseLine(alloc, "k\tbad\tdata", &.{});
+    try std.testing.expectEqualStrings("malformed header 'bad' (want 'name: value')", invalid.invalid);
 }
 
 /// Per-partition pending record buffer.
@@ -246,8 +255,9 @@ pub fn main(init: std.process.Init) !void {
 
     var rr: usize = 0; // round-robin cursor for unkeyed records
     var total: u64 = 0;
-    var json_lineno: u64 = 0;
-    var json_error: ?[]const u8 = null;
+    var input_lineno: u64 = 0;
+    var input_error: ?[]const u8 = null;
+    const input_location = if (csv_mode) "csv row" else "line";
     const timing = init.environ_map.get("KITE_TIME") != null;
     var t_read: u64 = 0;
     var t_flush: u64 = 0;
@@ -279,32 +289,34 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        const rec = if (csv_mode) blk: {
+        const parsed_record: RecordParseResult = if (csv_mode) blk: {
             const row = csv.nextRow(r, alloc) catch {
                 if (produce.txn != null and interrupted.load(.acquire)) abortInterrupted();
                 fatal("failed reading stdin", .{});
             } orelse break :read_loop;
-            break :blk csvRecord(alloc, row, cols, key_idx, static_headers, total + 1);
+            input_lineno += 1;
+            break :blk csvRecord(alloc, row, cols, key_idx, static_headers);
         } else blk: {
             const owned = nextLine(r, alloc) catch {
                 if (produce.txn != null and interrupted.load(.acquire)) abortInterrupted();
                 fatal("failed reading stdin", .{});
             } orelse break :read_loop;
+            input_lineno += 1;
             if (json_mode) {
-                json_lineno += 1;
                 if (std.mem.trim(u8, owned, " \t\r").len == 0) continue;
-                switch (jsonRecord(alloc, owned, static_headers)) {
-                    .record => |record| break :blk record,
-                    .invalid => |message| {
-                        if (produce.txn != null) fatal("line {d}: {s}", .{ json_lineno, message });
-                        json_error = message;
-                        break :read_loop;
-                    },
-                }
+                break :blk jsonRecord(alloc, owned, static_headers);
             }
             if (value_mode)
-                break :blk protocol.Record{ .value = owned, .headers = static_headers };
-            break :blk parseLine(alloc, owned, static_headers, total + 1);
+                break :blk .{ .record = .{ .value = owned, .headers = static_headers } };
+            break :blk parseLine(alloc, owned, static_headers);
+        };
+        const rec = switch (parsed_record) {
+            .record => |record| record,
+            .invalid => |message| {
+                if (produce.txn != null) fatal("{s} {d}: {s}", .{ input_location, input_lineno, message });
+                input_error = message;
+                break :read_loop;
+            },
         };
         t_read += timer.lap();
         total += 1;
@@ -343,17 +355,17 @@ pub fn main(init: std.process.Init) !void {
         break :blk cli.produceDrain(topic);
     };
     flushed catch |err| {
-        if (json_error) |message| {
+        if (input_error) |message| {
             stats.clearLine();
-            note("line {d}: {s}; broker acknowledged {d} of {d} earlier record(s)", .{
-                json_lineno, message, cli.acked_records, total,
+            note("{s} {d}: {s}; broker acknowledged {d} of {d} earlier record(s)", .{
+                input_location, input_lineno, message, cli.acked_records, total,
             });
         }
         produceFatal(&cli, err);
     };
-    if (json_error) |message| {
-        fatal("line {d}: {s}; broker acknowledged {d} of {d} earlier record(s)", .{
-            json_lineno, message, cli.acked_records, total,
+    if (input_error) |message| {
+        fatal("{s} {d}: {s}; broker acknowledged {d} of {d} earlier record(s)", .{
+            input_location, input_lineno, message, cli.acked_records, total,
         });
     }
     if (produce.txn != null) {
@@ -427,7 +439,7 @@ fn produceSummary(cli: *client.Client, stats: *stats_mod.Stats, total: u64, npar
     }
 }
 
-const JsonRecordResult = union(enum) {
+const RecordParseResult = union(enum) {
     record: protocol.Record,
     invalid: []const u8,
 };
@@ -440,7 +452,7 @@ fn jsonRecord(
     alloc: std.mem.Allocator,
     line: []const u8,
     static_headers: []const protocol.Header,
-) JsonRecordResult {
+) RecordParseResult {
     var sc = json.Scanner{ .src = line, .alloc = alloc };
     var key: ?[]const u8 = null;
     var value: ?[]const u8 = null;
@@ -567,7 +579,7 @@ fn decodeJsonBase64(alloc: std.mem.Allocator, encoded: []const u8) ?[]const u8 {
     };
 }
 
-fn jsonScanError(err: json.Error) JsonRecordResult {
+fn jsonScanError(err: json.Error) RecordParseResult {
     return switch (err) {
         error.Malformed => .{ .invalid = "invalid JSON (want {\"key\":..,\"value\":..,\"headers\":{..}})" },
         error.OutOfMemory => oom(),
@@ -1940,19 +1952,38 @@ fn csvRecord(
     cols: []const []const u8,
     key_idx: ?usize,
     static_headers: []const protocol.Header,
-    rowno: u64,
-) protocol.Record {
-    const fields = csv.splitFields(alloc, row) catch
-        fatal("csv row {d}: unterminated quoted field", .{rowno});
-    if (fields.len != cols.len)
-        fatal("csv row {d}: expected {d} field(s), got {d}", .{ rowno, cols.len, fields.len });
+) RecordParseResult {
+    const fields = csv.splitFields(alloc, row) catch |err| switch (err) {
+        error.MalformedCsv => return .{ .invalid = "unterminated quoted field" },
+        error.OutOfMemory => oom(),
+    };
+    if (fields.len != cols.len) return .{
+        .invalid = std.fmt.allocPrint(alloc, "expected {d} field(s), got {d}", .{ cols.len, fields.len }) catch oom(),
+    };
     var jw = std.Io.Writer.Allocating.init(alloc);
-    csv.rowJson(&jw.writer, cols, fields) catch fatal("out of memory", .{});
-    return .{
+    csv.rowJson(&jw.writer, cols, fields) catch oom();
+    return .{ .record = .{
         .key = if (key_idx) |ki| fields[ki] else null,
         .value = jw.written(),
         .headers = static_headers,
-    };
+    } };
+}
+
+test "CSV record parsing returns quote and field-count diagnostics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const cols = &.{ "k", "v" };
+    var good = "a,1".*;
+    const valid = csvRecord(alloc, &good, cols, 0, &.{});
+    try std.testing.expectEqualStrings("a", valid.record.key.?);
+    try std.testing.expectEqualStrings("{\"k\":\"a\",\"v\":\"1\"}", valid.record.value);
+    var bad_quote = "\"c,3".*;
+    const invalid_quote = csvRecord(alloc, &bad_quote, cols, null, &.{});
+    try std.testing.expectEqualStrings("unterminated quoted field", invalid_quote.invalid);
+    var bad_count = "c".*;
+    const invalid_count = csvRecord(alloc, &bad_count, cols, null, &.{});
+    try std.testing.expectEqualStrings("expected 2 field(s), got 1", invalid_count.invalid);
 }
 
 fn pendingBytes(pend: []Pending) usize {
