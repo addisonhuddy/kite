@@ -328,4 +328,5 @@ group_failover() {
 }
 run 10-group-bootstrap-coordinator-loss group_failover
 run 11-group-recovery-heartbeats python3 scripts/check-group-recovery.py "$KITE"
+run 12-large-records python3 scripts/check-large-records.py "$KITE"
 exit "$status"
