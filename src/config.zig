@@ -5,6 +5,8 @@ const yaml = @import("yaml.zig");
 pub const SecurityProtocol = enum { plaintext, ssl, sasl_ssl, sasl_plaintext };
 pub const SaslMechanism = enum { plain, scram_sha_256, scram_sha_512 };
 
+pub const max_fetch_bytes: usize = transport.max_response_len - (1 << 20);
+
 pub const Config = struct {
     bootstrap_servers: [][]const u8,
     security_protocol: SecurityProtocol = .plaintext,
@@ -654,8 +656,8 @@ fn applyKey(cfg: *Config, alloc: std.mem.Allocator, source: *Source, origin: Ori
                 warn("invalid fetch.max.bytes '{s}' ignored", .{val});
                 return;
             }
-            if (parsed >= transport.max_response_len) {
-                warn("fetch.max.bytes '{s}' is >= transport maximum; using default", .{val});
+            if (parsed > max_fetch_bytes) {
+                warn("fetch.max.bytes '{s}' exceeds maximum {d}; using default", .{ val, max_fetch_bytes });
                 cfg.fetch_max_bytes = 8 << 20;
             } else {
                 cfg.fetch_max_bytes = parsed;
@@ -971,7 +973,10 @@ test "fetch.max.bytes honors transport limit and rejects zero" {
     try std.testing.expectEqual(@as(usize, 32 << 20), cfg.fetch_max_bytes);
     try applyKey(&cfg, arena.allocator(), &src, .file, "fetch.max.bytes", "0");
     try std.testing.expectEqual(@as(usize, 32 << 20), cfg.fetch_max_bytes);
-    const over = try std.fmt.allocPrint(arena.allocator(), "{d}", .{transport.max_response_len});
+    const at_limit = try std.fmt.allocPrint(arena.allocator(), "{d}", .{max_fetch_bytes});
+    try applyKey(&cfg, arena.allocator(), &src, .file, "fetch.max.bytes", at_limit);
+    try std.testing.expectEqual(max_fetch_bytes, cfg.fetch_max_bytes);
+    const over = try std.fmt.allocPrint(arena.allocator(), "{d}", .{max_fetch_bytes + 1});
     try applyKey(&cfg, arena.allocator(), &src, .file, "fetch.max.bytes", over);
     try std.testing.expectEqual(@as(usize, 8 << 20), cfg.fetch_max_bytes);
 }
