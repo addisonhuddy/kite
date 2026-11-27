@@ -590,7 +590,7 @@ try:
         assert p.returncode == 1, (p.returncode, err)
         assert state8["init_count"] == 1, f"cleanup must not send InitProducerId, got init_count={state8['init_count']} err={err!r}"
         assert state8["end_txn_aborts"] == 1, f"expected epoch-checked EndTxn(abort), got {state8['end_txn_aborts']}"
-        assert "kafka-transactions.sh describe" in err and "PRODUCER_FENCED" not in err, f"expected unsettled-produce warning without PRODUCER_FENCED: {err!r}"
+        assert "kafka-transactions.sh --bootstrap-server" in err and "find-hanging" in err and "PRODUCER_FENCED" not in err, f"expected unsettled-produce find-hanging warning without PRODUCER_FENCED: {err!r}"
 finally:
     proxy8.close()
 
@@ -749,7 +749,7 @@ try:
                     assert stale_p.returncode == 1, (stale_p.returncode, stale_err)
                     assert state10_a["init_count"] == 1, f"stale producer must not send KIP-360 InitProducerId after fencing, got init_count={state10_a['init_count']} err={stale_err!r}"
                     assert state10_a["end_txn_aborts"] == 1, f"expected epoch-checked EndTxn(abort) from stale producer, got {state10_a['end_txn_aborts']}"
-                    assert "outcome unknown" in stale_err and "kafka-transactions.sh describe" in stale_err, stale_err
+                    assert "outcome unknown" in stale_err and "kafka-transactions.sh --bootstrap-server" in stale_err and "describe --transactional-id" in stale_err, stale_err
 
                     # Replacement producer must still commit cleanly.
                     _, repl_err = repl_p.communicate(timeout=15)

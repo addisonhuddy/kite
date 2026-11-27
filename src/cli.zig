@@ -348,7 +348,10 @@ pub const produce_help =
     "  --txn ID              Produce all of stdin atomically under transactional\n" ++
     "                        ID (commits on EOF, aborts on error or interrupt;\n" ++
     "                        if interrupted after commit is sent, exits 130 with\n" ++
-    "                        an unknown-outcome message instead of aborting).\n" ++
+    "                        an unknown-outcome message instead of aborting;\n" ++
+    "                        requires broker partition verification enabled:\n" ++
+    "                        transaction.partition.verification.enable=true,\n" ++
+    "                        default in Apache Kafka 3.6+).\n" ++
     "  -q, --quiet           Suppress the summary and progress lines on stderr.\n" ++
     "  -v, --verbose         Write connection and retry diagnostics to stderr.\n" ++
     "  -h, --help            Show this help and exit.\n" ++

@@ -357,9 +357,11 @@ default in Apache Kafka 3.6+). Before aborting, kite settles in-flight Produce
 requests up to their request deadline and then sends an epoch-checked
 `EndTxn(abort)` so a fenced process cannot affect a replacement producer. If an
 in-flight Produce cannot be confirmed within its deadline, kite closes that
-connection, aborts the transaction, and warns on stderr with the
-`kafka-transactions.sh describe` check (and `kafka-transactions.sh abort`
-remediation) in case partition verification is disabled on the broker.
+connection, aborts the transaction, and warns on stderr with the partition-level
+recovery commands (`kafka-transactions.sh --bootstrap-server <host:port>
+find-hanging --topic <topic> --partition <p>` followed by `abort --topic <topic>
+--partition <p> --start-offset <n>`) in case partition verification is disabled
+on the broker.
 
 ## Topics
 

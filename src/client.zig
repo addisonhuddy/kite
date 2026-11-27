@@ -1607,7 +1607,7 @@ pub const Client = struct {
                 c.txn_add_attempted = false;
                 c.txn_produce_unsettled_until = null;
                 if (!commit and unsettled) {
-                    std.debug.print("kite: warning: in-flight produce was unconfirmed before abort; if broker partition verification is disabled, verify with: kafka-transactions.sh describe --transactional-id '{s}'\n", .{txn_id});
+                    std.debug.print("kite: warning: in-flight produce was unconfirmed before abort; if broker partition verification is disabled, check for hanging transactions with: kafka-transactions.sh --bootstrap-server <host:port> find-hanging --topic <topic> --partition <p> (then abort --topic <topic> --partition <p> --start-offset <n>)\n", .{});
                 }
                 c.vlog("transaction '{s}' {s}", .{ txn_id, if (commit) "committed" else "aborted" });
                 return;
@@ -1645,9 +1645,9 @@ pub const Client = struct {
         c.endTransaction(false, null) catch {
             const detail = c.errDetail();
             if (detail.len > 0)
-                std.debug.print("kite: warning: transaction abort outcome unknown ({s}); verify with: kafka-transactions.sh describe --transactional-id '{s}'\n", .{ detail, txn_id })
+                std.debug.print("kite: warning: transaction abort outcome unknown ({s}); verify with: kafka-transactions.sh --bootstrap-server <host:port> describe --transactional-id '{s}'\n", .{ detail, txn_id })
             else
-                std.debug.print("kite: warning: transaction abort outcome unknown; verify with: kafka-transactions.sh describe --transactional-id '{s}'\n", .{txn_id});
+                std.debug.print("kite: warning: transaction abort outcome unknown; verify with: kafka-transactions.sh --bootstrap-server <host:port> describe --transactional-id '{s}'\n", .{txn_id});
             c.txn_added_parts.clearRetainingCapacity();
             c.txn_add_attempted = false;
             c.txn_produce_unsettled_until = null;
