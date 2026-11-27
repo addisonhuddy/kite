@@ -350,6 +350,9 @@ pub fn main(init: std.process.Init) !void {
 
     if (produce.txn != null and interrupted.load(.acquire))
         abortInterrupted();
+    if (input_error) |message| {
+        if (total == 0) fatal("{s} {d}: {s}", .{ input_location, input_lineno, message });
+    }
     const flushed: anyerror!void = blk: {
         flushAll(&cli, topic, pend) catch |err| break :blk err;
         break :blk cli.produceDrain(topic);

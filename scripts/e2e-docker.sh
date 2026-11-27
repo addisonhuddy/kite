@@ -133,6 +133,9 @@ expect_json_produce_error '{"value":{"x":}}' 'kite: line 1: invalid JSON' invali
 expect_json_produce_error '{"value":[1,]}' 'kite: line 1: invalid JSON' invalid-json-array
 expect_json_produce_error '{"value":01}' 'kite: line 1: invalid JSON' invalid-json-number
 expect_json_produce_error $'\n\t\n{"value":tru}' 'kite: line 3: invalid JSON' invalid-json-line-number
+if grep -Fq 'broker acknowledged' "$TMP/invalid-json-literal.err" "$TMP/invalid-json-line-number.err"; then
+    fail "malformed JSON without prior records should not report an acknowledgment count"
+fi
 echo "PASS malformed JSON input errors"
 
 JSON_PARTIAL="kite-json-partial-$(date +%s)-$RANDOM"
