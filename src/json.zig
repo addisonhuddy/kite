@@ -269,6 +269,7 @@ fn unescape(alloc: std.mem.Allocator, raw: []const u8, decode: bool) Error![]con
                 if (i + 4 >= raw.len) return error.Malformed;
                 var cp: u21 = try hexQuad(raw[i + 1 ..][0..4]);
                 i += 4;
+                if (!decode) continue;
                 if (cp >= 0xD800 and cp < 0xDC00 and i + 6 < raw.len and raw[i + 1] == '\\' and raw[i + 2] == 'u') {
                     const lo = try hexQuad(raw[i + 3 ..][0..4]);
                     if (lo >= 0xDC00 and lo < 0xE000) {
@@ -278,7 +279,7 @@ fn unescape(alloc: std.mem.Allocator, raw: []const u8, decode: bool) Error![]con
                 }
                 var buf: [4]u8 = undefined;
                 const n = std.unicode.utf8Encode(cp, &buf) catch return error.Malformed;
-                if (decode) out.appendSliceAssumeCapacity(buf[0..n]);
+                out.appendSliceAssumeCapacity(buf[0..n]);
                 continue;
             },
             else => return error.Malformed,
@@ -349,15 +350,29 @@ test "scanner: valid JSON values are preserved verbatim" {
 
 test "scanner: rejects invalid tokens, containers and strings" {
     for ([_][]const u8{
-        "tru",      "truefalse",   "False",                 "nul",          "null1",                 "undefined",
-        "-",        "+1",          "01",                    "-01",          ".2",                    "1.",
-        "1e",       "1e+",         "1e-",                   "0x1",          "1_000",                 "NaN",
-        "Infinity", "{\"x\":}",    "{\"x\" 1}",             "{\"x\":1,}",   "{\"x\":1 \"y\":2}",     "{x:1}",
-        "[,1]",     "[1,]",        "[1,,2]",                "[1 2]",        "[}",                    "{]",
-        "[",        "[[[]]",       "{\"x\":[{\"y\":tru}]}", "[{\"x\":01}]", "[true\x0c]",            "\x0btrue",
-        "\"a\tb\"", "\"\\u+01f\"", "\"\\u0_01\"",           "\"\\q\"",      "{\"x\":[\"\\ud800\"]}", "{\"\\q\":1}",
+        "tru",      "truefalse",   "False",                 "nul",          "null1",                        "undefined",
+        "-",        "+1",          "01",                    "-01",          ".2",                           "1.",
+        "1e",       "1e+",         "1e-",                   "0x1",          "1_000",                        "NaN",
+        "Infinity", "{\"x\":}",    "{\"x\" 1}",             "{\"x\":1,}",   "{\"x\":1 \"y\":2}",            "{x:1}",
+        "[,1]",     "[1,]",        "[1,,2]",                "[1 2]",        "[}",                           "{]",
+        "[",        "[[[]]",       "{\"x\":[{\"y\":tru}]}", "[{\"x\":01}]", "[true\x0c]",                   "\x0btrue",
+        "\"a\tb\"", "\"\\u+01f\"", "\"\\u0_01\"",           "\"\\q\"",      "{\"x\":[\"\\ud800\\u+01f\"]}", "{\"\\q\":1}",
     }) |raw| {
         var s = Scanner{ .src = raw, .alloc = std.testing.allocator };
+        try std.testing.expectError(error.Malformed, s.value());
+    }
+}
+
+test "scanner: lone surrogates pass through verbatim but cannot be decoded" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_][]const u8{ "{\"x\":\"\\ud800\"}", "[\"\\udc00\"]" }) |raw| {
+        var s = Scanner{ .src = raw, .alloc = arena.allocator() };
+        try std.testing.expectEqualStrings(raw, (try s.value()).bytes().?);
+        try std.testing.expect(s.atEnd());
+    }
+    for ([_][]const u8{ "\"\\ud800\"", "\"\\udc00\"" }) |raw| {
+        var s = Scanner{ .src = raw, .alloc = arena.allocator() };
         try std.testing.expectError(error.Malformed, s.value());
     }
 }
