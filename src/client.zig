@@ -65,6 +65,7 @@ pub const Retry = struct {
 pub const Client = struct {
     group_deadline: ?std.Io.Timestamp = null,
     wait_hook: ?transport.WaitHook = null,
+    control_busy: bool = false,
     alloc: std.mem.Allocator,
     io: std.Io,
     env: *std.process.Environ.Map,
@@ -391,7 +392,13 @@ pub const Client = struct {
         const resp_tags = key != protocol.api_key.api_versions and key != protocol.api_key.sasl_handshake;
         try protocol.encodeRequest(&e, key, ver, flexible, "kite", ctx, body_fn);
         try transport.send(conn, e.written());
-        const use_hook = c.wait_hook != null and conn != c.control and key != protocol.api_key.consumer_group_heartbeat and key != protocol.api_key.find_coordinator;
+        const on_control = c.control != null and conn == c.control.?;
+        const prev_control_busy = c.control_busy;
+        if (on_control) c.control_busy = true;
+        defer if (on_control) {
+            c.control_busy = prev_control_busy;
+        };
+        const use_hook = c.wait_hook != null and key != protocol.api_key.consumer_group_heartbeat and key != protocol.api_key.find_coordinator and key != protocol.api_key.api_versions;
         if (use_hook) {
             conn.net_reader.wait_hook = c.wait_hook;
             conn.setReadDeadline(c.group_deadline orelse std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(@intCast(timeout))));
@@ -611,16 +618,33 @@ pub const Client = struct {
         try c.requireVersion(protocol.api_key.find_coordinator, protocol.version.find_coordinator, "FindCoordinator");
         var retry: Retry = .{};
         while (true) {
-            if (c.control == null) c.reconnectControl() catch |err| {
-                if (retry.pause(c)) continue;
-                _ = try c.groupRemainingMs();
-                return err;
-            };
-            const resp = c.sendRequest(c.control.?, protocol.api_key.find_coordinator, protocol.version.find_coordinator, group, protocol.findCoordinatorRequest) catch |err| {
-                c.dropControl();
-                if (retry.pause(c)) continue;
-                _ = try c.groupRemainingMs();
-                return err;
+            const resp = if (c.control_busy) blk: {
+                var nodes = c.brokers.keyIterator();
+                const node = nodes.next() orelse return error.MetadataFailed;
+                const conn = c.connFor(node.*, connKey(node.*, 0xFFFF_FFFC)) catch |err| {
+                    c.dropConn(connKey(node.*, 0xFFFF_FFFC));
+                    if (retry.pause(c)) continue;
+                    _ = try c.groupRemainingMs();
+                    return err;
+                };
+                break :blk c.sendRequest(conn, protocol.api_key.find_coordinator, protocol.version.find_coordinator, group, protocol.findCoordinatorRequest) catch |err| {
+                    c.dropConn(connKey(node.*, 0xFFFF_FFFC));
+                    if (retry.pause(c)) continue;
+                    _ = try c.groupRemainingMs();
+                    return err;
+                };
+            } else blk: {
+                if (c.control == null) c.reconnectControl() catch |err| {
+                    if (retry.pause(c)) continue;
+                    _ = try c.groupRemainingMs();
+                    return err;
+                };
+                break :blk c.sendRequest(c.control.?, protocol.api_key.find_coordinator, protocol.version.find_coordinator, group, protocol.findCoordinatorRequest) catch |err| {
+                    c.dropControl();
+                    if (retry.pause(c)) continue;
+                    _ = try c.groupRemainingMs();
+                    return err;
+                };
             };
             defer c.alloc.free(resp.frame);
             var d = Decoder.init(resp.body);
@@ -672,12 +696,17 @@ pub const Client = struct {
         c.coordinator_node = -1;
     }
 
-    fn invalidateCoordinatorSlot(c: *Client, slot: u32) void {
-        if (c.coordinator_node >= 0) c.dropConn(connKey(c.coordinator_node, slot));
-        c.coordinator_node = -1;
+    const GroupResp = struct {
+        resp: Resp,
+        node: i32,
+    };
+
+    fn invalidateCoordinatorEndpoint(c: *Client, node: i32, slot: u32) void {
+        if (node >= 0) c.dropConn(connKey(node, slot));
+        if (c.coordinator_node == node) c.coordinator_node = -1;
     }
 
-    pub fn groupRequest(c: *Client, alloc: std.mem.Allocator, group: []const u8, key: i16, ver: i16, api: []const u8, ctx: anytype, comptime encode: fn (*Encoder, @TypeOf(ctx)) protocol.ProtoError!void) !Resp {
+    pub fn groupRequest(c: *Client, alloc: std.mem.Allocator, group: []const u8, key: i16, ver: i16, api: []const u8, ctx: anytype, comptime encode: fn (*Encoder, @TypeOf(ctx)) protocol.ProtoError!void) !GroupResp {
         try c.requireVersion(key, ver, api);
         const slot: u32 = if (key == protocol.api_key.consumer_group_heartbeat) 0xFFFF_FFFD else 0xFFFF_FFFE;
         var retry: Retry = .{};
@@ -685,19 +714,24 @@ pub const Client = struct {
         while (true) {
             const node = try c.findCoordinator(group);
             const conn = c.connFor(node, connKey(node, slot)) catch |err| {
-                c.invalidateCoordinatorSlot(slot);
+                c.invalidateCoordinatorEndpoint(node, slot);
                 if (comptime @TypeOf(ctx) == protocol.Heartbeat) request = request.forRetry();
                 if (retry.pause(c)) continue;
                 _ = try c.groupRemainingMs();
                 return err;
             };
-            return c.sendRequestAlloc(alloc, conn, key, ver, request, encode) catch |err| {
-                c.invalidateCoordinatorSlot(slot);
+            const resp = c.sendRequestAlloc(alloc, conn, key, ver, request, encode) catch |err| {
+                if (err == error.WaitHookAborted) {
+                    c.dropConn(connKey(node, slot));
+                    return err;
+                }
+                c.invalidateCoordinatorEndpoint(node, slot);
                 if (comptime @TypeOf(ctx) == protocol.Heartbeat) request = request.forRetry();
                 if (retry.pause(c)) continue;
                 _ = try c.groupRemainingMs();
                 return err;
             };
+            return .{ .resp = resp, .node = node };
         }
     }
 
@@ -705,11 +739,11 @@ pub const Client = struct {
         var retry: Retry = .{};
         var request = req;
         while (true) {
-            const resp = try c.groupRequest(alloc, req.group, protocol.api_key.consumer_group_heartbeat, protocol.version.consumer_group_heartbeat, "ConsumerGroupHeartbeat", request, protocol.heartbeatRequest);
-            var d = Decoder.init(resp.body);
+            const res = try c.groupRequest(alloc, req.group, protocol.api_key.consumer_group_heartbeat, protocol.version.consumer_group_heartbeat, "ConsumerGroupHeartbeat", request, protocol.heartbeatRequest);
+            var d = Decoder.init(res.resp.body);
             const result = try protocol.heartbeatResponse(&d, alloc);
             if (isCoordinatorError(result.code)) {
-                c.invalidateCoordinatorSlot(0xFFFF_FFFD);
+                c.invalidateCoordinatorEndpoint(res.node, 0xFFFF_FFFD);
                 request = request.forRetry();
                 if (retry.pause(c)) continue;
                 _ = try c.groupRemainingMs();
@@ -721,15 +755,15 @@ pub const Client = struct {
     pub fn commitGroupOffsets(c: *Client, alloc: std.mem.Allocator, req: protocol.OffsetCommit) !void {
         var retry: Retry = .{};
         while (true) {
-            const resp = try c.groupRequest(alloc, req.group, protocol.api_key.offset_commit, protocol.version.offset_commit, "OffsetCommit", req, protocol.offsetCommitRequest);
-            var d = Decoder.init(resp.body);
+            const res = try c.groupRequest(alloc, req.group, protocol.api_key.offset_commit, protocol.version.offset_commit, "OffsetCommit", req, protocol.offsetCommitRequest);
+            var d = Decoder.init(res.resp.body);
             const result = try protocol.offsetCommitResponse(&d, alloc);
             var code: protocol.ErrorCode = .none;
             for (result) |p| {
                 if (p.code != .none) code = p.code;
             }
             if (isCoordinatorError(code)) {
-                c.invalidateCoordinator();
+                c.invalidateCoordinatorEndpoint(res.node, 0xFFFF_FFFE);
                 if (retry.pause(c)) continue;
                 _ = try c.groupRemainingMs();
             }
@@ -792,11 +826,11 @@ pub const Client = struct {
     pub fn describeGroup(c: *Client, alloc: std.mem.Allocator, group: []const u8) !protocol.DescribedGroup {
         var retry: Retry = .{};
         while (true) {
-            const resp = try c.groupRequest(alloc, group, protocol.api_key.consumer_group_describe, protocol.version.consumer_group_describe, "ConsumerGroupDescribe", group, protocol.describeGroupRequest);
-            var d = Decoder.init(resp.body);
+            const res = try c.groupRequest(alloc, group, protocol.api_key.consumer_group_describe, protocol.version.consumer_group_describe, "ConsumerGroupDescribe", group, protocol.describeGroupRequest);
+            var d = Decoder.init(res.resp.body);
             const result = try protocol.describeGroupResponse(&d, alloc);
             if (isCoordinatorError(result.code)) {
-                c.invalidateCoordinator();
+                c.invalidateCoordinatorEndpoint(res.node, 0xFFFF_FFFE);
                 if (retry.pause(c)) continue;
             }
             try c.groupResult(result.code);
@@ -807,15 +841,15 @@ pub const Client = struct {
     pub fn fetchGroupOffsets(c: *Client, alloc: std.mem.Allocator, req: protocol.OffsetFetch) !protocol.FetchedOffsets {
         var retry: Retry = .{};
         while (true) {
-            const resp = try c.groupRequest(alloc, req.group, protocol.api_key.offset_fetch, protocol.version.offset_fetch, "OffsetFetch", req, protocol.offsetFetchRequest);
-            var d = Decoder.init(resp.body);
+            const res = try c.groupRequest(alloc, req.group, protocol.api_key.offset_fetch, protocol.version.offset_fetch, "OffsetFetch", req, protocol.offsetFetchRequest);
+            var d = Decoder.init(res.resp.body);
             const result = try protocol.offsetFetchResponse(&d, alloc);
             var code = result.code;
             for (result.offsets) |p| {
                 if (p.code != .none) code = p.code;
             }
             if (isCoordinatorError(code)) {
-                c.invalidateCoordinator();
+                c.invalidateCoordinatorEndpoint(res.node, 0xFFFF_FFFE);
                 if (retry.pause(c)) continue;
             }
             if (code == .unstable_offset_commit and retry.pause(c)) continue;
@@ -1122,18 +1156,25 @@ pub const Client = struct {
         if (c.control) |conn| {
             if (c.sendRequest(conn, protocol.api_key.metadata, protocol.version.metadata, t, metadataBody)) |resp| {
                 return resp;
-            } else |_| {
+            } else |err| {
                 c.vlog("metadata request failed — reconnecting control connection", .{});
                 c.dropControl();
+                if (err == error.WaitHookAborted) return err;
             }
         }
         var brokers = c.brokers.valueIterator();
         while (brokers.next()) |addr| {
-            return c.connectMetadata(t, addr.*) catch continue;
+            return c.connectMetadata(t, addr.*) catch |err| {
+                if (err == error.WaitHookAborted) return err;
+                continue;
+            };
         }
         for (c.cfg.bootstrap_servers) |server| {
             const addr = parseBootstrapServer(server) catch continue;
-            return c.connectMetadata(t, addr) catch continue;
+            return c.connectMetadata(t, addr) catch |err| {
+                if (err == error.WaitHookAborted) return err;
+                continue;
+            };
         }
         c.setErr("metadata request failed", .{});
         return error.MetadataFailed;
@@ -2091,7 +2132,7 @@ pub const Client = struct {
                 if (hook.next_due(hook.ctx)) |due| {
                     const until = now.durationTo(due).toMilliseconds();
                     if (until <= 0) {
-                        hook.tick(hook.ctx);
+                        if (hook.tick(hook.ctx)) return;
                         continue;
                     }
                     if (@as(u64, @intCast(until)) <= step) {
@@ -2101,7 +2142,7 @@ pub const Client = struct {
                 }
             }
             std.Io.sleep(c.io, .fromMilliseconds(@intCast(step)), .awake) catch {};
-            if (hook_due) if (c.wait_hook) |hook| hook.tick(hook.ctx);
+            if (hook_due) if (c.wait_hook) |hook| if (hook.tick(hook.ctx)) return;
         }
     }
 

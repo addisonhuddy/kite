@@ -13,6 +13,7 @@ pub const TransportError = error{
     TlsHandshakeAuthFailed,
     IoFailed,
     IoTimedOut,
+    WaitHookAborted,
     ResponseTooLarge,
     CorrelationMismatch,
     MalformedResponse,
@@ -32,7 +33,7 @@ pub const WaitHook = struct {
     ctx: *anyopaque,
     io: std.Io,
     next_due: *const fn (*anyopaque) ?std.Io.Timestamp,
-    tick: *const fn (*anyopaque) void,
+    tick: *const fn (*anyopaque) bool,
 };
 
 const SocketReader = struct {
@@ -87,7 +88,10 @@ const SocketReader = struct {
                 if (poll_limit) |ms| {
                     var fds = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
                     if ((std.posix.poll(&fds, @intCast(@min(ms, std.math.maxInt(i32)))) catch return error.ReadFailed) == 0) {
-                        if (hook_due) self.wait_hook.?.tick(self.wait_hook.?.ctx);
+                        if (hook_due and self.wait_hook.?.tick(self.wait_hook.?.ctx)) {
+                            self.err = error.WaitHookAborted;
+                            return error.ReadFailed;
+                        }
                         continue;
                     }
                 }
@@ -190,7 +194,7 @@ pub const Conn = struct {
     }
 
     fn ioError(c: *Conn) TransportError {
-        if (c.net_reader.err) |err| if (err == error.IoTimedOut) return err;
+        if (c.net_reader.err) |err| if (err == error.IoTimedOut or err == error.WaitHookAborted) return err;
         if (c.net_writer.err) |err| if (err == error.IoTimedOut) return err;
         return error.IoFailed;
     }
