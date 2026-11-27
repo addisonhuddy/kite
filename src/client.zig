@@ -391,7 +391,7 @@ pub const Client = struct {
         const resp_tags = key != protocol.api_key.api_versions and key != protocol.api_key.sasl_handshake;
         try protocol.encodeRequest(&e, key, ver, flexible, "kite", ctx, body_fn);
         try transport.send(conn, e.written());
-        const use_hook = c.wait_hook != null and key != protocol.api_key.consumer_group_heartbeat and key != protocol.api_key.find_coordinator;
+        const use_hook = c.wait_hook != null and conn != c.control and key != protocol.api_key.consumer_group_heartbeat and key != protocol.api_key.find_coordinator;
         if (use_hook) {
             conn.net_reader.wait_hook = c.wait_hook;
             conn.setReadDeadline(c.group_deadline orelse std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(@intCast(timeout))));
