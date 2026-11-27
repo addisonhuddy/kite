@@ -221,12 +221,18 @@ pub const Client = struct {
             ),
             else => c.setErr("produce to {s}[{d}]: {s}", .{ topic, pidx, result.code.name() }),
         }
-        if (result.message) |message| {
-            const prefix = c.errDetail().len;
-            const suffix = c.err_ctx[prefix..];
-            if (message.len > 0 and suffix.len > 3)
-                _ = std.fmt.bufPrintZ(suffix, ": {s}", .{message[0..@min(message.len, suffix.len - 3)]}) catch unreachable;
+        if (result.message) |message| c.appendProduceErr(": ", message);
+    }
+
+    fn appendProduceErr(c: *Client, separator: []const u8, detail: []const u8) void {
+        const suffix = c.err_ctx[c.errDetail().len..];
+        if (detail.len == 0 or suffix.len <= separator.len + 1) return;
+        const len = @min(detail.len, suffix.len - separator.len - 1);
+        @memcpy(suffix[0..separator.len], separator);
+        for (suffix[separator.len..][0..len], detail[0..len]) |*out, byte| {
+            out.* = if (std.ascii.isPrint(byte)) byte else '?';
         }
+        suffix[separator.len + len] = 0;
     }
 
     /// Verbose diagnostic to stderr, gated on `cfg.verbose` (-v).
@@ -2412,6 +2418,19 @@ test "rebuilding broker metadata releases old hosts including an empty update" {
     d = Decoder.init(&empty);
     try c.decodeBrokers(&d);
     try std.testing.expectEqual(@as(u32, 0), c.brokers.count());
+}
+
+test "produce error sanitizes and bounds broker detail" {
+    var c: Client = undefined;
+    c.err_ctx = @splat(0);
+    c.produceErr("topic", 0, .{ .code = .invalid_request, .message = "bad\x1b[31m\n\r\x00\x7f\xff!" }, 0);
+    try std.testing.expectEqualStrings("produce to topic[0]: INVALID_REQUEST: bad?[31m?????!", c.errDetail());
+
+    const long_message = [_]u8{0x1b} ** 512;
+    c.produceErr("topic", 0, .{ .code = .invalid_request, .message = &long_message }, 0);
+    const detail = c.errDetail();
+    try std.testing.expectEqual(c.err_ctx.len - 1, detail.len);
+    try std.testing.expectEqual(@as(u8, '?'), detail[detail.len - 1]);
 }
 
 test "dropping a produce socket invalidates only its outstanding responses" {
