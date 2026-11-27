@@ -1102,12 +1102,18 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
         }
     }.less);
     var human_rows: std.ArrayList([8][]const u8) = .empty;
+    var reported: usize = 0;
     var i: usize = 0;
     while (i < rows.items.len) {
         const topic = rows.items[i].topic;
         const topic_text = groupText(alloc, topic);
         const available = if (c.refreshMetadata(topic)) |_| true else |err| switch (err) {
             error.TopicNotFound => false,
+            error.TopicAuthorizationFailed => {
+                note("warning: skipping a topic the current principal is not authorized to describe", .{});
+                while (i < rows.items.len and std.mem.eql(u8, topic, rows.items[i].topic)) : (i += 1) {}
+                continue;
+            },
             else => fatalErr(&c, "could not resolve topic"),
         };
         const cursors = alloc.alloc(consumer.Cursor, if (available) c.partitions.items.len else 0) catch oom();
@@ -1119,6 +1125,7 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
         if (available) consumer.listOffsets(&c, &arena, topic, cursors, .latest, .read_uncommitted) catch fatalErr(&c, "could not fetch end offsets");
         while (i < rows.items.len and std.mem.eql(u8, topic, rows.items[i].topic)) : (i += 1) {
             const r = rows.items[i];
+            reported += 1;
             var end: ?i64 = null;
             for (cursors) |cursor| if (cursor.pidx == r.partition) {
                 end = cursor.offset;
@@ -1160,7 +1167,7 @@ fn runGroup(init: std.process.Init, args: []const []const u8, alloc: std.mem.All
     }
     if (!as_json) writeGroupTable(8, outw, .{ "GROUP", "TOPIC", "PARTITION", "COMMITTED", "END", "LAG", "MEMBER_ID", "CLIENT_ID" }, human_rows.items, tty) catch {};
     outw.flush() catch {};
-    if (!opts.common.quiet) note("{s}: {s}, {d} partition(s)", .{ group_text, groupText(alloc, described.state), rows.items.len });
+    if (!opts.common.quiet) note("{s}: {s}, {d} partition(s)", .{ group_text, groupText(alloc, described.state), reported });
     std.process.exit(0);
 }
 
