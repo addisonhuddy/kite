@@ -454,14 +454,16 @@ pub const Client = struct {
                 c.wait_hook
             else
                 null;
-        if (active_hook) |hook| {
-            conn.net_reader.wait_hook = hook;
+        const prev_hook = conn.net_reader.wait_hook;
+        const prev_cancel = conn.net_reader.cancellation;
+        if (active_hook) |hook| conn.net_reader.wait_hook = hook;
+        if (active_hook != null or c.group_deadline != null) {
             conn.setReadDeadline(c.group_deadline orelse std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(@intCast(timeout))));
         }
-        defer if (active_hook != null) {
-            conn.net_reader.wait_hook = null;
-            conn.setReadDeadline(null);
-        };
+        defer {
+            conn.net_reader.wait_hook = prev_hook;
+            conn.net_reader.cancellation = prev_cancel;
+        }
         return try transport.recv(conn, alloc, protocol.lastCorrelationId(), resp_tags);
     }
 

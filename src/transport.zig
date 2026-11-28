@@ -353,6 +353,45 @@ test "connect enforces shared deadline across TCP and TLS handshake" {
     try std.testing.expect(started.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds() < 300);
 }
 
+test "setReadDeadline enforces absolute deadline across fragmented reads" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(alloc);
+    defer env.deinit();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+    const c = try connect(io, alloc, &env, "127.0.0.1", server.socket.address.getPort(), null, 500);
+    defer alloc.destroy(c);
+    defer c.close();
+    const peer = try server.accept(io);
+    const Trickle = struct {
+        peer: std.Io.net.Stream,
+        io: std.Io,
+        fn run(self: @This()) void {
+            defer self.peer.close(self.io);
+            const frame = [_]u8{ 0, 0, 0, 12, 0, 0, 0, 1, 0, 'a', 'b', 'c', 'd', 'e', 'f', 'g' };
+            var buf: [16]u8 = undefined;
+            var writer = self.peer.writer(self.io, &buf);
+            writer.interface.writeAll(frame[0..4]) catch return;
+            writer.interface.flush() catch return;
+            for (frame[4..]) |byte| {
+                self.io.sleep(.fromMilliseconds(25), .awake) catch return;
+                writer.interface.writeAll(&.{byte}) catch return;
+                writer.interface.flush() catch return;
+            }
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Trickle.run, .{Trickle{ .peer = peer, .io = io }});
+    defer thread.join();
+    setTimeout(c, 500);
+    const started = std.Io.Timestamp.now(io, .awake);
+    c.setReadDeadline(started.addDuration(.fromMilliseconds(60)));
+    defer c.setReadDeadline(null);
+    try std.testing.expectError(error.IoTimedOut, recv(c, alloc, 1, true));
+    try std.testing.expect(started.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds() < 200);
+}
+
 /// Establish a connection: TCP, then TLS if `ca` is set (SNI + verification on).
 pub fn connect(
     io: std.Io,

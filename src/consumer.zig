@@ -175,6 +175,7 @@ const group_rebalance_timeout_ms = 30000;
 const group_session_assumed_ms = 45000;
 const group_commit_floor_ms = 1000;
 const group_rpc_min_timeout_ms = 1000;
+const heartbeat_min_timeout_ms = 50;
 const heartbeat_slack_ms = 100;
 
 fn heartbeatSlack(interval: u64) u64 {
@@ -183,7 +184,7 @@ fn heartbeatSlack(interval: u64) u64 {
 
 fn heartbeatTimeoutMs(interval: u64) u64 {
     if (interval >= group_rpc_min_timeout_ms) return interval -| heartbeatSlack(interval);
-    return group_rpc_min_timeout_ms;
+    return @max(heartbeat_min_timeout_ms, interval + @min(20, interval / 5));
 }
 
 const GroupSession = struct {
@@ -1137,9 +1138,9 @@ test "short heartbeat intervals separate liveness and data budgets and schedule 
 
     try std.testing.expectEqual(@as(u64, 4900), heartbeatTimeoutMs(5000));
     try std.testing.expectEqual(@as(u64, 900), heartbeatTimeoutMs(1000));
-    try std.testing.expectEqual(@as(u64, 1000), heartbeatTimeoutMs(100));
-    try std.testing.expectEqual(@as(u64, 1000), heartbeatTimeoutMs(2));
-    try std.testing.expectEqual(@as(u64, 1000), heartbeatTimeoutMs(1));
+    try std.testing.expectEqual(@as(u64, 120), heartbeatTimeoutMs(100));
+    try std.testing.expectEqual(@as(u64, 50), heartbeatTimeoutMs(2));
+    try std.testing.expectEqual(@as(u64, 50), heartbeatTimeoutMs(1));
 
     const alloc = std.testing.allocator;
     var env: std.process.Environ.Map = .init(alloc);
