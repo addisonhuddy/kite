@@ -475,7 +475,7 @@ const GroupSession = struct {
                 .assignment = if (parts.len == 0) &.{} else &.{.{ .topic_id = s.c.topic_id, .partitions = parts }},
             },
         }, sent, deadline) catch |err| {
-            if (err == error.GroupDeadlineExceeded or err == error.IoFailed or err == error.IoTimedOut or err == error.MetadataFailed or err == error.MetadataUnavailable or err == error.CoordinatorNotAvailable) {
+            if (err == error.GroupDeadlineExceeded or err == error.IoFailed or err == error.IoTimedOut or err == error.MetadataFailed or err == error.MetadataUnavailable or err == error.CoordinatorNotAvailable or err == error.AllBootstrapFailed) {
                 s.startRecovery();
                 s.heartbeat_due = true;
                 s.hook_timeouts +|= 1;
