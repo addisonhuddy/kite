@@ -2395,23 +2395,35 @@ pub const Client = struct {
             return false;
         }
         const end = std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(@intCast(ms)));
+        var post_deadline_checked = false;
         while (true) {
             const now = std.Io.Timestamp.now(c.io, .awake);
+            const left_ns = now.durationTo(end).nanoseconds;
             var watched_fd: ?std.posix.socket_t = null;
             var due_ns: ?i96 = null;
             if (c.wait_hook) |hook| {
                 if (hook.watch_fd) |wf| watched_fd = wf(hook.ctx);
                 if (hook.next_due(hook.ctx)) |due| {
-                    const until_ns = now.durationTo(due).nanoseconds;
-                    if (until_ns <= 0) {
-                        if (hook.tick(hook.ctx)) return true;
-                        continue;
-                    }
-                    due_ns = until_ns;
+                    due_ns = now.durationTo(due).nanoseconds;
                 }
             }
-            const left_ns = now.durationTo(end).nanoseconds;
-            if (left_ns <= 0 and watched_fd == null) return false;
+            if (left_ns <= 0) {
+                if (watched_fd == null) {
+                    if (!post_deadline_checked) {
+                        post_deadline_checked = true;
+                        if (due_ns) |until_ns| if (until_ns <= 0) {
+                            if (c.wait_hook.?.tick(c.wait_hook.?.ctx)) return true;
+                            continue;
+                        };
+                    }
+                    return false;
+                }
+                post_deadline_checked = true;
+            }
+            if (due_ns) |until_ns| if (until_ns <= 0) {
+                if (c.wait_hook.?.tick(c.wait_hook.?.ctx)) return true;
+                continue;
+            };
             var step: u64 = if (left_ns > 0) @intCast(@divTrunc(left_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms)) else std.math.maxInt(u64);
             var hook_due = false;
             if (due_ns) |until_ns| {
