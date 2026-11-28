@@ -13,6 +13,7 @@ pub const TransportError = error{
     TlsHandshakeAuthFailed,
     IoFailed,
     IoTimedOut,
+    WaitHookAborted,
     ResponseTooLarge,
     CorrelationMismatch,
     MalformedResponse,
@@ -28,6 +29,14 @@ const tls_plain_len = 32 * 1024;
 /// Fetch responses while bounding allocation against corrupt length prefixes.
 pub const max_response_len: usize = 128 << 20;
 
+pub const WaitHook = struct {
+    ctx: *anyopaque,
+    io: std.Io,
+    next_due: *const fn (*anyopaque) ?std.Io.Timestamp,
+    tick: *const fn (*anyopaque) bool,
+    watch_fd: ?*const fn (*anyopaque) ?std.posix.socket_t = null,
+};
+
 const SocketReader = struct {
     interface: std.Io.Reader,
     fd: std.posix.socket_t,
@@ -37,6 +46,9 @@ const SocketReader = struct {
         deadline: std.Io.Timestamp,
         io: std.Io,
     } = null,
+    wait_hook: ?WaitHook = null,
+    poll_nonblock: bool = false,
+    poll_would_block: bool = false,
 
     fn readVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
         const self: *SocketReader = @alignCast(@fieldParentPtr("interface", r));
@@ -44,16 +56,100 @@ const SocketReader = struct {
         const nbufs, const data_size = try r.writableVector(&buffers, data);
         std.debug.assert(nbufs != 0 and buffers[0].len != 0);
         while (true) {
+            if (self.poll_nonblock) {
+                var fds = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+                const rc = std.posix.poll(&fds, 0) catch {
+                    self.err = error.IoFailed;
+                    return error.ReadFailed;
+                };
+                if (rc == 0) {
+                    self.poll_would_block = true;
+                    return error.ReadFailed;
+                }
+                const n = std.posix.system.read(self.fd, buffers[0].ptr, buffers[0].len);
+                switch (std.posix.errno(n)) {
+                    .SUCCESS => {
+                        if (n == 0) return error.EndOfStream;
+                        const size: usize = @intCast(n);
+                        if (size > data_size) r.end += size - data_size;
+                        return @min(size, data_size);
+                    },
+                    .INTR => continue,
+                    .AGAIN, .TIMEDOUT => {
+                        self.poll_would_block = true;
+                        return error.ReadFailed;
+                    },
+                    else => {
+                        self.err = error.IoFailed;
+                        return error.ReadFailed;
+                    },
+                }
+            }
+            var poll_limit: ?u64 = null;
+            var hook_due = false;
+            var ready = false;
             if (self.cancellation) |cancel| {
                 if (cancel.stop) |flag| if (flag.load(.acquire)) return error.ReadFailed;
                 const remaining = std.Io.Timestamp.now(cancel.io, .awake).durationTo(cancel.deadline).toMilliseconds();
                 if (remaining <= 0) {
-                    self.err = error.IoTimedOut;
-                    return error.ReadFailed;
+                    if (self.wait_hook != null) {
+                        var fds = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+                        if ((std.posix.poll(&fds, 0) catch 0) > 0) ready = true;
+                    }
+                    if (!ready) {
+                        self.err = error.IoTimedOut;
+                        return error.ReadFailed;
+                    }
+                } else {
+                    poll_limit = @intCast(if (cancel.stop != null) @min(remaining, 50) else remaining);
                 }
-                const poll_ms = if (cancel.stop != null) @min(remaining, 50) else remaining;
-                var fds = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
-                if ((std.posix.poll(&fds, @intCast(@min(poll_ms, std.math.maxInt(i32)))) catch return error.ReadFailed) == 0) continue;
+            }
+            if (!ready) {
+                var watched_fd: ?std.posix.socket_t = null;
+                if (self.wait_hook) |hook| {
+                    if (hook.watch_fd) |wf| watched_fd = wf(hook.ctx);
+                    if (hook.next_due(hook.ctx)) |due| {
+                        const until = std.Io.Timestamp.now(hook.io, .awake).durationTo(due).toMilliseconds();
+                        if (until <= 0) {
+                            hook_due = true;
+                            poll_limit = 0;
+                        } else {
+                            const cap: u64 = @intCast(until);
+                            poll_limit = if (poll_limit) |p| @min(p, cap) else cap;
+                        }
+                    }
+                }
+                if (watched_fd) |wfd| {
+                    const timeout_ms: i32 = if (poll_limit) |ms| @intCast(@min(ms, std.math.maxInt(i32))) else -1;
+                    var fds = [_]std.posix.pollfd{
+                        .{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 },
+                        .{ .fd = wfd, .events = std.posix.POLL.IN, .revents = 0 },
+                    };
+                    const rc = std.posix.poll(&fds, timeout_ms) catch return error.ReadFailed;
+                    if (rc == 0) {
+                        if (hook_due and self.wait_hook.?.tick(self.wait_hook.?.ctx)) {
+                            self.err = error.WaitHookAborted;
+                            return error.ReadFailed;
+                        }
+                        continue;
+                    }
+                    if (fds[1].revents != 0) {
+                        if (self.wait_hook.?.tick(self.wait_hook.?.ctx)) {
+                            self.err = error.WaitHookAborted;
+                            return error.ReadFailed;
+                        }
+                        if (fds[0].revents == 0) continue;
+                    }
+                } else if (poll_limit) |ms| {
+                    var fds = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+                    if ((std.posix.poll(&fds, @intCast(@min(ms, std.math.maxInt(i32)))) catch return error.ReadFailed) == 0) {
+                        if (hook_due and self.wait_hook.?.tick(self.wait_hook.?.ctx)) {
+                            self.err = error.WaitHookAborted;
+                            return error.ReadFailed;
+                        }
+                        continue;
+                    }
+                }
             }
             const n = std.posix.system.read(self.fd, buffers[0].ptr, buffers[0].len);
             switch (std.posix.errno(n)) {
@@ -153,16 +249,16 @@ pub const Conn = struct {
     }
 
     fn ioError(c: *Conn) TransportError {
-        if (c.net_reader.err) |err| if (err == error.IoTimedOut) return err;
+        if (c.net_reader.err) |err| if (err == error.IoTimedOut or err == error.WaitHookAborted) return err;
         if (c.net_writer.err) |err| if (err == error.IoTimedOut) return err;
         return error.IoFailed;
     }
 };
 
 /// Connect TCP to host:port. host may be DNS or IP literal.
-fn tcpConnect(io: std.Io, host: []const u8, port: u16, timeout_ms: ?u64) !std.Io.net.Stream {
+fn tcpConnect(io: std.Io, host: []const u8, port: u16, deadline: ?std.Io.Timestamp) !std.Io.net.Stream {
     const hn = std.Io.net.HostName.init(host) catch return error.HostNotFound;
-    const s = if (timeout_ms) |ms| try connectBounded(io, hn, port, ms) else hn.connect(io, port, .{ .mode = .stream }) catch |err| return switch (err) {
+    const s = if (deadline) |dl| try connectBounded(io, hn, port, dl) else hn.connect(io, port, .{ .mode = .stream }) catch |err| return switch (err) {
         error.ConnectionRefused => error.ConnectionRefused,
         error.Timeout, error.HostUnreachable, error.NetworkUnreachable => error.ConnectTimedOut,
         error.UnknownHostName, error.NameServerFailure, error.NoAddressReturned => error.HostNotFound,
@@ -179,8 +275,7 @@ fn tcpConnect(io: std.Io, host: []const u8, port: u16, timeout_ms: ?u64) !std.Io
     return s;
 }
 
-fn connectBounded(io: std.Io, host: std.Io.net.HostName, port: u16, timeout_ms: u64) !std.Io.net.Stream {
-    const deadline = std.Io.Timestamp.now(io, .awake).addDuration(.fromMilliseconds(@intCast(timeout_ms)));
+fn connectBounded(io: std.Io, host: std.Io.net.HostName, port: u16, deadline: std.Io.Timestamp) !std.Io.net.Stream {
     var buffer: [32]std.Io.net.HostName.LookupResult = undefined;
     var addresses: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&buffer);
     host.lookup(io, &addresses, .{ .port = port }) catch return error.HostNotFound;
@@ -188,9 +283,8 @@ fn connectBounded(io: std.Io, host: std.Io.net.HostName, port: u16, timeout_ms: 
     while (addresses.getOne(io)) |result| switch (result) {
         .canonical_name => {},
         .address => |address| {
-            const remaining = std.Io.Timestamp.now(io, .awake).durationTo(deadline).toMilliseconds();
-            if (remaining <= 0) return error.ConnectTimedOut;
-            return connectAddress(io, address, @intCast(remaining)) catch |err| {
+            if (std.Io.Timestamp.now(io, .awake).durationTo(deadline).toMilliseconds() <= 0) return error.ConnectTimedOut;
+            return connectAddress(io, address, deadline) catch |err| {
                 last_error = err;
                 continue;
             };
@@ -199,7 +293,7 @@ fn connectBounded(io: std.Io, host: std.Io.net.HostName, port: u16, timeout_ms: 
     return last_error;
 }
 
-fn connectAddress(io: std.Io, address: std.Io.net.IpAddress, timeout_ms: u64) !std.Io.net.Stream {
+fn connectAddress(io: std.Io, address: std.Io.net.IpAddress, deadline: std.Io.Timestamp) !std.Io.net.Stream {
     const p = std.posix;
     const raw_fd = p.system.socket(std.Io.Threaded.posixAddressFamily(&address), p.SOCK.STREAM, p.IPPROTO.TCP);
     if (p.errno(raw_fd) != .SUCCESS) return error.ConnectFailed;
@@ -216,8 +310,11 @@ fn connectAddress(io: std.Io, address: std.Io.net.IpAddress, timeout_ms: u64) !s
         .SUCCESS => {},
         .CONNREFUSED => return error.ConnectionRefused,
         .INPROGRESS, .AGAIN => {
+            const remaining = std.Io.Timestamp.now(io, .awake).durationTo(deadline).toMilliseconds();
+            if (remaining <= 0) return error.ConnectTimedOut;
             var pollfds = [_]p.pollfd{.{ .fd = fd, .events = p.POLL.OUT, .revents = 0 }};
-            if ((p.poll(&pollfds, @intCast(timeout_ms)) catch return error.ConnectFailed) == 0) return error.ConnectTimedOut;
+            const rc = p.poll(&pollfds, @intCast(@min(@as(u64, @intCast(remaining)), std.math.maxInt(i32)))) catch return error.ConnectFailed;
+            if (rc == 0) return error.ConnectTimedOut;
             var socket_error: u32 = 0;
             var size: p.socklen_t = @sizeOf(u32);
             if (p.errno(p.system.getsockopt(fd, p.SOL.SOCKET, p.SO.ERROR, std.mem.asBytes(&socket_error), &size)) != .SUCCESS) return error.ConnectFailed;
@@ -289,10 +386,65 @@ test "bounded group connections succeed and report refused sockets" {
     const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try addr.listen(std.testing.io, .{});
     const bound = server.socket.address;
-    const stream = try connectAddress(std.testing.io, bound, 100);
+    const deadline = std.Io.Timestamp.now(std.testing.io, .awake).addDuration(.fromMilliseconds(100));
+    const stream = try connectAddress(std.testing.io, bound, deadline);
     stream.close(std.testing.io);
     server.deinit(std.testing.io);
-    try std.testing.expectError(error.ConnectionRefused, connectAddress(std.testing.io, bound, 100));
+    try std.testing.expectError(error.ConnectionRefused, connectAddress(std.testing.io, bound, deadline));
+}
+
+test "connect enforces shared deadline across TCP and TLS handshake" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var env: std.process.Environ.Map = .init(alloc);
+    defer env.deinit();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+    var ca: std.crypto.Certificate.Bundle = .empty;
+    defer ca.deinit(alloc);
+    const started = std.Io.Timestamp.now(io, .awake);
+    try std.testing.expectError(error.ConnectTimedOut, connect(io, alloc, &env, "127.0.0.1", server.socket.address.getPort(), &ca, 50));
+    try std.testing.expect(started.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds() < 300);
+}
+
+test "setReadDeadline enforces absolute deadline across fragmented reads" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(alloc);
+    defer env.deinit();
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+    const c = try connect(io, alloc, &env, "127.0.0.1", server.socket.address.getPort(), null, 500);
+    defer alloc.destroy(c);
+    defer c.close();
+    const peer = try server.accept(io);
+    const Trickle = struct {
+        peer: std.Io.net.Stream,
+        io: std.Io,
+        fn run(self: @This()) void {
+            defer self.peer.close(self.io);
+            const frame = [_]u8{ 0, 0, 0, 12, 0, 0, 0, 1, 0, 'a', 'b', 'c', 'd', 'e', 'f', 'g' };
+            var buf: [16]u8 = undefined;
+            var writer = self.peer.writer(self.io, &buf);
+            writer.interface.writeAll(frame[0..4]) catch return;
+            writer.interface.flush() catch return;
+            for (frame[4..]) |byte| {
+                self.io.sleep(.fromMilliseconds(25), .awake) catch return;
+                writer.interface.writeAll(&.{byte}) catch return;
+                writer.interface.flush() catch return;
+            }
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Trickle.run, .{Trickle{ .peer = peer, .io = io }});
+    defer thread.join();
+    setTimeout(c, 500);
+    const started = std.Io.Timestamp.now(io, .awake);
+    c.setReadDeadline(started.addDuration(.fromMilliseconds(60)));
+    defer c.setReadDeadline(null);
+    try std.testing.expectError(error.IoTimedOut, recv(c, alloc, 1, true));
+    try std.testing.expect(started.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds() < 200);
 }
 
 /// Establish a connection: TCP, then TLS if `ca` is set (SNI + verification on).
@@ -305,7 +457,11 @@ pub fn connect(
     ca: ?*std.crypto.Certificate.Bundle,
     timeout_ms: ?u64,
 ) TransportError!*Conn {
-    const stream = tcpConnect(io, host, port, timeout_ms) catch |err| return switch (err) {
+    const deadline: ?std.Io.Timestamp = if (timeout_ms) |ms|
+        std.Io.Timestamp.now(io, .awake).addDuration(.fromMilliseconds(@intCast(ms)))
+    else
+        null;
+    const stream = tcpConnect(io, host, port, deadline) catch |err| return switch (err) {
         error.ConnectionRefused, error.ConnectTimedOut, error.HostNotFound => err,
         else => error.ConnectFailed,
     };
@@ -335,9 +491,17 @@ pub fn connect(
     c.net_writer = .{ .fd = stream.socket.handle, .interface = .{ .vtable = &.{ .drain = SocketWriter.drain }, .buffer = &c.wbuf } };
     c.input = &c.net_reader.interface;
     c.output = &c.net_writer.interface;
-    if (timeout_ms) |ms| setTimeout(c, ms);
+    if (deadline) |dl| {
+        const rem = std.Io.Timestamp.now(io, .awake).durationTo(dl).toMilliseconds();
+        if (rem <= 0) return error.ConnectTimedOut;
+        setTimeout(c, @intCast(rem));
+    }
 
     if (ca) |bundle| {
+        if (deadline) |dl| {
+            c.net_reader.cancellation = .{ .io = io, .deadline = dl, .stop = null };
+        }
+        defer c.net_reader.cancellation = null;
         var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
         io.randomSecure(&entropy) catch io.random(&entropy);
         const client = std.crypto.tls.Client.init(c.input, c.output, .{
@@ -348,6 +512,9 @@ pub fn connect(
             .entropy = &entropy,
             .realtime_now = .now(io, .real),
         }) catch |err| {
+            if (c.net_reader.err) |rerr| {
+                if (rerr == error.IoTimedOut) return error.ConnectTimedOut;
+            }
             // errdefers above close the stream and free `c`.
             if (c.debug)
                 std.debug.print("tls init: {s}\n", .{@errorName(err)});
@@ -454,3 +621,96 @@ pub fn recv(c: *Conn, alloc: std.mem.Allocator, expect_corr: i32, header_tags: b
     if (header_tags) d.tagBuffer() catch return error.MalformedResponse;
     return .{ .frame = frame, .body = frame[d.pos..] };
 }
+
+pub fn hasBuffered(c: *const Conn) bool {
+    if (c.closed) return false;
+    if (c.tls_client) |tls| {
+        if (tls.reader.seek < tls.reader.end) return true;
+    }
+    return c.net_reader.interface.seek < c.net_reader.interface.end;
+}
+
+pub const FrameAccumulator = struct {
+    len_buf: [4]u8 = undefined,
+    len_read: usize = 0,
+    frame: ?[]u8 = null,
+    frame_read: usize = 0,
+
+    pub fn deinit(self: *FrameAccumulator, alloc: std.mem.Allocator) void {
+        if (self.frame) |f| alloc.free(f);
+        self.* = .{};
+    }
+
+    fn readChunk(c: *Conn, dst: []u8) TransportError!?usize {
+        const buffered = c.input.bufferedLen();
+        if (buffered > 0) {
+            const take = @min(dst.len, buffered);
+            const n = c.input.readSliceShort(dst[0..take]) catch return error.IoFailed;
+            return n;
+        }
+        const n = c.input.readSliceShort(dst) catch |err| {
+            if (c.net_reader.poll_would_block) return null;
+            c.close();
+            return if (err == error.ReadFailed) c.ioError() else error.IoFailed;
+        };
+        if (n == 0) {
+            if (c.net_reader.poll_would_block) return null;
+            c.close();
+            return error.IoFailed;
+        }
+        return n;
+    }
+
+    pub fn step(self: *FrameAccumulator, c: *Conn, alloc: std.mem.Allocator, expect_corr: i32, header_tags: bool) TransportError!?Response {
+        if (c.closed) return error.IoFailed;
+        const prev_nonblock = c.net_reader.poll_nonblock;
+        c.net_reader.poll_nonblock = true;
+        c.net_reader.poll_would_block = false;
+        defer {
+            c.net_reader.poll_nonblock = prev_nonblock;
+            c.net_reader.poll_would_block = false;
+        }
+        while (self.len_read < 4) {
+            const n = (try readChunk(c, self.len_buf[self.len_read..])) orelse return null;
+            self.len_read += n;
+        }
+        if (self.frame == null) {
+            const len = std.mem.readInt(u32, &self.len_buf, .big);
+            if (len < 4) {
+                c.close();
+                return error.MalformedResponse;
+            }
+            if (len > max_response_len) {
+                c.close();
+                return error.ResponseTooLarge;
+            }
+            const buf = alloc.alloc(u8, len) catch return error.OutOfMemory;
+            self.frame = buf;
+            self.frame_read = 0;
+        }
+        const buf = self.frame.?;
+        while (self.frame_read < buf.len) {
+            const n = (try readChunk(c, buf[self.frame_read..])) orelse return null;
+            self.frame_read += n;
+        }
+        const frame = buf;
+        self.frame = null;
+        self.len_read = 0;
+        self.frame_read = 0;
+        errdefer alloc.free(frame);
+        var d = protocol.Decoder.init(frame);
+        const corr = d.i32v() catch {
+            c.close();
+            return error.MalformedResponse;
+        };
+        if (corr != expect_corr) {
+            c.close();
+            return error.CorrelationMismatch;
+        }
+        if (header_tags) d.tagBuffer() catch {
+            c.close();
+            return error.MalformedResponse;
+        };
+        return .{ .frame = frame, .body = frame[d.pos..] };
+    }
+};

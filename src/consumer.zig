@@ -174,7 +174,24 @@ pub fn run(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
 const group_rebalance_timeout_ms = 30000;
 const group_session_assumed_ms = 45000;
 const group_commit_floor_ms = 1000;
+const group_rpc_min_timeout_ms = 1000;
+const heartbeat_min_timeout_ms = 50;
 const heartbeat_slack_ms = 100;
+
+fn heartbeatSlack(interval: u64) u64 {
+    return @min(heartbeat_slack_ms, interval / 4);
+}
+
+fn heartbeatBaseTimeoutMs(interval: u64) u64 {
+    if (interval >= group_rpc_min_timeout_ms) return interval -| heartbeatSlack(interval);
+    return @max(heartbeat_min_timeout_ms, interval * 2);
+}
+
+fn heartbeatTimeoutMs(interval: u64, timeouts: u8) u64 {
+    const base = heartbeatBaseTimeoutMs(interval);
+    const shift: u6 = @intCast(@min(timeouts, 10));
+    return @min(group_session_assumed_ms / 2, base << shift);
+}
 
 const GroupSession = struct {
     c: *client.Client,
@@ -189,6 +206,12 @@ const GroupSession = struct {
     position_fetch_due: bool = false,
     joined_once: bool = false,
     heartbeat_due: bool = true,
+    hook_paused: bool = false,
+    hook_timeouts: u32 = 0,
+    hb_timeouts: u8 = 0,
+    in_flight_hb: ?client.Client.InFlightHeartbeat = null,
+    pending_beat: ?PendingHeartbeat = null,
+    pending_error: ?anyerror = null,
     last_heartbeat: std.Io.Timestamp,
     last_record: std.Io.Timestamp,
     last_commit: ?std.Io.Timestamp = null,
@@ -200,12 +223,21 @@ const GroupSession = struct {
 
     fn beginAttempt(s: *GroupSession) void {
         s.attempt_started = std.Io.Timestamp.now(s.c.io, .awake);
-        s.c.group_deadline = s.attempt_started.addDuration(.fromMilliseconds(@intCast(@max(1, s.interval -| heartbeat_slack_ms))));
+        const timeout = @max(group_rpc_min_timeout_ms, s.interval -| heartbeatSlack(s.interval));
+        s.c.group_deadline = s.attempt_started.addDuration(.fromMilliseconds(@intCast(timeout)));
+    }
+
+    fn beginHeartbeatAttempt(s: *GroupSession) void {
+        s.attempt_started = std.Io.Timestamp.now(s.c.io, .awake);
+        const timeout = if (s.epoch == 0)
+            @max(group_rpc_min_timeout_ms, heartbeatTimeoutMs(s.interval, s.hb_timeouts))
+        else
+            heartbeatTimeoutMs(s.interval, s.hb_timeouts);
+        s.c.group_deadline = s.attempt_started.addDuration(.fromMilliseconds(@intCast(timeout)));
     }
 
     fn beginRound(s: *GroupSession) void {
         s.beginAttempt();
-        s.capDeadline(s.last_heartbeat.addDuration(.fromMilliseconds(@intCast(s.interval))));
         if (!s.opts.follow) if (s.recoveryDeadline()) |deadline| s.capDeadline(deadline);
         if (s.assignment_seen and s.idleReady()) if (s.opts.idle_ms) |idle| {
             const io_slack: u64 = if (s.recoveryDeadline() == null) 1000 else 0;
@@ -316,7 +348,15 @@ const GroupSession = struct {
         return true;
     }
 
+    fn abortInFlightHeartbeat(s: *GroupSession) void {
+        if (s.in_flight_hb) |*hb| {
+            s.c.abortInFlightHeartbeat(hb);
+            s.in_flight_hb = null;
+        }
+    }
+
     fn rejoin(s: *GroupSession) void {
+        s.abortInFlightHeartbeat();
         if (s.recovery_deadline == null) s.recovery_deadline = std.Io.Timestamp.now(s.c.io, .awake).addDuration(.fromMilliseconds(group_session_assumed_ms));
         s.owned.clearRetainingCapacity();
         s.commit_recovery_deadline = null;
@@ -361,8 +401,225 @@ const GroupSession = struct {
         s.c.vlog("committed {d} offsets for group {s}", .{ parts.items.len, s.opts.group.? });
     }
 
+    fn deinitPending(s: *GroupSession) void {
+        s.abortInFlightHeartbeat();
+        if (s.pending_beat) |pb| {
+            for (pb.assignment) |t| s.c.alloc.free(t.partitions);
+            s.c.alloc.free(pb.assignment);
+            s.pending_beat = null;
+        }
+        s.pending_error = null;
+    }
+
+    fn waitHook(s: *GroupSession) transport.WaitHook {
+        return .{
+            .ctx = s,
+            .io = s.c.io,
+            .next_due = nextHeartbeatDue,
+            .tick = heartbeatTick,
+            .watch_fd = watchHeartbeatFd,
+        };
+    }
+
+    fn watchHeartbeatFd(ctx: *anyopaque) ?std.posix.socket_t {
+        const s: *GroupSession = @ptrCast(@alignCast(ctx));
+        if (s.epoch <= 0 or s.hook_paused or s.pending_beat != null or s.pending_error != null) return null;
+        if (s.in_flight_hb) |*hb| return s.c.inFlightHeartbeatFd(hb);
+        return null;
+    }
+
+    fn nextHeartbeatDue(ctx: *anyopaque) ?std.Io.Timestamp {
+        const s: *GroupSession = @ptrCast(@alignCast(ctx));
+        if (s.epoch <= 0 or s.hook_paused or s.pending_beat != null or s.pending_error != null) return null;
+        if (s.in_flight_hb) |*hb| {
+            if (s.c.inFlightHeartbeatHasBuffered(hb)) return .zero;
+            return hb.deadline;
+        }
+        if (s.heartbeat_due) return .zero;
+        return s.last_heartbeat.addDuration(.fromMilliseconds(@intCast(s.interval)));
+    }
+
+    fn assignmentUnchanged(s: *const GroupSession, assignment: ?[]const protocol.TopicAssignment) bool {
+        const list = assignment orelse return true;
+        if (!s.assignment_seen) return false;
+        var assigned: []const i32 = &.{};
+        for (list) |t| {
+            if (!std.mem.eql(u8, &t.topic_id, &s.c.topic_id)) return false;
+            assigned = t.partitions;
+        }
+        return !assignmentChanged(s.owned.items, assigned);
+    }
+
+    fn startInFlightHeartbeat(s: *GroupSession, arena: *std.heap.ArenaAllocator, full: bool, in_hook: bool) bool {
+        _ = arena.reset(.retain_capacity);
+        const alloc = arena.allocator();
+        const parts = alloc.alloc(i32, s.owned.items.len) catch {
+            s.pending_error = error.OutOfMemory;
+            s.hook_paused = true;
+            return true;
+        };
+        for (s.owned.items, parts) |cursor, *p| p.* = cursor.pidx;
+        const sent = std.Io.Timestamp.now(s.c.io, .awake);
+        s.attempt_started = sent;
+        const deadline = sent.addDuration(.fromMilliseconds(@intCast(heartbeatTimeoutMs(s.interval, s.hb_timeouts))));
+        const inflight = s.c.startHeartbeat(alloc, .{
+            .group = s.opts.group.?,
+            .member_id = &s.member,
+            .member_epoch = s.epoch,
+            .rebalance_timeout_ms = if (full) group_rebalance_timeout_ms else -1,
+            .topics = if (full) &.{s.opts.topic} else null,
+            .assignment = if (full) (if (parts.len == 0) &.{} else &.{.{ .topic_id = s.c.topic_id, .partitions = parts }}) else null,
+            .retry_fields = .{
+                .rebalance_timeout_ms = group_rebalance_timeout_ms,
+                .topics = &.{s.opts.topic},
+                .assignment = if (parts.len == 0) &.{} else &.{.{ .topic_id = s.c.topic_id, .partitions = parts }},
+            },
+        }, sent, deadline) catch |err| {
+            if (err == error.GroupDeadlineExceeded or err == error.IoFailed or err == error.IoTimedOut or err == error.MetadataFailed or err == error.MetadataUnavailable or err == error.CoordinatorNotAvailable or err == error.AllBootstrapFailed) {
+                s.startRecovery();
+                s.heartbeat_due = true;
+                s.hook_timeouts +|= 1;
+                if (in_hook) s.hook_paused = true;
+                return false;
+            }
+            s.pending_error = err;
+            s.hook_paused = true;
+            return true;
+        };
+        s.in_flight_hb = inflight;
+        if (s.c.inFlightHeartbeatHasBuffered(&s.in_flight_hb.?)) {
+            return s.stepHeartbeat(in_hook);
+        }
+        return false;
+    }
+
+    fn stepHeartbeat(s: *GroupSession, in_hook: bool) bool {
+        if (s.epoch <= 0) return false;
+        if (s.pending_beat != null or s.pending_error != null) return true;
+        const prev_hook = s.c.wait_hook;
+        const prev_deadline = s.c.group_deadline;
+        const prev_attempt = s.attempt_started;
+        s.c.wait_hook = null;
+        defer {
+            s.c.wait_hook = prev_hook;
+            s.c.group_deadline = prev_deadline;
+            s.attempt_started = prev_attempt;
+        }
+        var arena = std.heap.ArenaAllocator.init(s.c.alloc);
+        defer arena.deinit();
+
+        if (s.in_flight_hb) |*hb| {
+            const res = s.c.pollHeartbeat(arena.allocator(), hb);
+            if (res) |maybe_hb| {
+                const reply = maybe_hb orelse return false;
+                const sent = hb.sent;
+                s.in_flight_hb = null;
+                if (client.Client.isCoordinatorError(reply.code)) {
+                    s.startRecovery();
+                    s.heartbeat_due = true;
+                    s.hook_timeouts +|= 1;
+                    if (in_hook and s.hook_timeouts > 1) s.hook_paused = true;
+                    return false;
+                }
+                const rtt_ms: u64 = @intCast(@max(0, sent.durationTo(std.Io.Timestamp.now(s.c.io, .awake)).toMilliseconds()));
+                if (rtt_ms <= heartbeatBaseTimeoutMs(s.interval)) {
+                    s.hb_timeouts = 0;
+                }
+                s.hook_timeouts = 0;
+                if (reply.code == .none and s.assignmentUnchanged(reply.assignment)) {
+                    s.epoch = reply.member_epoch;
+                    s.interval = @intCast(@max(1, reply.heartbeat_interval_ms));
+                    s.last_heartbeat = sent;
+                    s.heartbeat_due = false;
+                    s.heartbeatSucceeded();
+                    return false;
+                }
+                const cloned = cloneAssignment(s.c.alloc, reply.assignment) catch |err| {
+                    s.pending_error = err;
+                    s.hook_paused = true;
+                    return true;
+                };
+                if (s.pending_beat) |pb| {
+                    for (pb.assignment) |t| s.c.alloc.free(t.partitions);
+                    s.c.alloc.free(pb.assignment);
+                }
+                s.pending_beat = .{
+                    .sent = sent,
+                    .code = reply.code,
+                    .member_epoch = reply.member_epoch,
+                    .heartbeat_interval_ms = reply.heartbeat_interval_ms,
+                    .has_assignment = reply.assignment != null,
+                    .assignment = cloned,
+                };
+                s.hook_paused = true;
+                return true;
+            } else |err| {
+                s.in_flight_hb = null;
+                if (err == error.GroupDeadlineExceeded or err == error.IoFailed or err == error.IoTimedOut) {
+                    if (err == error.GroupDeadlineExceeded) s.hb_timeouts +|= 1;
+                    s.hook_timeouts +|= 1;
+                    s.startRecovery();
+                    s.heartbeat_due = true;
+                    if (s.hook_timeouts == 1) {
+                        return s.startInFlightHeartbeat(&arena, true, in_hook);
+                    }
+                    if (in_hook) s.hook_paused = true;
+                    return false;
+                }
+                s.pending_error = err;
+                s.hook_paused = true;
+                return true;
+            }
+        }
+
+        const now = std.Io.Timestamp.now(s.c.io, .awake);
+        const elapsed = s.last_heartbeat.durationTo(now).toMilliseconds();
+        if (!s.heartbeat_due and elapsed < s.interval) return false;
+        const full = s.heartbeat_due or s.hook_timeouts > 0 or s.hb_timeouts > 0;
+        return s.startInFlightHeartbeat(&arena, full, in_hook);
+    }
+
+    fn heartbeatTick(ctx: *anyopaque) bool {
+        const s: *GroupSession = @ptrCast(@alignCast(ctx));
+        return s.stepHeartbeat(true);
+    }
+
+    fn drainPending(s: *GroupSession, arena: *std.heap.ArenaAllocator) !void {
+        while (true) {
+            if (s.pending_error) |err| {
+                s.pending_error = null;
+                s.hook_paused = false;
+                return err;
+            }
+            if (s.pending_beat) |pb| {
+                s.pending_beat = null;
+                defer {
+                    for (pb.assignment) |t| s.c.alloc.free(t.partitions);
+                    s.c.alloc.free(pb.assignment);
+                }
+                s.hook_paused = false;
+                s.attempt_started = pb.sent;
+                s.applyHeartbeat(arena, .{
+                    .code = pb.code,
+                    .message = null,
+                    .member_id = &s.member,
+                    .member_epoch = pb.member_epoch,
+                    .heartbeat_interval_ms = pb.heartbeat_interval_ms,
+                    .assignment = if (pb.has_assignment) pb.assignment else null,
+                }) catch |err| {
+                    if (err == error.WaitHookAborted) continue;
+                    return err;
+                };
+                continue;
+            }
+            s.hook_paused = false;
+            return;
+        }
+    }
+
     fn beat(s: *GroupSession, arena: *std.heap.ArenaAllocator) !void {
-        s.beginAttempt();
+        s.abortInFlightHeartbeat();
+        s.beginHeartbeatAttempt();
         const alloc = arena.allocator();
         const parts = try alloc.alloc(i32, s.owned.items.len);
         for (s.owned.items, parts) |cursor, *p| p.* = cursor.pidx;
@@ -394,7 +651,7 @@ const GroupSession = struct {
         s.joined_once = true;
         s.epoch = result.member_epoch;
         s.interval = @intCast(@max(1, result.heartbeat_interval_ms));
-        s.last_heartbeat = std.Io.Timestamp.now(s.c.io, .awake);
+        s.last_heartbeat = if (s.attempt_started.nanoseconds > 0) s.attempt_started else std.Io.Timestamp.now(s.c.io, .awake);
         s.heartbeat_due = false;
         s.beginRound();
         if (joining) s.c.vlog("joined group '{s}', member {s}, epoch {d}", .{ s.opts.group.?, s.member, s.epoch });
@@ -554,6 +811,7 @@ const GroupSession = struct {
     }
 
     fn leave(s: *GroupSession) void {
+        s.abortInFlightHeartbeat();
         if (s.epoch <= 0) return;
         const saved_err = s.c.err_ctx;
         defer s.c.err_ctx = saved_err;
@@ -888,9 +1146,9 @@ test "unfinished assignments yield to heartbeats without losing resolved offsets
     try std.testing.expect(session.recoveryDeadline() == null);
     try std.testing.expectEqual(@as(i64, 12), session.owned.items[0].offset);
     try std.testing.expectEqual(@as(i64, 20), session.owned.items[1].offset);
-    session.last_heartbeat = now.addDuration(.fromMilliseconds(-950));
+    session.last_heartbeat = now.addDuration(.fromMilliseconds(-750));
     session.beginRound();
-    try std.testing.expect(try c.groupRemainingMs() <= 50);
+    try std.testing.expect(try c.groupRemainingMs() >= group_rpc_min_timeout_ms - 100);
 }
 
 test "follow ignores expired recovery budgets without renewing them" {
@@ -957,6 +1215,71 @@ test "failed final commits preserve pending progress and report replay" {
     }
 }
 
+test "short heartbeat intervals separate liveness and data budgets and schedule from send time" {
+    try std.testing.expectEqual(@as(u64, 100), heartbeatSlack(5000));
+    try std.testing.expectEqual(@as(u64, 100), heartbeatSlack(400));
+    try std.testing.expectEqual(@as(u64, 25), heartbeatSlack(100));
+    try std.testing.expectEqual(@as(u64, 12), heartbeatSlack(50));
+    try std.testing.expectEqual(@as(u64, 0), heartbeatSlack(2));
+    try std.testing.expectEqual(@as(u64, 0), heartbeatSlack(1));
+
+    try std.testing.expectEqual(@as(u64, 4900), heartbeatTimeoutMs(5000, 0));
+    try std.testing.expectEqual(@as(u64, 900), heartbeatTimeoutMs(1000, 0));
+    try std.testing.expectEqual(@as(u64, 200), heartbeatTimeoutMs(100, 0));
+    try std.testing.expectEqual(@as(u64, 400), heartbeatTimeoutMs(100, 1));
+    try std.testing.expectEqual(@as(u64, 800), heartbeatTimeoutMs(100, 2));
+    try std.testing.expectEqual(@as(u64, 50), heartbeatTimeoutMs(2, 0));
+    try std.testing.expectEqual(@as(u64, 50), heartbeatTimeoutMs(1, 0));
+
+    const alloc = std.testing.allocator;
+    var env: std.process.Environ.Map = .init(alloc);
+    defer env.deinit();
+    const cfg: config.Config = .{ .bootstrap_servers = &.{} };
+    var c = client.Client.init(alloc, std.testing.io, &env, &cfg);
+    defer c.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const now = std.Io.Timestamp.now(c.io, .awake);
+
+    for ([_]u64{ 1000, 999, 100, 2, 1 }) |interval| {
+        var session: GroupSession = .{ .c = &c, .opts = .{ .topic = "t", .group = "g" }, .member = @splat('m'), .epoch = 1, .interval = interval, .last_heartbeat = now.addDuration(.fromMilliseconds(-750)), .last_record = now };
+        session.beginRound();
+        try std.testing.expect(try c.groupRemainingMs() >= group_rpc_min_timeout_ms - 100);
+        session.beginHeartbeatAttempt();
+        try std.testing.expect(try c.groupRemainingMs() <= heartbeatTimeoutMs(interval, 0));
+    }
+
+    const sent = now.addDuration(.fromMilliseconds(-60));
+    var session: GroupSession = .{ .c = &c, .opts = .{ .topic = "t", .group = "g" }, .member = @splat('m'), .epoch = 1, .interval = 100, .last_heartbeat = sent, .last_record = now, .attempt_started = sent };
+    const result: protocol.HeartbeatResult = .{ .code = .none, .message = null, .member_id = "m", .member_epoch = 1, .heartbeat_interval_ms = 100, .assignment = null };
+    try session.applyHeartbeat(&arena, result);
+    try std.testing.expectEqual(sent, session.last_heartbeat);
+}
+
+const PendingHeartbeat = struct {
+    sent: std.Io.Timestamp,
+    code: protocol.ErrorCode,
+    member_epoch: i32,
+    heartbeat_interval_ms: i32,
+    has_assignment: bool,
+    assignment: []protocol.TopicAssignment,
+};
+
+fn cloneAssignment(alloc: std.mem.Allocator, assignment: ?[]const protocol.TopicAssignment) ![]protocol.TopicAssignment {
+    const src = assignment orelse return &.{};
+    const out = try alloc.alloc(protocol.TopicAssignment, src.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |t| alloc.free(t.partitions);
+        alloc.free(out);
+    }
+    for (src, out) |t, *dst| {
+        dst.* = .{ .topic_id = t.topic_id, .partitions = try alloc.dupe(i32, t.partitions) };
+        built += 1;
+    }
+    return out;
+}
+
 fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
     defer c.group_deadline = null;
     var random: [16]u8 = undefined;
@@ -964,7 +1287,10 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
     const now = std.Io.Timestamp.now(c.io, .awake);
     var session: GroupSession = .{ .c = c, .opts = opts, .member = std.fmt.bytesToHex(random, .lower), .last_heartbeat = now, .last_record = now };
     defer session.owned.deinit(c.alloc);
+    defer session.deinitPending();
     defer session.leave();
+    c.wait_hook = session.waitHook();
+    defer c.wait_hook = null;
     var arena = std.heap.ArenaAllocator.init(c.alloc);
     defer arena.deinit();
     var scratch: std.Io.Writer.Allocating = .init(c.alloc);
@@ -973,8 +1299,17 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
     var leader_index: usize = 0;
     var retry: client.Retry = .{};
     var commit_retry: client.Retry = .{};
+    var beat_timeouts: u32 = 0;
     var exit_error: ?anyerror = null;
     while (true) {
+        _ = arena.reset(.{ .retain_with_limit = round_arena_retain_limit });
+        session.drainPending(&arena) catch |err| {
+            if (!session.recoverEpoch(err)) {
+                exit_error = err;
+                break;
+            }
+            session.startRecovery();
+        };
         if (opts.stop) |flag| if (flag.load(.acquire)) break;
         if (opts.max_records) |max| if (count >= max) break;
         if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
@@ -985,24 +1320,40 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             break;
         };
         if (session.idleExpired(std.Io.Timestamp.now(c.io, .awake))) break;
-        _ = arena.reset(.{ .retain_with_limit = round_arena_retain_limit });
         session.beginRound();
         const elapsed = session.last_heartbeat.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds();
-        if (session.heartbeat_due or elapsed >= session.interval) {
+        if (session.epoch == 0) {
             session.beat(&arena) catch |err| {
+                if (err == error.WaitHookAborted) continue;
                 if (!session.recoverEpoch(err)) {
                     exit_error = err;
                     break;
                 }
                 session.startRecovery();
-                session.beginRound();
-                _ = retry.pause(c);
+                beat_timeouts +|= 1;
+                if (beat_timeouts > 1) {
+                    session.beginRound();
+                    _ = retry.pause(c);
+                }
             };
-            if (session.heartbeat_due) continue;
+            if (!session.heartbeat_due and session.epoch > 0) beat_timeouts = 0;
+            if (session.heartbeat_due or session.epoch == 0) continue;
+        } else if (session.in_flight_hb != null or session.heartbeat_due or elapsed >= session.interval) {
+            if (session.stepHeartbeat(false)) continue;
+            if (session.in_flight_hb == null and session.heartbeat_due) {
+                beat_timeouts +|= 1;
+                if (beat_timeouts > 1) {
+                    session.beginRound();
+                    _ = retry.pause(c);
+                }
+            } else if (session.in_flight_hb == null and !session.heartbeat_due) {
+                beat_timeouts = 0;
+            }
         }
         if (session.idleExpired(std.Io.Timestamp.now(c.io, .awake))) break;
         if (opts.follow and session.commit_recovery_deadline != null) {
             session.commit(arena.allocator(), true) catch |err| {
+                if (err == error.WaitHookAborted) continue;
                 if (!session.recoverEpoch(err)) {
                     exit_error = err;
                     break;
@@ -1018,26 +1369,31 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             c.sleep(@min(50, @max(1, session.interval / 4)));
             continue;
         }
-        if (!session.position_fetch_due or !session.hasReadyPartition()) session.resolvePositions(&arena) catch |err| {
-            if (!GroupSession.positionRetry(err)) {
-                if (!session.recoverEpoch(err)) {
-                    exit_error = err;
-                    break;
+        if (!session.position_fetch_due or !session.hasReadyPartition()) {
+            session.beginRound();
+            session.resolvePositions(&arena) catch |err| {
+                if (err == error.WaitHookAborted) continue;
+                if (!GroupSession.positionRetry(err)) {
+                    if (!session.recoverEpoch(err)) {
+                        exit_error = err;
+                        break;
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
+            };
+        }
         session.beginRound();
-        const selected = for (0..session.owned.items.len) |_| {
-            const idx = leader_index % session.owned.items.len;
-            leader_index +%= 1;
+        const selected = for (0..session.owned.items.len) |offset| {
+            const idx = (leader_index +% offset) % session.owned.items.len;
             if (session.fetchReady(session.owned.items[idx])) break idx;
         } else {
             if (!session.positions_pending_initial) _ = retry.pause(c);
             continue;
         };
+        leader_index = selected +% 1;
         if (session.owned.items[selected].leader_stale) {
             c.refreshMetadata(opts.topic) catch |err| {
+                if (err == error.WaitHookAborted) continue;
                 if (!session.recoverEpoch(err)) {
                     exit_error = err;
                     break;
@@ -1059,12 +1415,6 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             }
         }
         var fetch_opts = opts;
-        const since_beat = session.last_heartbeat.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds();
-        const until_beat = session.interval -| @as(u64, @intCast(@max(0, since_beat)));
-        if (until_beat <= heartbeat_slack_ms) {
-            c.sleep(until_beat);
-            continue;
-        }
         const remaining = c.groupRemainingMs() catch {
             session.heartbeat_due = true;
             continue;
@@ -1073,7 +1423,7 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             c.sleep(remaining);
             continue;
         }
-        fetch_opts.fetch_wait_ms = @min(c.cfg.fetch_max_wait_ms, @min(until_beat - heartbeat_slack_ms, remaining - @min(1000, remaining / 2)));
+        fetch_opts.fetch_wait_ms = @min(c.cfg.fetch_max_wait_ms, @min(@max(50, session.interval), remaining - @min(1000, remaining / 2)));
         if (session.idleReady()) if (opts.idle_ms) |idle| {
             const idle_remaining = idle -| @as(u64, @intCast(@max(0, session.last_record.durationTo(std.Io.Timestamp.now(c.io, .awake)).toMilliseconds())));
             if (idle_remaining <= 1) {
@@ -1084,6 +1434,11 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         };
         var progress = false;
         const outcomes = fetchLeader(c, arena.allocator(), fetch_opts, parts.items, out, &scratch, &count, &progress) catch |err| {
+            if (err == error.WaitHookAborted) {
+                try out.flush();
+                if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
+                continue;
+            }
             exit_error = err;
             break;
         };
@@ -1092,8 +1447,10 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
         try out.flush();
         if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
         if (progress) session.last_record = std.Io.Timestamp.now(c.io, .awake);
+        if (session.in_flight_hb != null and session.stepHeartbeat(false)) continue;
         session.beginRound();
         session.commit(arena.allocator(), false) catch |err| {
+            if (err == error.WaitHookAborted) continue;
             if (!session.recoverEpoch(err)) {
                 exit_error = err;
                 break;
@@ -1110,6 +1467,9 @@ fn runGroup(c: *client.Client, opts: Options, out: *std.Io.Writer) !u64 {
             }
         } else retry = .{};
     }
+    c.wait_hook = null;
+    session.abortInFlightHeartbeat();
+    session.drainPending(&arena) catch {};
     try out.flush();
     if (opts.sink_closed) |closed| if (closed()) return error.WriteFailed;
     session.beginAttempt();
@@ -1225,13 +1585,20 @@ fn listOffsetsLeader(
             try e.tagBuffer();
         }
     }.f;
-    const conn = c.connFor(parts[0].cursor.leader, client.Client.connKey(parts[0].cursor.leader, 0)) catch return error.RetryFetch;
+    const leader = parts[0].cursor.leader;
+    const conn = c.connFor(leader, client.Client.connKey(leader, 0)) catch return error.RetryFetch;
     const resp = c.sendRequestAlloc(alloc, conn, protocol.api_key.list_offsets, protocol.version.list_offsets, Ctx{
         .topic = topic,
         .parts = parts,
         .start = start,
         .isolation = isolation,
-    }, body) catch return error.RetryFetch;
+    }, body) catch |err| {
+        if (err == error.WaitHookAborted) {
+            c.dropConn(client.Client.connKey(leader, 0));
+            return err;
+        }
+        return error.RetryFetch;
+    };
     var d = Decoder.init(resp.body);
     _ = try d.i32v();
     const topics = try d.compactArrayLen();
@@ -1322,6 +1689,7 @@ test "mixed fetch replies update only each partition's recovery" {
     const alloc = std.testing.allocator;
     var c: client.Client = undefined;
     c.io = std.testing.io;
+    c.wait_hook = null;
     const cfg: config.Config = .{ .bootstrap_servers = &.{} };
     c.cfg = &cfg;
     const now = std.Io.Timestamp.now(c.io, .awake);
@@ -1389,6 +1757,7 @@ test "throttled empty fetches retain outage state and yield at the heartbeat dea
     const alloc = std.testing.allocator;
     var c: client.Client = undefined;
     c.io = std.testing.io;
+    c.wait_hook = null;
     const cfg: config.Config = .{ .bootstrap_servers = &.{} };
     c.cfg = &cfg;
     const now = std.Io.Timestamp.now(c.io, .awake);
@@ -1502,6 +1871,10 @@ fn fetchLeader(
         .max_bytes = c.cfg.fetch_max_bytes,
         .isolation = opts.isolation,
     }, encodeFetchBody) catch |err| {
+        if (err == error.WaitHookAborted) {
+            c.dropConn(client.Client.connKey(leader, 0));
+            return err;
+        }
         c.dropNode(leader);
         switch (err) {
             error.ResponseTooLarge => {
