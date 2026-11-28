@@ -460,12 +460,14 @@ commits. Heartbeats run between fetches; no background process is started.
 The stdout reader must drain within the broker's group session timeout (45s
 by default). A slower reader can cause fencing and replay of uncommitted records.
 Heartbeats are strictly single-flight per KIP-848 and run non-blockingly so a
-slow heartbeat reply does not stall Fetch. To survive a lost heartbeat reply
-without fencing (including over TLS), configure the broker's session timeout to
-at least two heartbeat intervals plus a reconnect round trip (Kafka's own
-defaults are a 45s session timeout and 5s heartbeat interval; sessions shorter
-than `~2 * heartbeat_interval + reconnect_rtt` will fence on a lost reply and
-rejoin).
+slow heartbeat reply does not stall Fetch. The per-attempt heartbeat reply
+budget starts at `max(50ms, 2 * interval)` for sub-second intervals (or
+`interval - min(100ms, interval / 4)` at `>= 1s`), doubles after each timeout
+(capped at 22.5s), and resets only once a reply arrives within the base budget.
+To survive a lost heartbeat reply without fencing (including over TLS), the
+broker's session timeout must exceed the active heartbeat reply budget plus
+reconnect/rediscovery time (Kafka's own defaults are a 45s session timeout and
+5s heartbeat interval; shorter sessions fence and rejoin on a lost reply).
 Network lookups and retries yield to the next heartbeat; unfinished assignments
 resume after it. With `--follow`, coordinator and broker outages are retried with
 backoff indefinitely, with a periodic stderr warning. kite rejoins if the broker

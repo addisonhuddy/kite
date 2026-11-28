@@ -364,12 +364,13 @@ class Handler(socketserver.StreamRequestHandler):
                         continue
                     session_limit = (
                         2.0 if broker.mode in ("short-heartbeat-slow-125ms", "short-heartbeat-slow-130ms", "short-heartbeat-slow-350ms", "short-heartbeat-slow-125ms-revoke")
+                        else 0.35 if broker.mode == "short-heartbeat-lost-reply-after-slow"
                         else 0.30 if broker.mode == "short-heartbeat-lost-reply-tls"
                         else 0.25 if broker.mode in ("short-heartbeat-slow-107ms", "short-heartbeat-lost-reply", "short-heartbeat-fragmented-reply")
                         else 0.15
                     )
                     beat_idx = len(broker.beats)
-                    if broker.mode in ("short-heartbeat-session", "short-heartbeat-session-slow-leader", "short-heartbeat-lost-reply", "short-heartbeat-lost-reply-tls", "short-heartbeat-lost-reply-below-min", "short-heartbeat-fragmented-reply", "short-heartbeat-slow-metadata", "short-heartbeat-revoke-during-fetch", "short-heartbeat-slow-107ms", "short-heartbeat-slow-125ms", "short-heartbeat-slow-130ms", "short-heartbeat-slow-350ms", "short-heartbeat-slow-125ms-revoke", "short-heartbeat-slow-offset-fetch") and epoch > 0:
+                    if broker.mode in ("short-heartbeat-session", "short-heartbeat-session-slow-leader", "short-heartbeat-lost-reply", "short-heartbeat-lost-reply-tls", "short-heartbeat-lost-reply-below-min", "short-heartbeat-lost-reply-after-slow", "short-heartbeat-fragmented-reply", "short-heartbeat-slow-metadata", "short-heartbeat-revoke-during-fetch", "short-heartbeat-slow-107ms", "short-heartbeat-slow-125ms", "short-heartbeat-slow-130ms", "short-heartbeat-slow-350ms", "short-heartbeat-slow-125ms-revoke", "short-heartbeat-slow-offset-fetch") and epoch > 0:
                         if beat_idx >= 2 and broker.beats[-1] - broker.beats[-2] > session_limit:
                             broker.fenced = True
                             response = pack("ih", 0, 25) + b"\x00\x00" + pack("ii", 0, 100) + b"\xff\x00"
@@ -378,6 +379,11 @@ class Handler(socketserver.StreamRequestHandler):
                             continue
                         if broker.mode in ("short-heartbeat-lost-reply", "short-heartbeat-lost-reply-tls", "short-heartbeat-lost-reply-below-min") and beat_idx == 3:
                             continue
+                        if broker.mode == "short-heartbeat-lost-reply-after-slow":
+                            if beat_idx in (2, 3):
+                                time.sleep(0.22)
+                            elif beat_idx == 4:
+                                continue
                         if broker.mode in ("short-heartbeat-session", "short-heartbeat-session-slow-leader"):
                             time.sleep(0.06)
                     if broker.mode == "short-heartbeat-slow-107ms" and epoch > 0:
@@ -467,7 +473,7 @@ class Handler(socketserver.StreamRequestHandler):
                     if broker.mode == "short-heartbeat-1000ms-slow":
                         time.sleep(0.30)
                     if broker.mode.startswith("short-heartbeat") and broker.delivered:
-                        delay = 0.25 if broker.mode in ("short-heartbeat", "short-heartbeat-session", "short-heartbeat-session-slow-leader", "short-heartbeat-lost-reply", "short-heartbeat-lost-reply-tls", "short-heartbeat-lost-reply-below-min", "short-heartbeat-fragmented-reply") else 0
+                        delay = 1.0 if broker.mode == "short-heartbeat-lost-reply-after-slow" else 0.25 if broker.mode in ("short-heartbeat", "short-heartbeat-session", "short-heartbeat-session-slow-leader", "short-heartbeat-lost-reply", "short-heartbeat-lost-reply-tls", "short-heartbeat-lost-reply-below-min", "short-heartbeat-fragmented-reply") else 0
                         if delay and time.monotonic() - broker.delivered < delay:
                             wait, = struct.unpack_from(">i", req, 15 + struct.unpack_from(">h", req, 8)[0])
                             time.sleep(wait / 1000)
@@ -697,8 +703,8 @@ def check(mode):
         elif mode.startswith("short-heartbeat"):
             assert [row["offset"] for row in rows] == [0, 1], rows
             assert time.monotonic() - broker.started < (4 if mode in ("short-heartbeat-1000ms-slow", "short-heartbeat-slow-350ms") else 3), result.stderr
-            if mode in ("short-heartbeat", "short-heartbeat-session", "short-heartbeat-session-slow-leader", "short-heartbeat-lost-reply", "short-heartbeat-lost-reply-tls", "short-heartbeat-lost-reply-below-min", "short-heartbeat-fragmented-reply", "short-heartbeat-slow-metadata", "short-heartbeat-revoke-during-fetch", "short-heartbeat-slow-125ms-revoke"):
-                assert len(broker.beats) >= 4 if mode in ("short-heartbeat-lost-reply", "short-heartbeat-lost-reply-tls", "short-heartbeat-lost-reply-below-min", "short-heartbeat-fragmented-reply") else len(broker.beats) >= 3, broker.beats
+            if mode in ("short-heartbeat", "short-heartbeat-session", "short-heartbeat-session-slow-leader", "short-heartbeat-lost-reply", "short-heartbeat-lost-reply-tls", "short-heartbeat-lost-reply-below-min", "short-heartbeat-lost-reply-after-slow", "short-heartbeat-fragmented-reply", "short-heartbeat-slow-metadata", "short-heartbeat-revoke-during-fetch", "short-heartbeat-slow-125ms-revoke"):
+                assert len(broker.beats) >= 5 if mode == "short-heartbeat-lost-reply-after-slow" else len(broker.beats) >= 4 if mode in ("short-heartbeat-lost-reply", "short-heartbeat-lost-reply-tls", "short-heartbeat-lost-reply-below-min", "short-heartbeat-fragmented-reply") else len(broker.beats) >= 3, broker.beats
             if mode == "short-heartbeat":
                 assert max(b - a for a, b in zip(broker.beats, broker.beats[1:])) < 0.3, broker.beats
             if mode in ("short-heartbeat-session", "short-heartbeat-session-slow-leader", "short-heartbeat-slow-metadata", "short-heartbeat-revoke-during-fetch", "short-heartbeat-slow-offset-fetch"):
@@ -710,7 +716,7 @@ def check(mode):
             if mode == "short-heartbeat-lost-reply-tls":
                 assert not broker.fenced, broker.beats
                 assert max(b - a for a, b in zip(broker.beats, broker.beats[1:])) < 0.30, broker.beats
-            if mode == "short-heartbeat-lost-reply-below-min":
+            if mode in ("short-heartbeat-lost-reply-below-min", "short-heartbeat-lost-reply-after-slow"):
                 assert broker.fenced, broker.beats
             if mode in ("short-heartbeat-slow-107ms", "short-heartbeat-slow-125ms", "short-heartbeat-slow-130ms", "short-heartbeat-slow-350ms"):
                 assert not broker.fenced, broker.beats
@@ -742,4 +748,4 @@ def check(mode):
 
 
 with concurrent.futures.ThreadPoolExecutor() as pool:
-    list(pool.map(check, sys.argv[2:] or ("position-slow-leaders", "position-backlog", "position-latest", "position-timeout", "partition-connection", "partition-connection-legacy", "request-connection", "transport-connection", "assignment", "leader", "healthy", "short-heartbeat", "short-heartbeat-slow-coordinator", "short-heartbeat-slow-107ms", "short-heartbeat-slow-125ms", "short-heartbeat-slow-130ms", "short-heartbeat-slow-350ms", "short-heartbeat-slow-125ms-revoke", "short-heartbeat-slow-leader", "short-heartbeat-session", "short-heartbeat-session-slow-leader", "short-heartbeat-lost-reply", "short-heartbeat-lost-reply-tls", "short-heartbeat-lost-reply-below-min", "short-heartbeat-fragmented-reply", "short-heartbeat-1000ms-slow", "short-heartbeat-fence-during-fetch", "short-heartbeat-fence-commit-backoff", "short-heartbeat-revoke-during-fetch", "short-heartbeat-coord-failover", "short-heartbeat-rediscover-alt-broker", "short-heartbeat-rediscover-silent-broker", "short-heartbeat-slow-metadata", "short-heartbeat-metadata-fallback-socket", "short-heartbeat-slow-offset-fetch", "short-heartbeat-1ms", "short-heartbeat-2ms", "partition-bound", "reset", "reset-fail", "reset-fair", "throttle-idle", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-partition", "follow-coordinator", "no-join", "no-join-heartbeat", "follow-join")))
+    list(pool.map(check, sys.argv[2:] or ("position-slow-leaders", "position-backlog", "position-latest", "position-timeout", "partition-connection", "partition-connection-legacy", "request-connection", "transport-connection", "assignment", "leader", "healthy", "short-heartbeat", "short-heartbeat-slow-coordinator", "short-heartbeat-slow-107ms", "short-heartbeat-slow-125ms", "short-heartbeat-slow-130ms", "short-heartbeat-slow-350ms", "short-heartbeat-slow-125ms-revoke", "short-heartbeat-slow-leader", "short-heartbeat-session", "short-heartbeat-session-slow-leader", "short-heartbeat-lost-reply", "short-heartbeat-lost-reply-tls", "short-heartbeat-lost-reply-below-min", "short-heartbeat-lost-reply-after-slow", "short-heartbeat-fragmented-reply", "short-heartbeat-1000ms-slow", "short-heartbeat-fence-during-fetch", "short-heartbeat-fence-commit-backoff", "short-heartbeat-revoke-during-fetch", "short-heartbeat-coord-failover", "short-heartbeat-rediscover-alt-broker", "short-heartbeat-rediscover-silent-broker", "short-heartbeat-slow-metadata", "short-heartbeat-metadata-fallback-socket", "short-heartbeat-slow-offset-fetch", "short-heartbeat-1ms", "short-heartbeat-2ms", "partition-bound", "reset", "reset-fail", "reset-fair", "throttle-idle", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-partition", "follow-coordinator", "no-join", "no-join-heartbeat", "follow-join")))
