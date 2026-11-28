@@ -458,7 +458,10 @@ pub const Client = struct {
         const prev_cancel = conn.net_reader.cancellation;
         if (active_hook) |hook| conn.net_reader.wait_hook = hook;
         if (active_hook != null or c.group_deadline != null) {
-            conn.setReadDeadline(c.group_deadline orelse std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(@intCast(timeout))));
+            const new_dl = c.group_deadline orelse std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(@intCast(timeout)));
+            const dl = if (prev_cancel) |pc| (if (pc.deadline.nanoseconds < new_dl.nanoseconds) pc.deadline else new_dl) else new_dl;
+            const stop = if (prev_cancel) |pc| pc.stop else null;
+            conn.setReadCancellation(stop, dl);
         }
         defer {
             conn.net_reader.wait_hook = prev_hook;
