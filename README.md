@@ -459,6 +459,13 @@ that idle window unless `--follow` is used. `-v` logs joins, assignments, and
 commits. Heartbeats run between fetches; no background process is started.
 The stdout reader must drain within the broker's group session timeout (45s
 by default). A slower reader can cause fencing and replay of uncommitted records.
+Heartbeats are strictly single-flight per KIP-848 and run non-blockingly so a
+slow heartbeat reply does not stall Fetch. To survive a lost heartbeat reply
+without fencing (including over TLS), configure the broker's session timeout to
+at least two heartbeat intervals plus a reconnect round trip (Kafka's own
+defaults are a 45s session timeout and 5s heartbeat interval; sessions shorter
+than `~2 * heartbeat_interval + reconnect_rtt` will fence on a lost reply and
+rejoin).
 Network lookups and retries yield to the next heartbeat; unfinished assignments
 resume after it. With `--follow`, coordinator and broker outages are retried with
 backoff indefinitely, with a periodic stderr warning. kite rejoins if the broker

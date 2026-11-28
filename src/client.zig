@@ -850,6 +850,84 @@ pub const Client = struct {
         }
     }
 
+    pub const InFlightHeartbeat = struct {
+        node: i32,
+        corr: i32,
+        sent: std.Io.Timestamp,
+        deadline: std.Io.Timestamp,
+        acc: transport.FrameAccumulator = .{},
+
+        pub fn deinit(self: *InFlightHeartbeat, alloc: std.mem.Allocator) void {
+            self.acc.deinit(alloc);
+        }
+    };
+
+    pub fn inFlightHeartbeatFd(c: *Client, inflight: *const InFlightHeartbeat) ?std.posix.socket_t {
+        const conn = c.conns.get(connKey(inflight.node, 0xFFFF_FFFD)) orelse return null;
+        if (conn.closed) return null;
+        return conn.stream.socket.handle;
+    }
+
+    pub fn inFlightHeartbeatHasBuffered(c: *Client, inflight: *const InFlightHeartbeat) bool {
+        const conn = c.conns.get(connKey(inflight.node, 0xFFFF_FFFD)) orelse return false;
+        return transport.hasBuffered(conn);
+    }
+
+    pub fn abortInFlightHeartbeat(c: *Client, inflight: *InFlightHeartbeat) void {
+        inflight.deinit(c.alloc);
+        c.invalidateCoordinatorEndpoint(inflight.node, 0xFFFF_FFFD);
+    }
+
+    pub fn startHeartbeat(c: *Client, alloc: std.mem.Allocator, req: protocol.Heartbeat, sent: std.Io.Timestamp, deadline: std.Io.Timestamp) !InFlightHeartbeat {
+        try c.requireVersion(protocol.api_key.consumer_group_heartbeat, protocol.version.consumer_group_heartbeat, "ConsumerGroupHeartbeat");
+        const prev_deadline = c.group_deadline;
+        c.group_deadline = deadline;
+        defer c.group_deadline = prev_deadline;
+        const node = try c.findCoordinator(req.group);
+        const conn = c.connFor(node, connKey(node, 0xFFFF_FFFD)) catch |err| {
+            c.invalidateCoordinatorEndpoint(node, 0xFFFF_FFFD);
+            return err;
+        };
+        const timeout = try c.requestTimeoutMs(0);
+        transport.setTimeout(conn, timeout);
+        var e = Encoder.init(alloc);
+        defer e.deinit();
+        try protocol.encodeRequest(&e, protocol.api_key.consumer_group_heartbeat, protocol.version.consumer_group_heartbeat, true, "kite", req, protocol.heartbeatRequest);
+        const corr = protocol.lastCorrelationId();
+        transport.send(conn, e.written()) catch |err| {
+            c.invalidateCoordinatorEndpoint(node, 0xFFFF_FFFD);
+            return err;
+        };
+        return .{ .node = node, .corr = corr, .sent = sent, .deadline = deadline };
+    }
+
+    pub fn pollHeartbeat(c: *Client, alloc: std.mem.Allocator, inflight: *InFlightHeartbeat) !?protocol.HeartbeatResult {
+        const conn = c.conns.get(connKey(inflight.node, 0xFFFF_FFFD)) orelse {
+            inflight.deinit(c.alloc);
+            return error.IoFailed;
+        };
+        const maybe_resp = inflight.acc.step(conn, c.alloc, inflight.corr, true) catch |err| {
+            inflight.deinit(c.alloc);
+            c.invalidateCoordinatorEndpoint(inflight.node, 0xFFFF_FFFD);
+            return err;
+        };
+        if (maybe_resp) |resp| {
+            defer c.alloc.free(resp.frame);
+            var d = Decoder.init(resp.body);
+            const result = try protocol.heartbeatResponse(&d, alloc);
+            if (isCoordinatorError(result.code)) {
+                c.invalidateCoordinatorEndpoint(inflight.node, 0xFFFF_FFFD);
+            }
+            return result;
+        }
+        if (std.Io.Timestamp.now(c.io, .awake).nanoseconds >= inflight.deadline.nanoseconds) {
+            inflight.deinit(c.alloc);
+            c.invalidateCoordinatorEndpoint(inflight.node, 0xFFFF_FFFD);
+            return error.GroupDeadlineExceeded;
+        }
+        return null;
+    }
+
     pub fn heartbeat(c: *Client, alloc: std.mem.Allocator, req: protocol.Heartbeat) !protocol.HeartbeatResult {
         var retry: Retry = .{};
         var request = req;
@@ -2319,25 +2397,39 @@ pub const Client = struct {
         const end = std.Io.Timestamp.now(c.io, .awake).addDuration(.fromMilliseconds(@intCast(ms)));
         while (true) {
             const now = std.Io.Timestamp.now(c.io, .awake);
-            const left = now.durationTo(end).toMilliseconds();
-            if (left <= 0) return false;
-            var step: u64 = @intCast(left);
-            var hook_due = false;
+            var watched_fd: ?std.posix.socket_t = null;
+            var due_ns: ?i96 = null;
             if (c.wait_hook) |hook| {
+                if (hook.watch_fd) |wf| watched_fd = wf(hook.ctx);
                 if (hook.next_due(hook.ctx)) |due| {
-                    const until = now.durationTo(due).toMilliseconds();
-                    if (until <= 0) {
+                    const until_ns = now.durationTo(due).nanoseconds;
+                    if (until_ns <= 0) {
                         if (hook.tick(hook.ctx)) return true;
                         continue;
                     }
-                    if (@as(u64, @intCast(until)) <= step) {
-                        step = @intCast(until);
-                        hook_due = true;
-                    }
+                    due_ns = until_ns;
                 }
             }
-            std.Io.sleep(c.io, .fromMilliseconds(@intCast(step)), .awake) catch {};
-            if (hook_due) if (c.wait_hook) |hook| if (hook.tick(hook.ctx)) return true;
+            const left_ns = now.durationTo(end).nanoseconds;
+            if (left_ns <= 0 and watched_fd == null) return false;
+            var step: u64 = if (left_ns > 0) @intCast(@divTrunc(left_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms)) else std.math.maxInt(u64);
+            var hook_due = false;
+            if (due_ns) |until_ns| {
+                const until: u64 = @intCast(@divTrunc(until_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+                if (until <= step) {
+                    step = until;
+                    hook_due = true;
+                }
+            }
+            if (step == std.math.maxInt(u64)) return false;
+            if (watched_fd) |wfd| {
+                var fds = [_]std.posix.pollfd{.{ .fd = wfd, .events = std.posix.POLL.IN, .revents = 0 }};
+                const rc = std.posix.poll(&fds, @intCast(@min(step, std.math.maxInt(i32)))) catch 0;
+                if (rc > 0 or hook_due) if (c.wait_hook) |hook| if (hook.tick(hook.ctx)) return true;
+            } else {
+                std.Io.sleep(c.io, .fromMilliseconds(@intCast(step)), .awake) catch {};
+                if (hook_due) if (c.wait_hook) |hook| if (hook.tick(hook.ctx)) return true;
+            }
         }
     }
 

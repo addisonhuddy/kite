@@ -34,6 +34,7 @@ pub const WaitHook = struct {
     io: std.Io,
     next_due: *const fn (*anyopaque) ?std.Io.Timestamp,
     tick: *const fn (*anyopaque) bool,
+    watch_fd: ?*const fn (*anyopaque) ?std.posix.socket_t = null,
 };
 
 const SocketReader = struct {
@@ -46,6 +47,8 @@ const SocketReader = struct {
         io: std.Io,
     } = null,
     wait_hook: ?WaitHook = null,
+    poll_nonblock: bool = false,
+    poll_would_block: bool = false,
 
     fn readVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
         const self: *SocketReader = @alignCast(@fieldParentPtr("interface", r));
@@ -53,6 +56,35 @@ const SocketReader = struct {
         const nbufs, const data_size = try r.writableVector(&buffers, data);
         std.debug.assert(nbufs != 0 and buffers[0].len != 0);
         while (true) {
+            if (self.poll_nonblock) {
+                var fds = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+                const rc = std.posix.poll(&fds, 0) catch {
+                    self.err = error.IoFailed;
+                    return error.ReadFailed;
+                };
+                if (rc == 0) {
+                    self.poll_would_block = true;
+                    return error.ReadFailed;
+                }
+                const n = std.posix.system.read(self.fd, buffers[0].ptr, buffers[0].len);
+                switch (std.posix.errno(n)) {
+                    .SUCCESS => {
+                        if (n == 0) return error.EndOfStream;
+                        const size: usize = @intCast(n);
+                        if (size > data_size) r.end += size - data_size;
+                        return @min(size, data_size);
+                    },
+                    .INTR => continue,
+                    .AGAIN, .TIMEDOUT => {
+                        self.poll_would_block = true;
+                        return error.ReadFailed;
+                    },
+                    else => {
+                        self.err = error.IoFailed;
+                        return error.ReadFailed;
+                    },
+                }
+            }
             var poll_limit: ?u64 = null;
             var hook_due = false;
             var ready = false;
@@ -73,7 +105,9 @@ const SocketReader = struct {
                 }
             }
             if (!ready) {
+                var watched_fd: ?std.posix.socket_t = null;
                 if (self.wait_hook) |hook| {
+                    if (hook.watch_fd) |wf| watched_fd = wf(hook.ctx);
                     if (hook.next_due(hook.ctx)) |due| {
                         const until = std.Io.Timestamp.now(hook.io, .awake).durationTo(due).toMilliseconds();
                         if (until <= 0) {
@@ -85,7 +119,28 @@ const SocketReader = struct {
                         }
                     }
                 }
-                if (poll_limit) |ms| {
+                if (watched_fd) |wfd| {
+                    const timeout_ms: i32 = if (poll_limit) |ms| @intCast(@min(ms, std.math.maxInt(i32))) else -1;
+                    var fds = [_]std.posix.pollfd{
+                        .{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 },
+                        .{ .fd = wfd, .events = std.posix.POLL.IN, .revents = 0 },
+                    };
+                    const rc = std.posix.poll(&fds, timeout_ms) catch return error.ReadFailed;
+                    if (rc == 0) {
+                        if (hook_due and self.wait_hook.?.tick(self.wait_hook.?.ctx)) {
+                            self.err = error.WaitHookAborted;
+                            return error.ReadFailed;
+                        }
+                        continue;
+                    }
+                    if (fds[1].revents != 0) {
+                        if (self.wait_hook.?.tick(self.wait_hook.?.ctx)) {
+                            self.err = error.WaitHookAborted;
+                            return error.ReadFailed;
+                        }
+                        if (fds[0].revents == 0) continue;
+                    }
+                } else if (poll_limit) |ms| {
                     var fds = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
                     if ((std.posix.poll(&fds, @intCast(@min(ms, std.math.maxInt(i32)))) catch return error.ReadFailed) == 0) {
                         if (hook_due and self.wait_hook.?.tick(self.wait_hook.?.ctx)) {
@@ -566,3 +621,96 @@ pub fn recv(c: *Conn, alloc: std.mem.Allocator, expect_corr: i32, header_tags: b
     if (header_tags) d.tagBuffer() catch return error.MalformedResponse;
     return .{ .frame = frame, .body = frame[d.pos..] };
 }
+
+pub fn hasBuffered(c: *const Conn) bool {
+    if (c.closed) return false;
+    if (c.tls_client) |tls| {
+        if (tls.reader.seek < tls.reader.end) return true;
+    }
+    return c.net_reader.interface.seek < c.net_reader.interface.end;
+}
+
+pub const FrameAccumulator = struct {
+    len_buf: [4]u8 = undefined,
+    len_read: usize = 0,
+    frame: ?[]u8 = null,
+    frame_read: usize = 0,
+
+    pub fn deinit(self: *FrameAccumulator, alloc: std.mem.Allocator) void {
+        if (self.frame) |f| alloc.free(f);
+        self.* = .{};
+    }
+
+    fn readChunk(c: *Conn, dst: []u8) TransportError!?usize {
+        const buffered = c.input.bufferedLen();
+        if (buffered > 0) {
+            const take = @min(dst.len, buffered);
+            const n = c.input.readSliceShort(dst[0..take]) catch return error.IoFailed;
+            return n;
+        }
+        const n = c.input.readSliceShort(dst) catch |err| {
+            if (c.net_reader.poll_would_block) return null;
+            c.close();
+            return if (err == error.ReadFailed) c.ioError() else error.IoFailed;
+        };
+        if (n == 0) {
+            if (c.net_reader.poll_would_block) return null;
+            c.close();
+            return error.IoFailed;
+        }
+        return n;
+    }
+
+    pub fn step(self: *FrameAccumulator, c: *Conn, alloc: std.mem.Allocator, expect_corr: i32, header_tags: bool) TransportError!?Response {
+        if (c.closed) return error.IoFailed;
+        const prev_nonblock = c.net_reader.poll_nonblock;
+        c.net_reader.poll_nonblock = true;
+        c.net_reader.poll_would_block = false;
+        defer {
+            c.net_reader.poll_nonblock = prev_nonblock;
+            c.net_reader.poll_would_block = false;
+        }
+        while (self.len_read < 4) {
+            const n = (try readChunk(c, self.len_buf[self.len_read..])) orelse return null;
+            self.len_read += n;
+        }
+        if (self.frame == null) {
+            const len = std.mem.readInt(u32, &self.len_buf, .big);
+            if (len < 4) {
+                c.close();
+                return error.MalformedResponse;
+            }
+            if (len > max_response_len) {
+                c.close();
+                return error.ResponseTooLarge;
+            }
+            const buf = alloc.alloc(u8, len) catch return error.OutOfMemory;
+            self.frame = buf;
+            self.frame_read = 0;
+        }
+        const buf = self.frame.?;
+        while (self.frame_read < buf.len) {
+            const n = (try readChunk(c, buf[self.frame_read..])) orelse return null;
+            self.frame_read += n;
+        }
+        const frame = buf;
+        self.frame = null;
+        self.len_read = 0;
+        self.frame_read = 0;
+        errdefer alloc.free(frame);
+        var d = protocol.Decoder.init(frame);
+        const corr = d.i32v() catch {
+            c.close();
+            return error.MalformedResponse;
+        };
+        if (corr != expect_corr) {
+            c.close();
+            return error.CorrelationMismatch;
+        }
+        if (header_tags) d.tagBuffer() catch {
+            c.close();
+            return error.MalformedResponse;
+        };
+        return .{ .frame = frame, .body = frame[d.pos..] };
+    }
+};
