@@ -68,9 +68,6 @@ class Broker(socketserver.ThreadingTCPServer):
         self.meta_dropped = False
         self.fallback_meta_conn = None
         self.slow_offset_fetch_done = False
-        self.hb_in_flight = False
-        self.revoked_acked = False
-        self.revoked_part_fetches = 0
         self.started = time.monotonic()
         self.reset_started = None
         self.reset_fetches = []
@@ -249,7 +246,7 @@ class Handler(socketserver.StreamRequestHandler):
                     return
                 split = broker.mode in ("healthy", "partition-bound", "follow-partition", "reset-fair")
                 connection_test = broker.mode.endswith("-connection")
-                paired = split or connection_test or broker.mode in ("short-heartbeat-hedge-revocation", "short-heartbeat-reconcile-timeout-revocation")
+                paired = split or connection_test
                 if api == 3 and split and broker.fetch_old_fault and not (broker.mode == "follow-partition" and time.monotonic() - broker.started >= 50):
                     return
                 if api == 1 and (broker.mode == "leader" or split):
@@ -271,8 +268,6 @@ class Handler(socketserver.StreamRequestHandler):
                 if api == 18:
                     if broker.mode == "position-slow-leaders":
                         time.sleep(0.2)
-                    if broker.mode == "short-heartbeat-slow-107ms" and broker.hb_in_flight:
-                        time.sleep(0.30)
                     tags = b""
                     versions = ((0, 11), (1, 12), (2, 8), (3, 12), (8, 9), (9, 9), (10, 6), (68, 1))
                     response = b"\x00\x00" + bytes([len(versions) + 1]) + b"".join(pack("hhh", k, v, v) + b"\x00" for k, v in versions) + b"\x00" * 5
@@ -356,27 +351,21 @@ class Handler(socketserver.StreamRequestHandler):
                         payload = pack("i", corr) + tags + response
                         self.wfile.write(pack("I", len(payload)) + payload)
                         continue
-                    session_limit = 0.11 if broker.mode == "short-heartbeat-lost-reply-110ms" else 0.25 if broker.mode in ("short-heartbeat-slow-107ms", "short-heartbeat-partial-backup") else 0.15
+                    session_limit = 0.25 if broker.mode == "short-heartbeat-slow-107ms" else 0.15
                     beat_idx = len(broker.beats)
-                    if broker.mode in ("short-heartbeat-session", "short-heartbeat-session-slow-leader", "short-heartbeat-lost-reply", "short-heartbeat-lost-reply-110ms", "short-heartbeat-slow-metadata", "short-heartbeat-revoke-during-fetch", "short-heartbeat-slow-107ms", "short-heartbeat-slow-offset-fetch", "short-heartbeat-partial-primary", "short-heartbeat-partial-backup") and epoch > 0:
+                    if broker.mode in ("short-heartbeat-session", "short-heartbeat-session-slow-leader", "short-heartbeat-lost-reply", "short-heartbeat-slow-metadata", "short-heartbeat-revoke-during-fetch", "short-heartbeat-slow-107ms", "short-heartbeat-slow-offset-fetch") and epoch > 0:
                         if beat_idx >= 2 and broker.beats[-1] - broker.beats[-2] > session_limit:
                             broker.fenced = True
                             response = pack("ih", 0, 25) + b"\x00\x00" + pack("ii", 0, 100) + b"\xff\x00"
                             payload = pack("i", corr) + tags + response
                             self.wfile.write(pack("I", len(payload)) + payload)
                             continue
-                        if broker.mode in ("short-heartbeat-lost-reply", "short-heartbeat-lost-reply-110ms") and beat_idx == 3:
+                        if broker.mode == "short-heartbeat-lost-reply" and beat_idx == 3:
                             continue
                         if broker.mode in ("short-heartbeat-session", "short-heartbeat-session-slow-leader"):
                             time.sleep(0.06)
                     if broker.mode == "short-heartbeat-slow-107ms" and epoch > 0:
-                        broker.hb_in_flight = True
-                        try:
-                            time.sleep(0.107)
-                        finally:
-                            broker.hb_in_flight = False
-                    if broker.mode == "short-heartbeat-partial-backup" and epoch > 0 and beat_idx == 3:
-                        time.sleep(0.16)
+                        time.sleep(0.107)
                     if broker.mode == "short-heartbeat-slow-coordinator" and epoch > 0:
                         time.sleep(0.09)
                     if broker.mode == "short-heartbeat-1000ms-slow" and epoch > 0:
@@ -392,92 +381,8 @@ class Handler(socketserver.StreamRequestHandler):
                             broker.generation = 3
                     if paired:
                         assignment = b"\x01\x02" + b"\x00" * 16 + b"\x03" + pack("ii", 0, 1) + b"\x00\x00\x00"
-                    if broker.mode in ("short-heartbeat-hedge-revocation", "short-heartbeat-reconcile-timeout-revocation") and epoch > 0:
-                        # Parse TopicPartitions from ConsumerGroupHeartbeatRequest v1
-                        p = pos + 4
-                        p += 1 if req[p] == 0 else req[p]  # instance_id
-                        p += 1 if req[p] == 0 else req[p]  # rack_id
-                        p += 4  # rebalance_timeout_ms
-                        tcnt = req[p]
-                        p += 1
-                        if tcnt > 1:
-                            for _ in range(tcnt - 1):
-                                _, p = string(req, p)
-                        p += 1 if req[p] == 0 else req[p]  # subscribed_topic_regex
-                        p += 1 if req[p] == 0 else req[p]  # server_assignor
-                        tp_cnt = req[p]
-                        p += 1
-                        owned = None
-                        if tp_cnt > 0:
-                            owned = []
-                            for _ in range(tp_cnt - 1):
-                                p += 16  # topic_id
-                                pcnt = req[p] - 1
-                                p += 1
-                                for _ in range(pcnt):
-                                    owned.append(struct.unpack_from(">i", req, p)[0])
-                                    p += 4
-                                p += 1  # tags
-                        if broker.mode == "short-heartbeat-reconcile-timeout-revocation":
-                            if beat_idx == 3:
-                                # Primary minimal wins overlapped race with NO assignment
-                                time.sleep(0.095)
-                                assignment = b"\xff\x00"
-                            elif beat_idx == 4:
-                                # Losing hedge triggers same-epoch revocation [0]
-                                broker.revoked = True
-                                time.sleep(0.05)
-                                assignment = b"\x01\x02" + b"\x00" * 16 + b"\x02" + pack("i", 0) + b"\x00\x00\x00"
-                            elif beat_idx == 5:
-                                # Reconciliation reply lost (times out)
-                                continue
-                            elif broker.revoked:
-                                if owned is not None and 1 in owned:
-                                    assignment = b"\x01\x02" + b"\x00" * 16 + b"\x02" + pack("i", 0) + b"\x00\x00\x00"
-                                else:
-                                    if owned == [0]:
-                                        broker.revoked_acked = True
-                                    assignment = b"\xff\x00"
-                        elif beat_idx == 3:
-                            # Primary minimal heartbeat: slow, returns no assignment
-                            time.sleep(0.10)
-                            assignment = b"\xff\x00"
-                        elif beat_idx == 4:
-                            # Hedged full heartbeat: triggers same-epoch revocation, arrives after primary
-                            broker.revoked = True
-                            time.sleep(0.04)
-                            assignment = b"\x01\x02" + b"\x00" * 16 + b"\x02" + pack("i", 0) + b"\x00\x00\x00"
-                        elif broker.revoked:
-                            if owned is not None and 1 in owned:
-                                # Reconciling full heartbeat still reports partition 1 -> repeat revocation
-                                assignment = b"\x01\x02" + b"\x00" * 16 + b"\x02" + pack("i", 0) + b"\x00\x00\x00"
-                            else:
-                                if owned == [0]:
-                                    broker.revoked_acked = True
-                                assignment = b"\xff\x00"
-                    if broker.mode == "short-heartbeat-stale-minimal-fence" and epoch > 0:
-                        if beat_idx == 3:
-                            # Stale minimal primary returns FENCED_MEMBER_EPOCH before full hedge replies
-                            time.sleep(0.095)
-                            response = pack("ih", 0, 110) + b"\x00\x00" + pack("ii", 0, 100) + b"\xff\x00"
-                            payload = pack("i", corr) + tags + response
-                            self.wfile.write(pack("I", len(payload)) + payload)
-                            continue
-                        if beat_idx == 4:
-                            # Full hedge succeeds and advances member epoch to 2
-                            broker.generation = 2
-                            time.sleep(0.04)
                     interval = 1 if broker.mode == "short-heartbeat-1ms" else 2 if broker.mode == "short-heartbeat-2ms" else 1000 if broker.mode == "short-heartbeat-1000ms-slow" else 100 if broker.mode.startswith("short-heartbeat") else 1000
                     response = b"\x00" * 7 + text(member) + pack("ii", broker.generation, interval) + assignment
-                    if (broker.mode == "short-heartbeat-partial-primary" and beat_idx == 3) or (broker.mode == "short-heartbeat-partial-backup" and beat_idx == 4):
-                        payload = pack("i", corr) + tags + response
-                        wire = pack("I", len(payload)) + payload
-                        self.wfile.write(wire[:4])
-                        self.wfile.flush()
-                        time.sleep(0.45)
-                        self.wfile.write(wire[4:])
-                        self.wfile.flush()
-                        continue
                 elif api == 9:
                     if broker.mode == "short-heartbeat-slow-offset-fetch" and not broker.slow_offset_fetch_done:
                         broker.slow_offset_fetch_done = True
@@ -491,7 +396,7 @@ class Handler(socketserver.StreamRequestHandler):
                     if broker.mode == "reset-fail" and broker.reset_started:
                         code = 6
                     response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ihqqi", self.server.node - 1 if split else 0, code, 0, 0, 0) + b"\x00\x00\x00"
-                    if connection_test or broker.mode in ("short-heartbeat-hedge-revocation", "short-heartbeat-reconcile-timeout-revocation"):
+                    if connection_test:
                         pos = 11 + struct.unpack_from(">h", req, 8)[0]
                         _, pos = string(req, pos + 6)
                         count = req[pos] - 1
@@ -526,56 +431,30 @@ class Handler(socketserver.StreamRequestHandler):
                         time.sleep(0.09)
                     if broker.mode == "short-heartbeat-1000ms-slow":
                         time.sleep(0.30)
-                    if broker.mode in ("short-heartbeat-hedge-revocation", "short-heartbeat-reconcile-timeout-revocation"):
-                        pos = 11 + struct.unpack_from(">h", req, 8)[0]
-                        _, pos = string(req, pos + 26)
-                        count = req[pos] - 1
-                        pos += 1
-                        parts = b""
-                        for _ in range(count):
-                            p, _, offset = struct.unpack_from(">iiq", req, pos)
-                            pos += 33
-                            if p == 1 and broker.revoked:
-                                broker.revoked_part_fetches += 1
-                            if p == 0:
-                                if offset == 0:
-                                    rec = batch(0)
-                                elif broker.revoked_acked:
-                                    rec = batch(1)
-                                else:
-                                    time.sleep(0.05)
-                                    rec = b""
-                            else:
-                                rec = batch(offset) if offset == 0 or broker.revoked else b""
-                            end = max(1, offset + 1) if rec else max(1, offset)
-                            parts += pack("ihqqq", p, 0, end, end, -1) + b"\x00" + pack("i", -1) + text(rec) + b"\x00"
-                        broker.delivered = broker.delivered or time.monotonic()
-                        response = b"\x00" * 10 + b"\x02" + text(b"example") + bytes([count + 1]) + parts + b"\x00\x00"
-                    elif broker.mode.startswith("short-heartbeat") and broker.delivered:
-                        delay = 0.25 if broker.mode in ("short-heartbeat", "short-heartbeat-session", "short-heartbeat-session-slow-leader", "short-heartbeat-lost-reply", "short-heartbeat-lost-reply-110ms", "short-heartbeat-partial-primary", "short-heartbeat-partial-backup", "short-heartbeat-stale-minimal-fence") else 0
+                    if broker.mode.startswith("short-heartbeat") and broker.delivered:
+                        delay = 0.25 if broker.mode in ("short-heartbeat", "short-heartbeat-session", "short-heartbeat-session-slow-leader", "short-heartbeat-lost-reply") else 0
                         if delay and time.monotonic() - broker.delivered < delay:
                             wait, = struct.unpack_from(">i", req, 15 + struct.unpack_from(">h", req, 8)[0])
                             time.sleep(wait / 1000)
                             records = b""
                         else:
                             records = batch(1)
-                    if broker.mode not in ("short-heartbeat-hedge-revocation", "short-heartbeat-reconcile-timeout-revocation"):
-                        if broker.delivered and broker.mode in ("commit-bound", "follow-commit"):
-                            records = b""
-                        if broker.mode == "follow-commit":
-                            pos = 11 + struct.unpack_from(">h", req, 8)[0]
-                            _, pos = string(req, pos + 26)
-                            offset, = struct.unpack_from(">q", req, pos + 9)
-                            records = batch(offset)
-                        if broker.mode == "short-heartbeat-fence-during-fetch" and len(broker.fetches) == 1:
-                            pass
-                        elif broker.mode in ("short-heartbeat-slow-metadata", "short-heartbeat-rediscover-alt-broker", "short-heartbeat-rediscover-silent-broker", "short-heartbeat-metadata-fallback-socket") and fetch_code == 6:
-                            pass
-                        else:
-                            broker.delivered = broker.delivered or time.monotonic()
-                        end = max(1, struct.unpack_from(">q", records)[0] + 1) if records else 1
-                        part = pack("ihqqq", self.server.node - 1 if split else 0, fetch_code, end, end, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
-                        response = b"\x00" * 10 + b"\x02" + text(b"example") + b"\x02" + part + b"\x00\x00"
+                    if broker.delivered and broker.mode in ("commit-bound", "follow-commit"):
+                        records = b""
+                    if broker.mode == "follow-commit":
+                        pos = 11 + struct.unpack_from(">h", req, 8)[0]
+                        _, pos = string(req, pos + 26)
+                        offset, = struct.unpack_from(">q", req, pos + 9)
+                        records = batch(offset)
+                    if broker.mode == "short-heartbeat-fence-during-fetch" and len(broker.fetches) == 1:
+                        pass
+                    elif broker.mode in ("short-heartbeat-slow-metadata", "short-heartbeat-rediscover-alt-broker", "short-heartbeat-rediscover-silent-broker", "short-heartbeat-metadata-fallback-socket") and fetch_code == 6:
+                        pass
+                    else:
+                        broker.delivered = broker.delivered or time.monotonic()
+                    end = max(1, struct.unpack_from(">q", records)[0] + 1) if records else 1
+                    part = pack("ihqqq", self.server.node - 1 if split else 0, fetch_code, end, end, -1) + b"\x00" + pack("i", -1) + text(records) + b"\x00"
+                    response = b"\x00" * 10 + b"\x02" + text(b"example") + b"\x02" + part + b"\x00\x00"
                     if connection_test:
                         parts = b""
                         for p in (0, 1):
@@ -602,11 +481,7 @@ class Handler(socketserver.StreamRequestHandler):
                         code = 16
                     if code == 0:
                         broker.commit_recovered = broker.commit_recovered or time.monotonic()
-                    if broker.mode in ("short-heartbeat-hedge-revocation", "short-heartbeat-reconcile-timeout-revocation"):
-                        parts = b"".join(pack("ih", p, code) + b"\x00" for p in (0, 1))
-                        response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x03" + parts + b"\x00\x00"
-                    else:
-                        response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ih", 1 if split else 0, code) + b"\x00\x00\x00"
+                    response = b"\x00" * 4 + b"\x02" + text(b"example") + b"\x02" + pack("ih", 1 if split else 0, code) + b"\x00\x00\x00"
                 else:
                     raise AssertionError(api)
                 payload = pack("i", corr) + tags + response
@@ -638,8 +513,6 @@ def check(mode):
             flags = ["--idle", "20s", "-n", "3"]
         elif mode == "healthy":
             flags = ["--idle", "20s", "-n", "2"]
-        elif mode in ("short-heartbeat-hedge-revocation", "short-heartbeat-reconcile-timeout-revocation"):
-            flags = ["--idle", "5s", "-n", "3"]
         elif mode.startswith("short-heartbeat"):
             flags = ["--idle", "5s", "-n", "2"]
         elif mode.startswith("follow"):
@@ -763,27 +636,17 @@ def check(mode):
             assert broker.fetch_old_fault and broker.fetch_nodes.count(2) == 2, broker.fetch_nodes
             assert len(rows) == 2 and all(row["partition"] == 1 for row in rows), rows
         elif mode.startswith("short-heartbeat"):
-            if mode in ("short-heartbeat-hedge-revocation", "short-heartbeat-reconcile-timeout-revocation"):
-                assert sorted((r["partition"], r["offset"]) for r in rows) == [(0, 0), (0, 1), (1, 0)], rows
-                assert broker.revoked and broker.revoked_acked and broker.revoked_part_fetches == 0, (broker.revoked, broker.revoked_acked, broker.revoked_part_fetches)
-                assert time.monotonic() - broker.started < 4, result.stderr
-            else:
-                assert [row["offset"] for row in rows] == [0, 1], rows
-                assert time.monotonic() - broker.started < (4 if mode == "short-heartbeat-1000ms-slow" else 3), result.stderr
-            if mode == "short-heartbeat-stale-minimal-fence":
-                assert broker.epochs.count(0) == 1 and 2 in broker.epochs, broker.epochs
-            if mode in ("short-heartbeat", "short-heartbeat-session", "short-heartbeat-session-slow-leader", "short-heartbeat-lost-reply", "short-heartbeat-lost-reply-110ms", "short-heartbeat-slow-metadata", "short-heartbeat-revoke-during-fetch"):
-                assert len(broker.beats) >= 4 if mode in ("short-heartbeat-lost-reply", "short-heartbeat-lost-reply-110ms") else len(broker.beats) >= 3, broker.beats
+            assert [row["offset"] for row in rows] == [0, 1], rows
+            assert time.monotonic() - broker.started < (4 if mode == "short-heartbeat-1000ms-slow" else 3), result.stderr
+            if mode in ("short-heartbeat", "short-heartbeat-session", "short-heartbeat-session-slow-leader", "short-heartbeat-lost-reply", "short-heartbeat-slow-metadata", "short-heartbeat-revoke-during-fetch"):
+                assert len(broker.beats) >= 4 if mode == "short-heartbeat-lost-reply" else len(broker.beats) >= 3, broker.beats
             if mode == "short-heartbeat":
                 assert max(b - a for a, b in zip(broker.beats, broker.beats[1:])) < 0.3, broker.beats
-            if mode in ("short-heartbeat-session", "short-heartbeat-session-slow-leader", "short-heartbeat-lost-reply", "short-heartbeat-slow-metadata", "short-heartbeat-revoke-during-fetch", "short-heartbeat-slow-offset-fetch", "short-heartbeat-partial-primary"):
+            if mode in ("short-heartbeat-session", "short-heartbeat-session-slow-leader", "short-heartbeat-slow-metadata", "short-heartbeat-revoke-during-fetch", "short-heartbeat-slow-offset-fetch"):
                 assert not broker.fenced, broker.beats
                 assert max(b - a for a, b in zip(broker.beats, broker.beats[1:])) < 0.15, broker.beats
-            if mode in ("short-heartbeat-slow-107ms", "short-heartbeat-partial-backup"):
+            if mode == "short-heartbeat-slow-107ms":
                 assert not broker.fenced, broker.beats
-            if mode == "short-heartbeat-lost-reply-110ms":
-                assert not broker.fenced, broker.beats
-                assert max(b - a for a, b in zip(broker.beats, broker.beats[1:])) < 0.11, broker.beats
             if mode == "short-heartbeat-fence-during-fetch":
                 assert broker.fenced and 1 not in broker.commit_epochs, broker.commit_epochs
             if mode == "short-heartbeat-fence-commit-backoff":
@@ -811,4 +674,4 @@ def check(mode):
 
 
 with concurrent.futures.ThreadPoolExecutor() as pool:
-    list(pool.map(check, sys.argv[2:] or ("position-slow-leaders", "position-backlog", "position-latest", "position-timeout", "partition-connection", "partition-connection-legacy", "request-connection", "transport-connection", "assignment", "leader", "healthy", "short-heartbeat", "short-heartbeat-slow-coordinator", "short-heartbeat-slow-107ms", "short-heartbeat-partial-primary", "short-heartbeat-partial-backup", "short-heartbeat-hedge-revocation", "short-heartbeat-reconcile-timeout-revocation", "short-heartbeat-stale-minimal-fence", "short-heartbeat-slow-leader", "short-heartbeat-session", "short-heartbeat-session-slow-leader", "short-heartbeat-lost-reply", "short-heartbeat-lost-reply-110ms", "short-heartbeat-1000ms-slow", "short-heartbeat-fence-during-fetch", "short-heartbeat-fence-commit-backoff", "short-heartbeat-revoke-during-fetch", "short-heartbeat-coord-failover", "short-heartbeat-rediscover-alt-broker", "short-heartbeat-rediscover-silent-broker", "short-heartbeat-slow-metadata", "short-heartbeat-metadata-fallback-socket", "short-heartbeat-slow-offset-fetch", "short-heartbeat-1ms", "short-heartbeat-2ms", "partition-bound", "reset", "reset-fail", "reset-fair", "throttle-idle", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-partition", "follow-coordinator", "no-join", "no-join-heartbeat", "follow-join")))
+    list(pool.map(check, sys.argv[2:] or ("position-slow-leaders", "position-backlog", "position-latest", "position-timeout", "partition-connection", "partition-connection-legacy", "request-connection", "transport-connection", "assignment", "leader", "healthy", "short-heartbeat", "short-heartbeat-slow-coordinator", "short-heartbeat-slow-107ms", "short-heartbeat-slow-leader", "short-heartbeat-session", "short-heartbeat-session-slow-leader", "short-heartbeat-lost-reply", "short-heartbeat-1000ms-slow", "short-heartbeat-fence-during-fetch", "short-heartbeat-fence-commit-backoff", "short-heartbeat-revoke-during-fetch", "short-heartbeat-coord-failover", "short-heartbeat-rediscover-alt-broker", "short-heartbeat-rediscover-silent-broker", "short-heartbeat-slow-metadata", "short-heartbeat-metadata-fallback-socket", "short-heartbeat-slow-offset-fetch", "short-heartbeat-1ms", "short-heartbeat-2ms", "partition-bound", "reset", "reset-fail", "reset-fair", "throttle-idle", "adoption", "metadata", "offsets", "idle-confirmed", "idle-unconfirmed", "bounded", "commit-bound", "follow-commit", "follow-fetch", "follow-partition", "follow-coordinator", "no-join", "no-join-heartbeat", "follow-join")))

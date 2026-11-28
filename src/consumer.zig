@@ -175,7 +175,6 @@ const group_rebalance_timeout_ms = 30000;
 const group_session_assumed_ms = 45000;
 const group_commit_floor_ms = 1000;
 const group_rpc_min_timeout_ms = 1000;
-const heartbeat_min_timeout_ms = 50;
 const heartbeat_slack_ms = 100;
 
 fn heartbeatSlack(interval: u64) u64 {
@@ -185,11 +184,6 @@ fn heartbeatSlack(interval: u64) u64 {
 fn heartbeatTimeoutMs(interval: u64) u64 {
     if (interval >= group_rpc_min_timeout_ms) return interval -| heartbeatSlack(interval);
     return group_rpc_min_timeout_ms;
-}
-
-fn heartbeatHedgeMs(interval: u64) ?u64 {
-    if (interval >= group_rpc_min_timeout_ms) return null;
-    return @max(heartbeat_min_timeout_ms, interval -| @min(20, interval / 5));
 }
 
 const GroupSession = struct {
@@ -323,7 +317,7 @@ const GroupSession = struct {
 
     fn recoverEpoch(s: *GroupSession, err: anyerror) bool {
         const failure = switch (err) {
-            error.MetadataFailed, error.MetadataUnavailable, error.HeartbeatUnreconciled => error.GroupDeadlineExceeded,
+            error.MetadataFailed, error.MetadataUnavailable => error.GroupDeadlineExceeded,
             else => err,
         };
         switch (failure) {
@@ -460,7 +454,6 @@ const GroupSession = struct {
                     .topics = &.{s.opts.topic},
                     .assignment = if (parts.len == 0) &.{} else &.{.{ .topic_id = s.c.topic_id, .partitions = parts }},
                 },
-                .hedge_ms = heartbeatHedgeMs(s.interval),
             });
             if (res) |hb| {
                 s.hook_timeouts = 0;
@@ -557,7 +550,6 @@ const GroupSession = struct {
                 .topics = &.{s.opts.topic},
                 .assignment = if (parts.len == 0) &.{} else &.{.{ .topic_id = s.c.topic_id, .partitions = parts }},
             },
-            .hedge_ms = heartbeatHedgeMs(s.interval),
         });
         try s.applyHeartbeat(arena, result);
     }
@@ -1148,12 +1140,6 @@ test "short heartbeat intervals separate liveness and data budgets and schedule 
     try std.testing.expectEqual(@as(u64, 1000), heartbeatTimeoutMs(100));
     try std.testing.expectEqual(@as(u64, 1000), heartbeatTimeoutMs(2));
     try std.testing.expectEqual(@as(u64, 1000), heartbeatTimeoutMs(1));
-
-    try std.testing.expectEqual(@as(?u64, null), heartbeatHedgeMs(5000));
-    try std.testing.expectEqual(@as(?u64, null), heartbeatHedgeMs(1000));
-    try std.testing.expectEqual(@as(?u64, 80), heartbeatHedgeMs(100));
-    try std.testing.expectEqual(@as(?u64, 50), heartbeatHedgeMs(2));
-    try std.testing.expectEqual(@as(?u64, 50), heartbeatHedgeMs(1));
 
     const alloc = std.testing.allocator;
     var env: std.process.Environ.Map = .init(alloc);

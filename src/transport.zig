@@ -46,7 +46,6 @@ const SocketReader = struct {
         io: std.Io,
     } = null,
     wait_hook: ?WaitHook = null,
-    poll_nonblock: bool = false,
 
     fn readVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
         const self: *SocketReader = @alignCast(@fieldParentPtr("interface", r));
@@ -54,17 +53,6 @@ const SocketReader = struct {
         const nbufs, const data_size = try r.writableVector(&buffers, data);
         std.debug.assert(nbufs != 0 and buffers[0].len != 0);
         while (true) {
-            if (self.poll_nonblock) {
-                var fds = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
-                const rc = std.posix.poll(&fds, 0) catch {
-                    self.err = error.IoFailed;
-                    return error.ReadFailed;
-                };
-                if (rc == 0) {
-                    self.err = error.IoTimedOut;
-                    return error.ReadFailed;
-                }
-            }
             var poll_limit: ?u64 = null;
             var hook_due = false;
             var ready = false;
@@ -213,9 +201,9 @@ pub const Conn = struct {
 };
 
 /// Connect TCP to host:port. host may be DNS or IP literal.
-fn tcpConnect(io: std.Io, host: []const u8, port: u16, timeout_ms: ?u64, wait_hook: ?WaitHook) !std.Io.net.Stream {
+fn tcpConnect(io: std.Io, host: []const u8, port: u16, deadline: ?std.Io.Timestamp) !std.Io.net.Stream {
     const hn = std.Io.net.HostName.init(host) catch return error.HostNotFound;
-    const s = if (timeout_ms) |ms| try connectBounded(io, hn, port, ms, wait_hook) else if (wait_hook != null) try connectBounded(io, hn, port, 15000, wait_hook) else hn.connect(io, port, .{ .mode = .stream }) catch |err| return switch (err) {
+    const s = if (deadline) |dl| try connectBounded(io, hn, port, dl) else hn.connect(io, port, .{ .mode = .stream }) catch |err| return switch (err) {
         error.ConnectionRefused => error.ConnectionRefused,
         error.Timeout, error.HostUnreachable, error.NetworkUnreachable => error.ConnectTimedOut,
         error.UnknownHostName, error.NameServerFailure, error.NoAddressReturned => error.HostNotFound,
@@ -232,19 +220,16 @@ fn tcpConnect(io: std.Io, host: []const u8, port: u16, timeout_ms: ?u64, wait_ho
     return s;
 }
 
-fn connectBounded(io: std.Io, host: std.Io.net.HostName, port: u16, timeout_ms: u64, wait_hook: ?WaitHook) !std.Io.net.Stream {
-    const deadline = std.Io.Timestamp.now(io, .awake).addDuration(.fromMilliseconds(@intCast(timeout_ms)));
+fn connectBounded(io: std.Io, host: std.Io.net.HostName, port: u16, deadline: std.Io.Timestamp) !std.Io.net.Stream {
     var buffer: [32]std.Io.net.HostName.LookupResult = undefined;
     var addresses: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&buffer);
     host.lookup(io, &addresses, .{ .port = port }) catch return error.HostNotFound;
-    var last_error: error{ HostNotFound, ConnectTimedOut, ConnectFailed, ConnectionRefused, WaitHookAborted } = error.HostNotFound;
+    var last_error: error{ HostNotFound, ConnectTimedOut, ConnectFailed, ConnectionRefused } = error.HostNotFound;
     while (addresses.getOne(io)) |result| switch (result) {
         .canonical_name => {},
         .address => |address| {
-            const remaining = std.Io.Timestamp.now(io, .awake).durationTo(deadline).toMilliseconds();
-            if (remaining <= 0) return error.ConnectTimedOut;
-            return connectAddress(io, address, @intCast(remaining), wait_hook) catch |err| {
-                if (err == error.WaitHookAborted) return err;
+            if (std.Io.Timestamp.now(io, .awake).durationTo(deadline).toMilliseconds() <= 0) return error.ConnectTimedOut;
+            return connectAddress(io, address, deadline) catch |err| {
                 last_error = err;
                 continue;
             };
@@ -253,7 +238,7 @@ fn connectBounded(io: std.Io, host: std.Io.net.HostName, port: u16, timeout_ms: 
     return last_error;
 }
 
-fn connectAddress(io: std.Io, address: std.Io.net.IpAddress, timeout_ms: u64, wait_hook: ?WaitHook) !std.Io.net.Stream {
+fn connectAddress(io: std.Io, address: std.Io.net.IpAddress, deadline: std.Io.Timestamp) !std.Io.net.Stream {
     const p = std.posix;
     const raw_fd = p.system.socket(std.Io.Threaded.posixAddressFamily(&address), p.SOCK.STREAM, p.IPPROTO.TCP);
     if (p.errno(raw_fd) != .SUCCESS) return error.ConnectFailed;
@@ -270,32 +255,11 @@ fn connectAddress(io: std.Io, address: std.Io.net.IpAddress, timeout_ms: u64, wa
         .SUCCESS => {},
         .CONNREFUSED => return error.ConnectionRefused,
         .INPROGRESS, .AGAIN => {
-            const deadline = std.Io.Timestamp.now(io, .awake).addDuration(.fromMilliseconds(@intCast(timeout_ms)));
-            while (true) {
-                const remaining = std.Io.Timestamp.now(io, .awake).durationTo(deadline).toMilliseconds();
-                if (remaining <= 0) return error.ConnectTimedOut;
-                var poll_limit: u64 = @intCast(remaining);
-                var hook_due = false;
-                if (wait_hook) |hook| {
-                    if (hook.next_due(hook.ctx)) |due| {
-                        const until = std.Io.Timestamp.now(hook.io, .awake).durationTo(due).toMilliseconds();
-                        if (until <= 0) {
-                            hook_due = true;
-                            poll_limit = 0;
-                        } else {
-                            poll_limit = @min(poll_limit, @as(u64, @intCast(until)));
-                        }
-                    }
-                }
-                var pollfds = [_]p.pollfd{.{ .fd = fd, .events = p.POLL.OUT, .revents = 0 }};
-                const rc = p.poll(&pollfds, @intCast(@min(poll_limit, std.math.maxInt(i32)))) catch return error.ConnectFailed;
-                if (rc > 0) break;
-                if (hook_due) {
-                    if (wait_hook.?.tick(wait_hook.?.ctx)) return error.WaitHookAborted;
-                    continue;
-                }
-                if (std.Io.Timestamp.now(io, .awake).durationTo(deadline).toMilliseconds() <= 0) return error.ConnectTimedOut;
-            }
+            const remaining = std.Io.Timestamp.now(io, .awake).durationTo(deadline).toMilliseconds();
+            if (remaining <= 0) return error.ConnectTimedOut;
+            var pollfds = [_]p.pollfd{.{ .fd = fd, .events = p.POLL.OUT, .revents = 0 }};
+            const rc = p.poll(&pollfds, @intCast(@min(@as(u64, @intCast(remaining)), std.math.maxInt(i32)))) catch return error.ConnectFailed;
+            if (rc == 0) return error.ConnectTimedOut;
             var socket_error: u32 = 0;
             var size: p.socklen_t = @sizeOf(u32);
             if (p.errno(p.system.getsockopt(fd, p.SOL.SOCKET, p.SO.ERROR, std.mem.asBytes(&socket_error), &size)) != .SUCCESS) return error.ConnectFailed;
@@ -341,47 +305,6 @@ test "socket reads time out normally and discard partial frames" {
     }
 }
 
-test "FrameAccumulator handles partial header and body without blocking" {
-    const io = std.testing.io;
-    const alloc = std.testing.allocator;
-    var env: std.process.Environ.Map = .init(alloc);
-    defer env.deinit();
-    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
-    var server = try addr.listen(io, .{});
-    defer server.deinit(io);
-    const c = try connect(io, alloc, &env, "127.0.0.1", server.socket.address.getPort(), null, 50);
-    defer alloc.destroy(c);
-    defer c.close();
-    const peer = try server.accept(io);
-    defer peer.close(io);
-    const frame = [_]u8{ 0, 0, 0, 6, 0, 0, 0, 7, 0, 'k' };
-    var buf: [32]u8 = undefined;
-    var writer = peer.writer(io, &buf);
-    var acc: FrameAccumulator = .{};
-    defer acc.deinit(alloc);
-
-    try std.testing.expect((try acc.step(c, alloc, 7, true)) == null);
-    try writer.interface.writeAll(frame[0..2]);
-    try writer.interface.flush();
-    try std.testing.expect(waitReadable(c, 50));
-    try std.testing.expect((try acc.step(c, alloc, 7, true)) == null);
-    try std.testing.expectEqual(@as(usize, 2), acc.hdr_len);
-
-    try writer.interface.writeAll(frame[2..7]);
-    try writer.interface.flush();
-    try std.testing.expect(waitReadable(c, 50));
-    try std.testing.expect((try acc.step(c, alloc, 7, true)) == null);
-    try std.testing.expectEqual(@as(usize, 3), acc.body_len);
-
-    try writer.interface.writeAll(frame[7..]);
-    try writer.interface.flush();
-    try std.testing.expect(waitReadable(c, 50));
-    const resp = (try acc.step(c, alloc, 7, true)).?;
-    defer alloc.free(resp.frame);
-    try std.testing.expectEqualStrings("k", resp.body);
-    try std.testing.expect(!c.closed);
-}
-
 test "socket write timeouts are normal errors and close the connection" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -408,44 +331,14 @@ test "bounded group connections succeed and report refused sockets" {
     const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var server = try addr.listen(std.testing.io, .{});
     const bound = server.socket.address;
-    const stream = try connectAddress(std.testing.io, bound, 100, null);
+    const deadline = std.Io.Timestamp.now(std.testing.io, .awake).addDuration(.fromMilliseconds(100));
+    const stream = try connectAddress(std.testing.io, bound, deadline);
     stream.close(std.testing.io);
     server.deinit(std.testing.io);
-    try std.testing.expectError(error.ConnectionRefused, connectAddress(std.testing.io, bound, 100, null));
+    try std.testing.expectError(error.ConnectionRefused, connectAddress(std.testing.io, bound, deadline));
 }
 
-test "connectWithHook aborts stalled TLS handshake when wait hook fires" {
-    const io = std.testing.io;
-    const alloc = std.testing.allocator;
-    var env: std.process.Environ.Map = .init(alloc);
-    defer env.deinit();
-    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
-    var server = try addr.listen(io, .{});
-    defer server.deinit(io);
-    var ca: std.crypto.Certificate.Bundle = .empty;
-    defer ca.deinit(alloc);
-    const HookState = struct {
-        due: std.Io.Timestamp,
-        fired: bool = false,
-        fn nextDue(ctx: *anyopaque) ?std.Io.Timestamp {
-            const s: *@This() = @ptrCast(@alignCast(ctx));
-            return s.due;
-        }
-        fn tick(ctx: *anyopaque) bool {
-            const s: *@This() = @ptrCast(@alignCast(ctx));
-            s.fired = true;
-            return true;
-        }
-    };
-    const started = std.Io.Timestamp.now(io, .awake);
-    var state: HookState = .{ .due = started.addDuration(.fromMilliseconds(15)) };
-    const hook: WaitHook = .{ .io = io, .ctx = &state, .next_due = HookState.nextDue, .tick = HookState.tick };
-    try std.testing.expectError(error.WaitHookAborted, connectWithHook(io, alloc, &env, "127.0.0.1", server.socket.address.getPort(), &ca, 1000, hook));
-    try std.testing.expect(state.fired);
-    try std.testing.expect(started.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds() < 200);
-}
-
-test "connectWithHook honors timeout when TLS handshake and wait hook both stall" {
+test "connect enforces shared deadline across TCP and TLS handshake" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     var env: std.process.Environ.Map = .init(alloc);
@@ -455,20 +348,8 @@ test "connectWithHook honors timeout when TLS handshake and wait hook both stall
     defer server.deinit(io);
     var ca: std.crypto.Certificate.Bundle = .empty;
     defer ca.deinit(alloc);
-    const HookState = struct {
-        io: std.Io,
-        fn nextDue(ctx: *anyopaque) ?std.Io.Timestamp {
-            const s: *@This() = @ptrCast(@alignCast(ctx));
-            return std.Io.Timestamp.now(s.io, .awake).addDuration(.fromMilliseconds(5));
-        }
-        fn tick(_: *anyopaque) bool {
-            return false;
-        }
-    };
-    var state: HookState = .{ .io = io };
-    const hook: WaitHook = .{ .io = io, .ctx = &state, .next_due = HookState.nextDue, .tick = HookState.tick };
     const started = std.Io.Timestamp.now(io, .awake);
-    try std.testing.expectError(error.ConnectTimedOut, connectWithHook(io, alloc, &env, "127.0.0.1", server.socket.address.getPort(), &ca, 50, hook));
+    try std.testing.expectError(error.ConnectTimedOut, connect(io, alloc, &env, "127.0.0.1", server.socket.address.getPort(), &ca, 50));
     try std.testing.expect(started.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds() < 300);
 }
 
@@ -482,23 +363,12 @@ pub fn connect(
     ca: ?*std.crypto.Certificate.Bundle,
     timeout_ms: ?u64,
 ) TransportError!*Conn {
-    return connectWithHook(io, alloc, env, host, port, ca, timeout_ms, null);
-}
-
-/// Establish a connection with an optional wait hook that can abort slow TCP
-/// connect or TLS handshake waits.
-pub fn connectWithHook(
-    io: std.Io,
-    alloc: std.mem.Allocator,
-    env: *std.process.Environ.Map,
-    host: []const u8,
-    port: u16,
-    ca: ?*std.crypto.Certificate.Bundle,
-    timeout_ms: ?u64,
-    wait_hook: ?WaitHook,
-) TransportError!*Conn {
-    const stream = tcpConnect(io, host, port, timeout_ms, wait_hook) catch |err| return switch (err) {
-        error.ConnectionRefused, error.ConnectTimedOut, error.HostNotFound, error.WaitHookAborted => err,
+    const deadline: ?std.Io.Timestamp = if (timeout_ms) |ms|
+        std.Io.Timestamp.now(io, .awake).addDuration(.fromMilliseconds(@intCast(ms)))
+    else
+        null;
+    const stream = tcpConnect(io, host, port, deadline) catch |err| return switch (err) {
+        error.ConnectionRefused, error.ConnectTimedOut, error.HostNotFound => err,
         else => error.ConnectFailed,
     };
     errdefer stream.close(io);
@@ -527,21 +397,17 @@ pub fn connectWithHook(
     c.net_writer = .{ .fd = stream.socket.handle, .interface = .{ .vtable = &.{ .drain = SocketWriter.drain }, .buffer = &c.wbuf } };
     c.input = &c.net_reader.interface;
     c.output = &c.net_writer.interface;
-    if (timeout_ms) |ms| setTimeout(c, ms);
+    if (deadline) |dl| {
+        const rem = std.Io.Timestamp.now(io, .awake).durationTo(dl).toMilliseconds();
+        if (rem <= 0) return error.ConnectTimedOut;
+        setTimeout(c, @intCast(rem));
+    }
 
     if (ca) |bundle| {
-        c.net_reader.wait_hook = wait_hook;
-        if (timeout_ms) |ms| {
-            c.net_reader.cancellation = .{
-                .io = io,
-                .deadline = std.Io.Timestamp.now(io, .awake).addDuration(.fromMilliseconds(@intCast(ms))),
-                .stop = null,
-            };
+        if (deadline) |dl| {
+            c.net_reader.cancellation = .{ .io = io, .deadline = dl, .stop = null };
         }
-        defer {
-            c.net_reader.wait_hook = null;
-            c.net_reader.cancellation = null;
-        }
+        defer c.net_reader.cancellation = null;
         var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
         io.randomSecure(&entropy) catch io.random(&entropy);
         const client = std.crypto.tls.Client.init(c.input, c.output, .{
@@ -553,7 +419,6 @@ pub fn connectWithHook(
             .realtime_now = .now(io, .real),
         }) catch |err| {
             if (c.net_reader.err) |rerr| {
-                if (rerr == error.WaitHookAborted) return error.WaitHookAborted;
                 if (rerr == error.IoTimedOut) return error.ConnectTimedOut;
             }
             // errdefers above close the stream and free `c`.
@@ -578,34 +443,6 @@ pub fn setTimeout(c: *Conn, ms: u64) void {
     std.posix.setsockopt(c.stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
     std.posix.setsockopt(c.stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
     c.timeout_ms = ms;
-}
-
-/// Wait until `c` has buffered plaintext or socket-readable bytes, or `timeout_ms` elapses.
-pub fn waitReadable(c: *Conn, timeout_ms: u64) bool {
-    if (c.closed) return true;
-    if (c.input.seek < c.input.end) return true;
-    var fds = [_]std.posix.pollfd{.{ .fd = c.net_reader.fd, .events = std.posix.POLL.IN, .revents = 0 }};
-    const rc = std.posix.poll(&fds, @intCast(@min(timeout_ms, std.math.maxInt(i32)))) catch return true;
-    return rc > 0;
-}
-
-/// Wait until either `a` or `b` has buffered plaintext or socket-readable bytes, or `deadline` expires.
-/// Returns 0 if `a` is ready, 1 if `b` is ready, or null on timeout.
-pub fn waitEitherReadable(io: std.Io, a: *Conn, b: *Conn, deadline: std.Io.Timestamp) ?u1 {
-    if (a.closed or a.input.seek < a.input.end) return 0;
-    if (b.closed or b.input.seek < b.input.end) return 1;
-    while (true) {
-        const rem = std.Io.Timestamp.now(io, .awake).durationTo(deadline).toMilliseconds();
-        if (rem <= 0) return null;
-        var fds = [_]std.posix.pollfd{
-            .{ .fd = a.net_reader.fd, .events = std.posix.POLL.IN, .revents = 0 },
-            .{ .fd = b.net_reader.fd, .events = std.posix.POLL.IN, .revents = 0 },
-        };
-        const rc = std.posix.poll(&fds, @intCast(@min(@as(u64, @intCast(rem)), std.math.maxInt(i32)))) catch return 0;
-        if (rc == 0) return null;
-        if (fds[0].revents != 0) return 0;
-        if (fds[1].revents != 0) return 1;
-    }
 }
 
 /// Send a framed request (4-byte big-endian length + payload).
@@ -653,100 +490,6 @@ pub const Response = struct {
     frame: []u8,
     /// Response body after the v1 header (correlation id + tag buffer).
     body: []u8,
-};
-
-pub const FrameAccumulator = struct {
-    hdr: [4]u8 = undefined,
-    hdr_len: usize = 0,
-    frame: ?[]u8 = null,
-    body_len: usize = 0,
-
-    pub fn deinit(f: *FrameAccumulator, alloc: std.mem.Allocator) void {
-        if (f.frame) |buf| alloc.free(buf);
-        f.frame = null;
-        f.hdr_len = 0;
-        f.body_len = 0;
-    }
-
-    pub fn hasPartial(f: *const FrameAccumulator) bool {
-        return f.hdr_len > 0 or f.frame != null;
-    }
-
-    fn readAvailable(c: *Conn, dst: []u8) TransportError!usize {
-        while (c.input.buffered().len == 0) {
-            const before = c.net_reader.interface.seek;
-            c.net_reader.err = null;
-            c.net_reader.poll_nonblock = true;
-            defer c.net_reader.poll_nonblock = false;
-            c.input.fillMore() catch |err| {
-                if (err == error.ReadFailed and c.net_reader.err != null and c.net_reader.err.? == error.IoTimedOut) {
-                    c.net_reader.err = null;
-                    return 0;
-                }
-                c.close();
-                return if (err == error.EndOfStream) error.IoFailed else c.ioError();
-            };
-            if (c.input.buffered().len == 0 and c.net_reader.interface.seek == before) return 0;
-        }
-        const avail = c.input.buffered();
-        const n = @min(avail.len, dst.len);
-        @memcpy(dst[0..n], avail[0..n]);
-        c.input.toss(n);
-        return n;
-    }
-
-    /// Drain any currently available bytes from `c` without blocking.
-    /// Returns a complete validated Response once the full frame arrives,
-    /// `null` while the frame is incomplete, or a TransportError on failure.
-    pub fn step(f: *FrameAccumulator, c: *Conn, alloc: std.mem.Allocator, expect_corr: i32, header_tags: bool) TransportError!?Response {
-        if (c.closed) return error.IoFailed;
-        while (f.hdr_len < 4) {
-            const n = try readAvailable(c, f.hdr[f.hdr_len..4]);
-            if (n == 0) return null;
-            f.hdr_len += n;
-        }
-        if (f.frame == null) {
-            const len = std.mem.readInt(u32, &f.hdr, .big);
-            if (len > max_response_len) {
-                c.close();
-                return error.ResponseTooLarge;
-            }
-            f.frame = alloc.alloc(u8, len) catch return error.OutOfMemory;
-        }
-        const buf = f.frame.?;
-        while (f.body_len < buf.len) {
-            const n = try readAvailable(c, buf[f.body_len..]);
-            if (n == 0) return null;
-            f.body_len += n;
-        }
-        f.frame = null;
-        f.hdr_len = 0;
-        f.body_len = 0;
-        errdefer alloc.free(buf);
-        if (c.debug) {
-            if (c.redact_next_recv) {
-                c.redact_next_recv = false;
-                std.debug.print("recv {d}B: <redacted>\n", .{buf.len});
-            } else {
-                const n = @min(buf.len, 512);
-                std.debug.print("recv {d}B: {x}\n", .{ buf.len, buf[0..n] });
-            }
-        }
-        var d = protocol.Decoder.init(buf);
-        const corr = d.i32v() catch {
-            c.close();
-            return error.MalformedResponse;
-        };
-        if (corr != expect_corr) {
-            c.close();
-            return error.CorrelationMismatch;
-        }
-        if (header_tags) d.tagBuffer() catch {
-            c.close();
-            return error.MalformedResponse;
-        };
-        return .{ .frame = buf, .body = buf[d.pos..] };
-    }
 };
 
 /// Receive one framed response and validate its correlation id.

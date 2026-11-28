@@ -79,7 +79,6 @@ pub const Retry = struct {
 pub const Client = struct {
     group_deadline: ?std.Io.Timestamp = null,
     wait_hook: ?transport.WaitHook = null,
-    hedge_watch_hook: ?transport.WaitHook = null,
     control_busy: bool = false,
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -308,8 +307,7 @@ pub const Client = struct {
             try c.loadCa()
         else
             null;
-        const conn = transport.connectWithHook(c.io, c.alloc, c.env, host, port, ca, if (c.group_deadline != null) remaining else null, c.hedge_watch_hook) catch |err| {
-            if (err == error.WaitHookAborted) return error.WaitHookAborted;
+        const conn = transport.connect(c.io, c.alloc, c.env, host, port, ca, if (c.group_deadline != null) remaining else null) catch |err| {
             switch (err) {
                 error.TlsHandshakeAuthFailed => c.setErr(
                     "TLS certificate verification failed for {s}:{d} (check ssl.truststore.location)",
@@ -451,7 +449,7 @@ pub const Client = struct {
         defer if (on_control) {
             c.control_busy = prev_control_busy;
         };
-        const active_hook: ?transport.WaitHook = c.hedge_watch_hook orelse
+        const active_hook: ?transport.WaitHook =
             if (c.wait_hook != null and key != protocol.api_key.consumer_group_heartbeat and key != protocol.api_key.find_coordinator and key != protocol.api_key.api_versions)
                 c.wait_hook
             else
@@ -811,225 +809,11 @@ pub const Client = struct {
     const GroupResp = struct {
         resp: Resp,
         node: i32,
-        overlapped: bool = false,
-    };
-
-    const HeartbeatAttempt = struct {
-        resp: Resp,
-        overlapped: bool = false,
     };
 
     fn invalidateCoordinatorEndpoint(c: *Client, node: i32, slot: u32) void {
         if (node >= 0) c.dropConn(connKey(node, slot));
         if (c.coordinator_node == node) c.coordinator_node = -1;
-    }
-
-    fn isEpochFenceHeartbeat(body: []const u8) bool {
-        var d = Decoder.init(body);
-        _ = d.i32v() catch return false;
-        const code: protocol.ErrorCode = @enumFromInt(d.i16v() catch return false);
-        return code == .fenced_member_epoch or code == .stale_member_epoch;
-    }
-
-    fn finishFrame(io: std.Io, conn: *Conn, acc: *transport.FrameAccumulator, alloc: std.mem.Allocator, corr: i32, deadline: std.Io.Timestamp) !Resp {
-        while (true) {
-            if (try acc.step(conn, alloc, corr, true)) |resp| return resp;
-            const left = std.Io.Timestamp.now(io, .awake).durationTo(deadline).toMilliseconds();
-            if (left <= 0) return error.IoTimedOut;
-            if (!transport.waitReadable(conn, @intCast(left))) return error.IoTimedOut;
-        }
-    }
-
-    fn sendHeartbeatAttempt(c: *Client, alloc: std.mem.Allocator, node: i32, conn: *Conn, req: protocol.Heartbeat) !HeartbeatAttempt {
-        const timeout = try c.requestTimeoutMs(0);
-        transport.setTimeout(conn, timeout);
-        var e1 = Encoder.init(alloc);
-        defer e1.deinit();
-        try protocol.encodeRequest(&e1, protocol.api_key.consumer_group_heartbeat, protocol.version.consumer_group_heartbeat, true, "kite", req, protocol.heartbeatRequest);
-        const corr1 = protocol.lastCorrelationId();
-        try transport.send(conn, e1.written());
-
-        const hedge_ms = if (req.member_epoch > 0) req.hedge_ms else null;
-        if (hedge_ms == null) {
-            return .{ .resp = try transport.recv(conn, alloc, corr1, true) };
-        }
-
-        const now0 = std.Io.Timestamp.now(c.io, .awake);
-        const deadline = c.group_deadline orelse now0.addDuration(.fromMilliseconds(@intCast(timeout)));
-        const hedge_cap = now0.addDuration(.fromMilliseconds(@intCast(@min(hedge_ms.?, timeout))));
-        const hedge_deadline = if (now0.durationTo(deadline).toMilliseconds() < now0.durationTo(hedge_cap).toMilliseconds()) deadline else hedge_cap;
-
-        var acc1: transport.FrameAccumulator = .{};
-        defer acc1.deinit(alloc);
-        while (true) {
-            if (try acc1.step(conn, alloc, corr1, true)) |resp| return .{ .resp = resp };
-            const rem = std.Io.Timestamp.now(c.io, .awake).durationTo(hedge_deadline).toMilliseconds();
-            if (rem <= 0) break;
-            _ = transport.waitReadable(conn, @intCast(rem));
-        }
-
-        const addr = c.brokers.get(node) orelse return .{ .resp = try finishFrame(c.io, conn, &acc1, alloc, corr1, deadline) };
-        const Watch = struct {
-            io: std.Io,
-            conn: *Conn,
-            acc: *transport.FrameAccumulator,
-            alloc: std.mem.Allocator,
-            corr: i32,
-            ready: ?Resp = null,
-            failed: bool = false,
-            oom: bool = false,
-            fn nextDue(ctx: *anyopaque) ?std.Io.Timestamp {
-                const w: *@This() = @ptrCast(@alignCast(ctx));
-                const now = std.Io.Timestamp.now(w.io, .awake);
-                if (w.ready != null or w.failed or w.oom or transport.waitReadable(w.conn, 0)) return now;
-                return now.addDuration(.fromMilliseconds(5));
-            }
-            fn tick(ctx: *anyopaque) bool {
-                const w: *@This() = @ptrCast(@alignCast(ctx));
-                if (w.ready != null or w.failed or w.oom) return true;
-                if (w.acc.step(w.conn, w.alloc, w.corr, true)) |maybe_resp| {
-                    if (maybe_resp) |resp| {
-                        w.ready = resp;
-                        return true;
-                    }
-                    return false;
-                } else |err| {
-                    if (err == error.OutOfMemory) w.oom = true else w.failed = true;
-                    return true;
-                }
-            }
-        };
-        var watch: Watch = .{ .io = c.io, .conn = conn, .acc = &acc1, .alloc = alloc, .corr = corr1 };
-        var conn_alive = true;
-        const hedge = blk: {
-            const prev_watch = c.hedge_watch_hook;
-            c.hedge_watch_hook = .{ .io = c.io, .ctx = &watch, .next_due = Watch.nextDue, .tick = Watch.tick };
-            defer c.hedge_watch_hook = prev_watch;
-            if (c.connectOne(addr.host, addr.port)) |h| break :blk h else |err| {
-                if (err == error.WaitHookAborted) {
-                    if (watch.oom) return error.OutOfMemory;
-                    if (watch.ready) |resp| return .{ .resp = resp };
-                    conn_alive = false;
-                    c.hedge_watch_hook = prev_watch;
-                    break :blk c.connectOne(addr.host, addr.port) catch return error.IoFailed;
-                }
-                return .{ .resp = try finishFrame(c.io, conn, &acc1, alloc, corr1, deadline) };
-            }
-        };
-        var keep_hedge = false;
-        defer if (!keep_hedge) {
-            hedge.close();
-            c.alloc.destroy(hedge);
-        };
-        if (watch.oom) return error.OutOfMemory;
-        if (watch.ready) |resp| return .{ .resp = resp };
-        if (watch.failed) conn_alive = false;
-        if (conn_alive) {
-            if (acc1.step(conn, alloc, corr1, true)) |maybe_resp| {
-                if (maybe_resp) |resp| return .{ .resp = resp };
-            } else |err| {
-                if (err == error.OutOfMemory) return err;
-                conn_alive = false;
-            }
-        }
-        const rem = try c.requestTimeoutMs(0);
-        transport.setTimeout(hedge, rem);
-        var e2 = Encoder.init(alloc);
-        defer e2.deinit();
-        try protocol.encodeRequest(&e2, protocol.api_key.consumer_group_heartbeat, protocol.version.consumer_group_heartbeat, true, "kite", req.forRetry(), protocol.heartbeatRequest);
-        const corr2 = protocol.lastCorrelationId();
-        transport.send(hedge, e2.written()) catch |err| {
-            if (!conn_alive) return err;
-            return .{ .resp = try finishFrame(c.io, conn, &acc1, alloc, corr1, deadline) };
-        };
-
-        var acc2: transport.FrameAccumulator = .{};
-        defer acc2.deinit(alloc);
-        var hedge_alive = true;
-        var deferred_fence: ?Resp = null;
-        var deferred_fence_from_hedge = false;
-        defer if (deferred_fence) |f| alloc.free(f.frame);
-        while (conn_alive or hedge_alive) {
-            const pick: u1 = if (conn_alive and hedge_alive)
-                transport.waitEitherReadable(c.io, conn, hedge, deadline) orelse break
-            else if (conn_alive) blk: {
-                const left = std.Io.Timestamp.now(c.io, .awake).durationTo(deadline).toMilliseconds();
-                if (left <= 0 or !transport.waitReadable(conn, @intCast(left))) break;
-                break :blk 0;
-            } else blk: {
-                const left = std.Io.Timestamp.now(c.io, .awake).durationTo(deadline).toMilliseconds();
-                if (left <= 0 or !transport.waitReadable(hedge, @intCast(left))) break;
-                break :blk 1;
-            };
-            if (pick == 0) {
-                if (acc1.step(conn, alloc, corr1, true)) |maybe_resp| {
-                    if (maybe_resp) |resp| {
-                        if (hedge_alive and isEpochFenceHeartbeat(resp.body)) {
-                            if (deferred_fence) |old| alloc.free(old.frame);
-                            deferred_fence = resp;
-                            deferred_fence_from_hedge = false;
-                            conn_alive = false;
-                            continue;
-                        }
-                        return .{ .resp = resp, .overlapped = true };
-                    }
-                } else |err| {
-                    if (err == error.OutOfMemory) return err;
-                    conn_alive = false;
-                    if (!hedge_alive) {
-                        if (deferred_fence) |f| {
-                            deferred_fence = null;
-                            if (deferred_fence_from_hedge) {
-                                const slot_key = connKey(node, 0xFFFF_FFFD);
-                                c.dropConn(slot_key);
-                                c.conns.put(c.alloc, slot_key, hedge) catch return .{ .resp = f, .overlapped = true };
-                                keep_hedge = true;
-                            }
-                            return .{ .resp = f, .overlapped = true };
-                        }
-                        return err;
-                    }
-                }
-            } else {
-                if (acc2.step(hedge, alloc, corr2, true)) |maybe_resp| {
-                    if (maybe_resp) |resp| {
-                        if (conn_alive and isEpochFenceHeartbeat(resp.body)) {
-                            if (deferred_fence) |old| alloc.free(old.frame);
-                            deferred_fence = resp;
-                            deferred_fence_from_hedge = true;
-                            hedge_alive = false;
-                            continue;
-                        }
-                        const slot_key = connKey(node, 0xFFFF_FFFD);
-                        c.dropConn(slot_key);
-                        c.conns.put(c.alloc, slot_key, hedge) catch return .{ .resp = resp, .overlapped = true };
-                        keep_hedge = true;
-                        return .{ .resp = resp, .overlapped = true };
-                    }
-                } else |err| {
-                    if (err == error.OutOfMemory) return err;
-                    hedge_alive = false;
-                    if (!conn_alive) {
-                        if (deferred_fence) |f| {
-                            deferred_fence = null;
-                            return .{ .resp = f, .overlapped = true };
-                        }
-                        return err;
-                    }
-                }
-            }
-        }
-        if (deferred_fence) |f| {
-            deferred_fence = null;
-            if (deferred_fence_from_hedge) {
-                const slot_key = connKey(node, 0xFFFF_FFFD);
-                c.dropConn(slot_key);
-                c.conns.put(c.alloc, slot_key, hedge) catch return .{ .resp = f, .overlapped = true };
-                keep_hedge = true;
-            }
-            return .{ .resp = f, .overlapped = true };
-        }
-        return error.IoTimedOut;
     }
 
     pub fn groupRequest(c: *Client, alloc: std.mem.Allocator, group: []const u8, key: i16, ver: i16, api: []const u8, ctx: anytype, comptime encode: fn (*Encoder, @TypeOf(ctx)) protocol.ProtoError!void) !GroupResp {
@@ -1046,26 +830,13 @@ pub const Client = struct {
                 _ = try c.groupRemainingMs();
                 return err;
             };
-            if (comptime @TypeOf(ctx) == protocol.Heartbeat) {
-                const attempt = c.sendHeartbeatAttempt(alloc, node, conn, request) catch |err| {
-                    if (err == error.WaitHookAborted) {
-                        c.dropConn(connKey(node, slot));
-                        return err;
-                    }
-                    c.invalidateCoordinatorEndpoint(node, slot);
-                    request = request.forRetry();
-                    if (try retry.pauseOrAbort(c)) continue;
-                    _ = try c.groupRemainingMs();
-                    return err;
-                };
-                return .{ .resp = attempt.resp, .node = node, .overlapped = attempt.overlapped };
-            }
             const resp = c.sendRequestAlloc(alloc, conn, key, ver, request, encode) catch |err| {
                 if (err == error.WaitHookAborted) {
                     c.dropConn(connKey(node, slot));
                     return err;
                 }
                 c.invalidateCoordinatorEndpoint(node, slot);
+                if (comptime @TypeOf(ctx) == protocol.Heartbeat) request = request.forRetry();
                 if (try retry.pauseOrAbort(c)) continue;
                 _ = try c.groupRemainingMs();
                 return err;
@@ -1077,36 +848,15 @@ pub const Client = struct {
     pub fn heartbeat(c: *Client, alloc: std.mem.Allocator, req: protocol.Heartbeat) !protocol.HeartbeatResult {
         var retry: Retry = .{};
         var request = req;
-        var pending_assignment: ?[]protocol.TopicAssignment = null;
-        var reconciling = false;
         while (true) {
-            const res = c.groupRequest(alloc, req.group, protocol.api_key.consumer_group_heartbeat, protocol.version.consumer_group_heartbeat, "ConsumerGroupHeartbeat", request, protocol.heartbeatRequest) catch |err| {
-                if (reconciling) return error.HeartbeatUnreconciled;
-                return err;
-            };
+            const res = try c.groupRequest(alloc, req.group, protocol.api_key.consumer_group_heartbeat, protocol.version.consumer_group_heartbeat, "ConsumerGroupHeartbeat", request, protocol.heartbeatRequest);
             var d = Decoder.init(res.resp.body);
-            var result = protocol.heartbeatResponse(&d, alloc) catch |err| {
-                if (reconciling) return error.HeartbeatUnreconciled;
-                return err;
-            };
+            const result = try protocol.heartbeatResponse(&d, alloc);
             if (isCoordinatorError(result.code)) {
                 c.invalidateCoordinatorEndpoint(res.node, 0xFFFF_FFFD);
                 request = request.forRetry();
                 if (try retry.pauseOrAbort(c)) continue;
-                if (reconciling) return error.HeartbeatUnreconciled;
                 _ = try c.groupRemainingMs();
-            }
-            if (res.overlapped and result.code == .none and request.member_epoch > 0) {
-                if (result.assignment != null) pending_assignment = result.assignment;
-                reconciling = true;
-                var reconcile = request.forRetry();
-                reconcile.member_epoch = result.member_epoch;
-                reconcile.hedge_ms = null;
-                request = reconcile;
-                continue;
-            }
-            if (result.code == .none and result.assignment == null and pending_assignment != null) {
-                result.assignment = pending_assignment;
             }
             return result;
         }
